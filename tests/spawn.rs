@@ -1,3 +1,7 @@
+// Copyright 2024 Christian Mazakas
+// Distributed under the Boost Software License, Version 1.0. (See accompanying
+// file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+
 use std::{
     cell::{Cell, RefCell},
     future::Future,
@@ -342,7 +346,6 @@ fn await_from_main() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
 fn await_stress_test() {
     async fn task(x: i32) {
         let x2 = yield_now(x).await;
@@ -486,5 +489,6 @@ fn await_futures_unordered() {
 
     ex.spawn(launch_timers(ex.clone()));
 
-    assert_eq!(ioc.run(), 5);
+    let n = ioc.run();
+    assert_eq!(n, 5);
 }

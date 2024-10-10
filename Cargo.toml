@@ -1,9 +1,18 @@
+# Copyright 2024 Christian Mazakas
+# Distributed under the Boost Software License, Version 1.0. (See accompanying
+# file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+
 [package]
 name = "fiona"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+nix = { version = "0.29.0", features = ["event"] }
+
+[build-dependencies]
+bindgen = "0.70.1"
+pkg-config = "0.3.31"
 
 [dev-dependencies]
 futures = "0.3.30"
