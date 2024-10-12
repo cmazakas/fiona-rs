@@ -431,6 +431,41 @@ fn await_timer() {
     assert_eq!(n, 1);
 }
 
+#[test]
+fn await_manually_polled() {
+    async fn f1(ex: fiona::Executor) {
+        let w = WakerFuture.await;
+
+        // test the case where we manually poll a sibling task, attaching ourselves as the continuation
+        // our task then immediately finishes
+        //
+        let f = std::pin::pin!(ex.spawn(f2()));
+
+        let mut cx = std::task::Context::from_waker(&w);
+        let r = f.poll(&mut cx);
+        assert!(r.is_pending());
+    }
+
+    async fn f2() -> Box<i32> {
+        yield_now(Box::new(1234)).await
+    }
+
+    async fn f3() {
+        let x = yield_now(4321).await;
+        let p = yield_now(Box::new(x)).await;
+        assert_eq!(*p, 4321);
+    }
+
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+    ex.spawn(f1(ex.clone()));
+    ex.spawn(f3());
+
+    let n = ioc.run();
+    assert_eq!(n, 3);
+}
+
 //-----------------------------------------------------------------------------
 
 #[test]

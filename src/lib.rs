@@ -363,7 +363,7 @@ impl IoContext {
                 let m_item = self.p.borrow().receiver.try_recv();
                 if let Ok(ref w) = m_item {
                     match w.upgrade() {
-                        None => break,
+                        None => continue,
                         Some(task) => {
                             (*self.p).borrow_mut().root_task = Some(w.clone());
 
@@ -397,9 +397,7 @@ impl IoContext {
             }
 
             {
-                unsafe {
-                    reserve_sqes(ring, 1);
-                }
+                unsafe { reserve_sqes(ring, 1) };
 
                 let eventfd_sqe = unsafe { io_uring_get_sqe(ring) };
                 let sqe = unsafe { &mut *eventfd_sqe };
@@ -415,9 +413,7 @@ impl IoContext {
 
             let num_ready = unsafe { io_uring_cq_ready(ring) };
             let num_cqes = unsafe { io_uring_peek_batch_cqe(ring, cqes.as_mut_ptr(), num_ready) };
-            unsafe {
-                cqes.set_len(num_cqes as usize);
-            }
+            unsafe { cqes.set_len(num_cqes as usize) };
 
             for cqe in &mut cqes {
                 let cqe = unsafe { &mut **cqe };
@@ -426,9 +422,7 @@ impl IoContext {
                 }
             }
 
-            unsafe {
-                io_uring_cq_advance(ring, num_cqes);
-            }
+            unsafe { io_uring_cq_advance(ring, num_cqes) };
         }
 
         num_completed
