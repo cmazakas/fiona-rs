@@ -32,6 +32,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::task::Poll;
+use std::task::Waker;
 
 use nix::libc::c_void;
 
@@ -53,7 +54,12 @@ use uring::IORING_SETUP_CQSIZE;
 use uring::IORING_SETUP_DEFER_TASKRUN;
 use uring::IORING_SETUP_SINGLE_ISSUER;
 
+pub mod time;
 mod uring;
+
+pub type Result<T> = std::result::Result<T, nix::Error>;
+
+//-----------------------------------------------------------------------------
 
 struct TaskInner<F: ?Sized + Future<Output = ()> + 'static> {
     strong: AtomicU64,
@@ -245,26 +251,43 @@ struct IoContextFrame {
 
 //-----------------------------------------------------------------------------
 
-// struct RefCount {
-//     count: usize,
-//     release_impl: unsafe fn(p: *mut u8),
-//     obj: *mut u8,
-// }
+struct RefCount {
+    count: usize,
+    release_impl: unsafe fn(p: *mut u8),
+    obj: *mut u8,
+}
 
-// unsafe fn release_impl<T>(p: *mut u8) {
-//     let layout = std::alloc::Layout::new::<T>();
-//     std::ptr::drop_in_place(p.cast::<T>());
-//     std::alloc::dealloc(p, layout);
-// }
+unsafe fn add_ref(rc: *mut RefCount) {
+    (*rc).count += 1;
+}
 
-// unsafe fn release(rc: *mut RefCount) {
-//     (*rc).count -= 1;
-//     if (*rc).count == 0 {
-//         let fp = (*rc).release_impl;
-//         let p = (*rc).obj;
-//         (fp)(p);
-//     }
-// }
+unsafe fn release_impl<T>(p: *mut u8) {
+    let layout = std::alloc::Layout::new::<T>();
+    std::ptr::drop_in_place(p.cast::<T>());
+    std::alloc::dealloc(p, layout);
+}
+
+unsafe fn release(rc: *mut RefCount) {
+    (*rc).count -= 1;
+    if (*rc).count == 0 {
+        let fp = (*rc).release_impl;
+        let p = (*rc).obj;
+        (fp)(p);
+    }
+}
+
+enum OpType {
+    Timer,
+}
+
+struct IoUringOp {
+    ref_count: *mut RefCount,
+    initiated: bool,
+    done: bool,
+    res: i32,
+    waker: Option<Waker>,
+    op_type: OpType,
+}
 
 //-----------------------------------------------------------------------------
 
@@ -420,6 +443,13 @@ impl IoContext {
                 if cqe.user_data == 0 || cqe.user_data == 1 {
                     continue;
                 }
+
+                let op = cqe.user_data as *mut IoUringOp;
+                unsafe {
+                    (*op).done = true;
+                    (*op).res = cqe.res;
+                    (*op).waker.clone().unwrap().wake();
+                }
             }
 
             unsafe { io_uring_cq_advance(ring, num_cqes) };
@@ -447,7 +477,7 @@ impl Default for IoContext {
 
 struct SpawnValue<T> {
     t: Option<T>,
-    waker: Option<std::task::Waker>,
+    waker: Option<Waker>,
 }
 
 //-----------------------------------------------------------------------------
