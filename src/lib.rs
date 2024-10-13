@@ -277,7 +277,7 @@ unsafe fn release(rc: *mut RefCount) {
 }
 
 enum OpType {
-    Timer,
+    Timeout,
 }
 
 struct IoUringOp {
@@ -377,6 +377,8 @@ impl IoContext {
         let cq_entries = ex.p.borrow().params.cq_entries;
         let mut cqes = Vec::<*mut io_uring_cqe>::with_capacity(cq_entries as usize);
 
+        let mut need_eventfd_read = true;
+
         loop {
             if self.p.borrow().tasks.is_empty() {
                 break;
@@ -419,7 +421,7 @@ impl IoContext {
                 break;
             }
 
-            {
+            if need_eventfd_read {
                 unsafe { reserve_sqes(ring, 1) };
 
                 let eventfd_sqe = unsafe { io_uring_get_sqe(ring) };
@@ -429,6 +431,7 @@ impl IoContext {
                     io_uring_prep_read(sqe, event_fd.as_raw_fd(), p, 8, 0);
                 }
                 sqe.user_data = 0x01; // sentinel value
+                need_eventfd_read = false;
             }
 
             let ret = unsafe { io_uring_submit_and_wait(ring, 1) };
@@ -440,15 +443,23 @@ impl IoContext {
 
             for cqe in &mut cqes {
                 let cqe = unsafe { &mut **cqe };
-                if cqe.user_data == 0 || cqe.user_data == 1 {
+                if cqe.user_data == 0 {
                     continue;
                 }
 
-                let op = cqe.user_data as *mut IoUringOp;
-                unsafe {
-                    (*op).done = true;
-                    (*op).res = cqe.res;
-                    (*op).waker.clone().unwrap().wake();
+                if cqe.user_data == 1 {
+                    need_eventfd_read = true;
+                    continue;
+                }
+
+                let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
+                match op.op_type {
+                    OpType::Timeout => {
+                        op.done = true;
+                        op.res = cqe.res;
+                        op.waker.clone().unwrap().wake();
+                        unsafe { release(op.ref_count) };
+                    }
                 }
             }
 

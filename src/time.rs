@@ -57,7 +57,7 @@ impl Timer {
                 initiated: false,
                 res: -1,
                 waker: None,
-                op_type: OpType::Timer,
+                op_type: OpType::Timeout,
             },
         };
 
@@ -95,7 +95,6 @@ impl<'a> Future for TimerFuture<'a> {
         match (timer_impl.op.initiated, timer_impl.op.done) {
             (true, true) => {
                 let res = timer_impl.op.res;
-                unsafe { release(self.timer.p.cast::<RefCount>()) };
                 if res < 0 {
                     let res = -res;
                     if res == ETIME {
