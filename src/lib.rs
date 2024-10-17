@@ -40,9 +40,12 @@ use uring::io_uring;
 use uring::io_uring_cq_advance;
 use uring::io_uring_cq_ready;
 use uring::io_uring_cqe;
+use uring::io_uring_cqe_seen;
+use uring::io_uring_get_events;
 use uring::io_uring_get_sqe;
 use uring::io_uring_params;
 use uring::io_uring_peek_batch_cqe;
+use uring::io_uring_peek_cqe;
 use uring::io_uring_prep_read;
 use uring::io_uring_queue_init_params;
 use uring::io_uring_register_files_sparse;
@@ -276,14 +279,18 @@ unsafe fn release(rc: *mut RefCount) {
     }
 }
 
+//-----------------------------------------------------------------------------
+
 enum OpType {
     Timeout,
+    TimeoutCancel,
 }
 
 struct IoUringOp {
     ref_count: *mut RefCount,
     initiated: bool,
     done: bool,
+    eager_dropped: bool,
     res: i32,
     waker: Option<Waker>,
     op_type: OpType,
@@ -296,13 +303,38 @@ pub struct IoContext {
 }
 
 unsafe fn submit_ring(ring: *mut io_uring) {
-    io_uring_submit_and_get_events(ring);
+    let _r = io_uring_submit_and_get_events(ring);
 }
 
 unsafe fn reserve_sqes(ring: *mut io_uring, n: u32) {
     let r = io_uring_sq_space_left(ring);
     if r < n {
         submit_ring(ring);
+    }
+}
+
+struct RunGuard {
+    p: Rc<RefCell<IoContextFrame>>,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        let frame = &mut *self.p.borrow_mut();
+        let ring = addr_of_mut!(frame.ioring);
+        unsafe { submit_ring(ring) };
+        frame.tasks.clear();
+
+        unsafe { io_uring_get_events(ring) };
+        let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
+        while unsafe { io_uring_peek_cqe(ring, addr_of_mut!(cqe)) } == 0 {
+            let cqe = unsafe { &mut *cqe };
+            if cqe.user_data != 0 && cqe.user_data != 1 {
+                let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
+                unsafe { release(op.ref_count) };
+            }
+
+            unsafe { io_uring_cqe_seen(ring, cqe) };
+        }
     }
 }
 
@@ -366,6 +398,8 @@ impl IoContext {
     }
 
     pub fn run(&mut self) -> u64 {
+        let _guard = RunGuard { p: self.p.clone() };
+
         let mut num_completed = 0;
 
         let event_fd = nix::sys::eventfd::EventFd::new().unwrap();
@@ -427,7 +461,7 @@ impl IoContext {
                 let eventfd_sqe = unsafe { io_uring_get_sqe(ring) };
                 let sqe = unsafe { &mut *eventfd_sqe };
                 unsafe {
-                    let p = std::ptr::from_mut::<u64>(&mut event_count).cast::<c_void>();
+                    let p = std::ptr::from_mut(&mut event_count).cast::<c_void>();
                     io_uring_prep_read(sqe, event_fd.as_raw_fd(), p, 8, 0);
                 }
                 sqe.user_data = 0x01; // sentinel value
@@ -455,9 +489,15 @@ impl IoContext {
                 let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
                 match op.op_type {
                     OpType::Timeout => {
-                        op.done = true;
-                        op.res = cqe.res;
-                        op.waker.clone().unwrap().wake();
+                        if !op.eager_dropped {
+                            op.done = true;
+                            op.res = cqe.res;
+                            op.waker.clone().unwrap().wake();
+                        }
+                        op.eager_dropped = false;
+                        unsafe { release(op.ref_count) };
+                    }
+                    OpType::TimeoutCancel => {
                         unsafe { release(op.ref_count) };
                     }
                 }
