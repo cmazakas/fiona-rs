@@ -6,7 +6,8 @@
 #![allow(
     clippy::mutable_key_type,
     clippy::missing_panics_doc,
-    clippy::cast_ptr_alignment
+    clippy::cast_ptr_alignment,
+    clippy::too_many_lines
 )]
 
 extern crate nix;
@@ -260,6 +261,7 @@ struct IoContextFrame {
     receiver: Receiver<Weak>,
     sender: Sender<Weak>,
     root_task: Option<Weak>,
+    local_task_queue: VecDeque<Weak>,
 }
 
 //-----------------------------------------------------------------------------
@@ -417,6 +419,7 @@ impl IoContext {
             sender: tx,
             root_task: None,
             ioring,
+            local_task_queue: VecDeque::new(),
         }));
 
         {
@@ -472,6 +475,36 @@ impl IoContext {
         loop {
             if self.p.borrow().tasks.is_empty() {
                 break;
+            }
+
+            loop {
+                let m_item = self.p.borrow_mut().local_task_queue.pop_front();
+                if let Some(ref w) = m_item {
+                    match w.upgrade() {
+                        None => continue,
+                        Some(task) => {
+                            (*self.p).borrow_mut().root_task = Some(w.clone());
+
+                            let w = Arc::new(TaskWaker {
+                                weak_ptr: Some(w.clone()),
+                                sender: sender.clone(),
+                                event_fd: event_fd.as_raw_fd(),
+                            })
+                            .into();
+
+                            let mut cx = std::task::Context::from_waker(&w);
+                            if let Poll::Ready(()) =
+                                unsafe { Pin::new_unchecked(&mut *(*task.p.as_ptr()).future.get()) }
+                                    .poll(&mut cx)
+                            {
+                                (*self.p).borrow_mut().tasks.remove(&task);
+                                num_completed += 1;
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
             }
 
             loop {
@@ -547,7 +580,7 @@ impl IoContext {
                             op.done = true;
                             op.res = cqe.res;
                             if let Some(weak) = op.weak.take() {
-                                sender.send(weak).unwrap();
+                                self.p.borrow_mut().local_task_queue.push_back(weak);
                             }
                         }
                         op.eager_dropped = false;
