@@ -19,6 +19,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -63,9 +64,19 @@ pub type Result<T> = std::result::Result<T, nix::Error>;
 
 //-----------------------------------------------------------------------------
 
+#[repr(C, align(64))]
+struct AlignedAtomicU64(AtomicU64);
+
+impl Deref for AlignedAtomicU64 {
+    type Target = AtomicU64;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 struct TaskInner<F: ?Sized + Future<Output = ()> + 'static> {
-    strong: AtomicU64,
-    weak: AtomicU64,
+    strong: AlignedAtomicU64,
+    weak: AlignedAtomicU64,
     future: ManuallyDrop<UnsafeCell<F>>,
 }
 
@@ -81,8 +92,8 @@ impl Task {
     pub fn new<F: Future<Output = ()> + 'static>(future: F) -> Self {
         Self {
             p: NonNull::from(Box::leak(Box::new(TaskInner {
-                strong: AtomicU64::new(1),
-                weak: AtomicU64::new(1),
+                strong: AlignedAtomicU64(AtomicU64::new(1)),
+                weak: AlignedAtomicU64(AtomicU64::new(1)),
                 future: ManuallyDrop::new(UnsafeCell::new(future)),
             }))),
             phantom: PhantomData,
