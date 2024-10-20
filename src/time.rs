@@ -49,6 +49,8 @@ impl Timer {
             obj: p,
         };
 
+        let weak = ex.p.borrow().root_task.clone().unwrap();
+
         let timer_impl = TimerImpl {
             ref_count,
             ex,
@@ -58,7 +60,7 @@ impl Timer {
                 done: false,
                 initiated: false,
                 res: -1,
-                waker: None,
+                weak: Some(weak.clone()),
                 eager_dropped: false,
                 op_type: OpType::Timeout,
             },
@@ -67,7 +69,7 @@ impl Timer {
                 done: false,
                 initiated: false,
                 res: -1,
-                waker: None,
+                weak: Some(weak),
                 eager_dropped: false,
                 op_type: OpType::TimeoutCancel,
             },
@@ -123,7 +125,7 @@ impl Drop for TimerFuture<'_> {
 
             let op = &mut timer_impl.timeout_op;
             op.eager_dropped = true;
-            op.waker = None;
+            op.weak = None;
             op.initiated = false;
             op.done = false;
             op.res = 0;
@@ -136,7 +138,7 @@ impl Future for TimerFuture<'_> {
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         assert!(!self.completed);
 
@@ -157,7 +159,6 @@ impl Future for TimerFuture<'_> {
                 timer_impl.timeout_op.initiated = false;
                 timer_impl.timeout_op.done = false;
                 timer_impl.timeout_op.res = -1;
-                timer_impl.timeout_op.waker = None;
 
                 if res < 0 {
                     let res = -res;
@@ -171,7 +172,8 @@ impl Future for TimerFuture<'_> {
                 }
             }
             (true, false) => {
-                timer_impl.timeout_op.waker = Some(cx.waker().clone());
+                timer_impl.timeout_op.weak =
+                    Some(timer_impl.ex.p.borrow().root_task.clone().unwrap());
                 Poll::Pending
             }
             (false, true) => panic!(),
@@ -182,13 +184,14 @@ impl Future for TimerFuture<'_> {
 
                 let ts = std::ptr::from_mut(timer_impl.dur.as_mut().unwrap());
 
-                timer_impl.timeout_op.waker = Some(cx.waker().clone());
                 unsafe { io_uring_prep_timeout(sqe, ts.cast::<__kernel_timespec>(), 0, 0) };
                 unsafe {
                     (*sqe).user_data = &raw mut timer_impl.timeout_op as usize as u64;
                 }
                 unsafe { add_ref(&raw mut timer_impl.ref_count) };
 
+                timer_impl.timeout_op.weak =
+                    Some(timer_impl.ex.p.borrow().root_task.clone().unwrap());
                 timer_impl.timeout_op.initiated = true;
                 self.initiated = true;
                 Poll::Pending

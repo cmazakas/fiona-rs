@@ -64,7 +64,7 @@ pub type Result<T> = std::result::Result<T, nix::Error>;
 
 //-----------------------------------------------------------------------------
 
-#[repr(C, align(64))]
+#[repr(C, align(128))]
 struct AlignedAtomicU64(AtomicU64);
 
 impl Deref for AlignedAtomicU64 {
@@ -302,7 +302,7 @@ struct IoUringOp {
     done: bool,
     eager_dropped: bool,
     res: i32,
-    waker: Option<Waker>,
+    weak: Option<Weak>,
     op_type: OpType,
 }
 
@@ -467,6 +467,8 @@ impl IoContext {
 
         let mut need_eventfd_read = true;
 
+        let sender = self.p.borrow().sender.clone();
+
         loop {
             if self.p.borrow().tasks.is_empty() {
                 break;
@@ -480,11 +482,9 @@ impl IoContext {
                         Some(task) => {
                             (*self.p).borrow_mut().root_task = Some(w.clone());
 
-                            let sender = self.p.borrow().sender.clone();
-
                             let w = Arc::new(TaskWaker {
                                 weak_ptr: Some(w.clone()),
-                                sender,
+                                sender: sender.clone(),
                                 event_fd: event_fd.as_raw_fd(),
                             })
                             .into();
@@ -546,7 +546,9 @@ impl IoContext {
                         if !op.eager_dropped {
                             op.done = true;
                             op.res = cqe.res;
-                            op.waker.clone().unwrap().wake();
+                            if let Some(weak) = op.weak.take() {
+                                sender.send(weak).unwrap();
+                            }
                         }
                         op.eager_dropped = false;
                         unsafe { release(op.ref_count) };
