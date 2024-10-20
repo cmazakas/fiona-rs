@@ -3,7 +3,6 @@
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 use std::marker::PhantomData;
-use std::ptr::addr_of_mut;
 use std::{future::Future, task::Poll, time::Duration};
 
 use nix::errno::Errno;
@@ -106,7 +105,7 @@ impl Drop for Timer {
     }
 }
 
-impl<'a> Drop for TimerFuture<'a> {
+impl Drop for TimerFuture<'_> {
     fn drop(&mut self) {
         let p = self.timer.p;
         let timer_impl = unsafe { &mut *p };
@@ -116,7 +115,7 @@ impl<'a> Drop for TimerFuture<'a> {
             unsafe { reserve_sqes(ring, 1) };
             let sqe = unsafe { io_uring_get_sqe(ring) };
 
-            let user_data = addr_of_mut!(timer_impl.timeout_op) as usize as u64;
+            let user_data = &raw mut timer_impl.timeout_op as usize as u64;
             unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
             unsafe { (*sqe).user_data = 0 };
             // unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
@@ -132,7 +131,7 @@ impl<'a> Drop for TimerFuture<'a> {
     }
 }
 
-impl<'a> Future for TimerFuture<'a> {
+impl Future for TimerFuture<'_> {
     type Output = Result<()>;
 
     fn poll(
@@ -186,9 +185,9 @@ impl<'a> Future for TimerFuture<'a> {
                 timer_impl.timeout_op.waker = Some(cx.waker().clone());
                 unsafe { io_uring_prep_timeout(sqe, ts.cast::<__kernel_timespec>(), 0, 0) };
                 unsafe {
-                    (*sqe).user_data = addr_of_mut!(timer_impl.timeout_op) as usize as u64;
+                    (*sqe).user_data = &raw mut timer_impl.timeout_op as usize as u64;
                 }
-                unsafe { add_ref(addr_of_mut!(timer_impl.ref_count)) };
+                unsafe { add_ref(&raw mut timer_impl.ref_count) };
 
                 timer_impl.timeout_op.initiated = true;
                 self.initiated = true;

@@ -21,7 +21,6 @@ use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
-use std::ptr::addr_of_mut;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
@@ -302,6 +301,33 @@ pub struct IoContext {
     p: Rc<RefCell<IoContextFrame>>,
 }
 
+//-----------------------------------------------------------------------------
+
+pub struct IoContextParams {
+    pub sq_entries: u32,
+    pub cq_entries: u32,
+    pub nr_files: u32,
+}
+
+impl IoContextParams {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            sq_entries: 256,
+            cq_entries: 1024,
+            nr_files: 1024,
+        }
+    }
+}
+
+impl Default for IoContextParams {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+//-----------------------------------------------------------------------------
+
 unsafe fn submit_ring(ring: *mut io_uring) {
     let _r = io_uring_submit_and_get_events(ring);
 }
@@ -320,13 +346,13 @@ struct RunGuard {
 impl Drop for RunGuard {
     fn drop(&mut self) {
         let frame = &mut *self.p.borrow_mut();
-        let ring = addr_of_mut!(frame.ioring);
+        let ring = &raw mut frame.ioring;
         unsafe { submit_ring(ring) };
         frame.tasks.clear();
 
         unsafe { io_uring_get_events(ring) };
         let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
-        while unsafe { io_uring_peek_cqe(ring, addr_of_mut!(cqe)) } == 0 {
+        while unsafe { io_uring_peek_cqe(ring, &raw mut cqe) } == 0 {
             let cqe = unsafe { &mut *cqe };
             if cqe.user_data != 0 && cqe.user_data != 1 {
                 let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
@@ -341,11 +367,28 @@ impl Drop for RunGuard {
 impl IoContext {
     #[must_use]
     pub fn new() -> Self {
-        let (tx, rx) = std::sync::mpsc::channel();
-
         let sq_entries = 256;
         let cq_entries = 4 * 1024;
-        let num_fds = 1024; // matches the default for Linux processes
+        let nr_files = 1024; // matches the default for Linux processes
+
+        let params = IoContextParams {
+            sq_entries,
+            cq_entries,
+            nr_files,
+        };
+
+        Self::with_params(&params)
+    }
+
+    #[must_use]
+    pub fn with_params(params: &IoContextParams) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let IoContextParams {
+            sq_entries,
+            cq_entries,
+            nr_files,
+        } = *params;
 
         let mut params = unsafe { std::mem::zeroed::<io_uring_params>() };
         params.cq_entries = cq_entries;
@@ -366,21 +409,21 @@ impl IoContext {
         }));
 
         {
-            let ring = addr_of_mut!(p.borrow_mut().ioring);
-            let ret = unsafe { io_uring_queue_init_params(sq_entries, ring, addr_of_mut!(params)) };
+            let ring = &raw mut p.borrow_mut().ioring;
+            let ret = unsafe { io_uring_queue_init_params(sq_entries, ring, &raw mut params) };
             assert_eq!(ret, 0);
 
             let ret = unsafe { io_uring_register_ring_fd(ring) };
             assert_eq!(ret, 1);
 
-            let ret = unsafe { io_uring_register_files_sparse(ring, num_fds) };
+            let ret = unsafe { io_uring_register_files_sparse(ring, nr_files) };
             assert_eq!(ret, 0);
         }
 
         {
             let available_fds = &mut p.borrow_mut().available_fds;
-            available_fds.reserve(num_fds as usize);
-            for i in 0..num_fds {
+            available_fds.reserve(nr_files as usize);
+            for i in 0..nr_files {
                 available_fds.push_back(i);
             }
         }
@@ -394,7 +437,7 @@ impl IoContext {
     }
 
     fn ring(&self) -> *mut io_uring {
-        unsafe { addr_of_mut!((*self.p.as_ptr()).ioring) }
+        unsafe { &raw mut (*self.p.as_ptr()).ioring }
     }
 
     pub fn run(&mut self) -> u64 {
@@ -595,7 +638,7 @@ pub struct Executor {
 
 impl Executor {
     fn ring(&self) -> *mut io_uring {
-        unsafe { addr_of_mut!((*self.p.as_ptr()).ioring) }
+        unsafe { &raw mut (*self.p.as_ptr()).ioring }
     }
 
     // fn get_available_fd(&self) -> Option<u32> {
