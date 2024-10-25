@@ -4,7 +4,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    future::Future,
+    future::{poll_fn, Future},
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -464,6 +464,103 @@ fn await_manually_polled() {
 
     let n = ioc.run();
     assert_eq!(n, 3);
+}
+
+#[test]
+fn await_manually_polled_early_drop() {
+    // want to attempt to test the property that the main task we're waiting on goes
+    // out of scope when an external thread completes and tries to use the Waker
+
+    static mut NUM_RUNS: u64 = 0;
+
+    async fn f1() {
+        let w = WakerFuture.await;
+        let mut cx = std::task::Context::from_waker(&w);
+
+        let mut f = wait_for(Duration::from_millis(250), ());
+        assert!(std::pin::pin!(&mut f).poll(&mut cx).is_pending());
+        unsafe { NUM_RUNS += 1 };
+    }
+
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+    ex.spawn(f1());
+
+    let n = ioc.run();
+
+    std::thread::sleep(Duration::from_millis(550));
+
+    assert_eq!(n, 1);
+    assert_eq!(unsafe { NUM_RUNS }, n);
+}
+
+#[test]
+fn await_manual_timeslice() {
+    // want to test that a user can appropriately use our Waker to time-slice
+    // long-standing operations, letting other things in the run queue process
+
+    static mut NUM_RUNS: u64 = 0;
+
+    let vec = Rc::new(RefCell::new(Vec::<i32>::new()));
+
+    let flag = Rc::new(RefCell::new(false));
+
+    async fn f1(flag: Rc<RefCell<bool>>, vec: Rc<RefCell<Vec<i32>>>) {
+        let mut v1 = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+        poll_fn(|cx| {
+            assert!(!*flag.borrow());
+            *flag.borrow_mut() = true;
+
+            vec.borrow_mut().extend(v1.drain(0..2));
+            if v1.is_empty() {
+                return Poll::Ready(());
+            }
+
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await;
+
+        unsafe { NUM_RUNS += 1 };
+    }
+
+    async fn f2(flag: Rc<RefCell<bool>>, vec: Rc<RefCell<Vec<i32>>>) {
+        let mut v2 = vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+
+        poll_fn(|cx| {
+            assert!(*flag.borrow());
+            *flag.borrow_mut() = false;
+
+            vec.borrow_mut().extend(v2.drain(0..2));
+            if v2.is_empty() {
+                return Poll::Ready(());
+            }
+
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await;
+
+        unsafe { NUM_RUNS += 1 };
+    }
+
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+    ex.spawn(f1(flag.clone(), vec.clone()));
+    ex.spawn(f2(flag.clone(), vec.clone()));
+
+    let n = ioc.run();
+
+    assert_eq!(n, 2);
+    assert_eq!(unsafe { NUM_RUNS }, n);
+
+    assert_eq!(
+        *vec.borrow(),
+        vec![1, 2, 10, 9, 3, 4, 8, 7, 5, 6, 6, 5, 7, 8, 4, 3, 9, 10, 2, 1]
+    );
 }
 
 //-----------------------------------------------------------------------------

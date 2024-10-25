@@ -9,20 +9,22 @@
     clippy::cast_ptr_alignment,
     clippy::too_many_lines
 )]
+#![feature(ptr_metadata)]
 
 extern crate nix;
 
+use std::alloc::Layout;
 use std::cell::RefCell;
-use std::cell::UnsafeCell;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
+use std::ptr::metadata;
+use std::ptr::DynMetadata;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
@@ -31,12 +33,15 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::Ordering::Release;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::task::Context;
 use std::task::Poll;
+use std::task::RawWaker;
+use std::task::RawWakerVTable;
 use std::task::Waker;
 
 use nix::libc::c_void;
 
+use nix::sys::eventfd::EventFd;
 use uring::io_uring;
 use uring::io_uring_cq_advance;
 use uring::io_uring_cq_ready;
@@ -75,34 +80,85 @@ impl Deref for AlignedAtomicU64 {
     }
 }
 
-struct TaskInner<F: ?Sized + Future<Output = ()> + 'static> {
+struct TaskInnerHeader {
     strong: AlignedAtomicU64,
     weak: AlignedAtomicU64,
-    future: ManuallyDrop<UnsafeCell<F>>,
+    future_vtable: DynMetadata<dyn Future<Output = ()> + 'static>,
+    sender: Option<Sender<Weak>>,
+    event_fd: i32,
 }
 
 //-----------------------------------------------------------------------------
 
 struct Task {
-    p: NonNull<TaskInner<dyn Future<Output = ()>>>,
-    phantom: PhantomData<TaskInner<dyn Future<Output = ()> + 'static>>,
+    p: NonNull<u8>,
+    phantom: PhantomData<dyn Future<Output = ()> + 'static>,
+}
+
+fn align_up(n: usize, align: usize) -> usize {
+    (n + (align - 1)) & !(align - 1)
 }
 
 impl Task {
     #[must_use]
-    pub fn new<F: Future<Output = ()> + 'static>(future: F) -> Self {
-        Self {
-            p: NonNull::from(Box::leak(Box::new(TaskInner {
-                strong: AlignedAtomicU64(AtomicU64::new(1)),
-                weak: AlignedAtomicU64(AtomicU64::new(1)),
-                future: ManuallyDrop::new(UnsafeCell::new(future)),
-            }))),
+    pub fn new<F: Future<Output = ()> + 'static>(
+        f: F,
+        sender: Sender<Weak>,
+        event_fd: i32,
+    ) -> Task {
+        let layout = Layout::new::<TaskInnerHeader>()
+            .extend(Layout::for_value(&f))
+            .unwrap()
+            .0
+            .pad_to_align();
+
+        let p = unsafe { std::alloc::alloc(layout) };
+        let p = NonNull::new(p).unwrap();
+
+        let header = TaskInnerHeader {
+            strong: AlignedAtomicU64(AtomicU64::new(1)),
+            weak: AlignedAtomicU64(AtomicU64::new(1)),
+            future_vtable: metadata(std::ptr::from_ref(&f as &dyn Future<Output = ()>)),
+            sender: Some(sender),
+            event_fd,
+        };
+
+        unsafe { std::ptr::write(p.as_ptr().cast::<TaskInnerHeader>(), header) };
+
+        let offset = align_up(size_of::<TaskInnerHeader>(), layout.align());
+        unsafe { std::ptr::write(p.as_ptr().add(offset).cast::<F>(), f) };
+
+        Task {
+            p,
             phantom: PhantomData,
         }
     }
 
-    fn inner(&self) -> &TaskInner<dyn Future<Output = ()>> {
-        unsafe { self.p.as_ref() }
+    fn inner(&self) -> &TaskInnerHeader {
+        unsafe { &*self.p.as_ptr().cast::<TaskInnerHeader>() }
+    }
+
+    fn as_ptr(&self) -> *mut (dyn Future<Output = ()> + 'static) {
+        let align = std::cmp::max(
+            align_of::<TaskInnerHeader>(),
+            self.inner().future_vtable.align_of(),
+        );
+
+        let offset = align_up(size_of::<TaskInnerHeader>(), align);
+
+        unsafe {
+            std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(
+                self.p.as_ptr().add(offset),
+                self.inner().future_vtable,
+            )
+        }
+    }
+
+    unsafe fn poll(&mut self, cx: &mut Context) -> Poll<()> {
+        let future = unsafe { &mut *self.as_ptr() };
+        let future = unsafe { Pin::new_unchecked(future) };
+
+        future.poll(cx)
     }
 
     #[must_use]
@@ -122,12 +178,11 @@ impl Drop for Task {
             return;
         }
 
-        // delay the Acquire semantics until we know we need to Drop the T
+        // delay the Acquire semantics until we know we need to drop() the Future
         self.inner().strong.load(Acquire);
 
-        unsafe {
-            ManuallyDrop::drop(&mut (*self.p.as_ptr()).future);
-        }
+        unsafe { std::ptr::drop_in_place(self.as_ptr()) };
+        unsafe { &mut *self.p.as_ptr().cast::<TaskInnerHeader>() }.sender = None;
 
         if self.inner().weak.fetch_sub(1, Release) > 1 {
             return;
@@ -135,12 +190,27 @@ impl Drop for Task {
 
         self.inner().weak.load(Acquire);
 
-        drop(unsafe { Box::from_raw(self.p.as_ptr()) });
+        let align = std::cmp::max(
+            align_of::<TaskInnerHeader>(),
+            self.inner().future_vtable.align_of(),
+        );
+
+        let offset = align_up(size_of::<TaskInnerHeader>(), align);
+
+        let layout = Layout::from_size_align(
+            align_up(offset + self.inner().future_vtable.size_of(), align),
+            align,
+        )
+        .unwrap();
+
+        unsafe {
+            std::alloc::dealloc(self.p.as_ptr(), layout);
+        };
     }
 }
 
 impl Clone for Task {
-    fn clone(&self) -> Self {
+    fn clone(&self) -> Task {
         self.inner().strong.fetch_add(1, Relaxed);
         Self {
             p: self.p,
@@ -166,13 +236,26 @@ impl Hash for Task {
 //-----------------------------------------------------------------------------
 
 pub struct Weak {
-    p: NonNull<TaskInner<dyn Future<Output = ()>>>,
-    phantom: PhantomData<TaskInner<dyn Future<Output = ()>>>,
+    p: NonNull<u8>,
+    phantom: PhantomData<dyn Future<Output = ()> + 'static>,
 }
 
 impl Weak {
-    fn inner(&self) -> &TaskInner<dyn Future<Output = ()>> {
-        unsafe { self.p.as_ref() }
+    fn into_raw(self) -> *const () {
+        let p = self.p.as_ptr().cast();
+        std::mem::forget(self);
+        p
+    }
+
+    unsafe fn from_raw(p: *const ()) -> Weak {
+        Weak {
+            p: NonNull::new(p.cast_mut().cast::<u8>()).unwrap(),
+            phantom: PhantomData,
+        }
+    }
+
+    fn inner(&self) -> &TaskInnerHeader {
+        unsafe { &*self.p.as_ptr().cast::<TaskInnerHeader>() }
     }
 
     fn upgrade(&self) -> Option<Task> {
@@ -211,7 +294,22 @@ impl Drop for Weak {
 
         self.inner().weak.load(Acquire);
 
-        drop(unsafe { Box::from_raw(self.p.as_ptr()) });
+        let align = std::cmp::max(
+            align_of::<TaskInnerHeader>(),
+            self.inner().future_vtable.align_of(),
+        );
+
+        let offset = align_up(size_of::<TaskInnerHeader>(), align);
+
+        let layout = Layout::from_size_align(
+            align_up(offset + self.inner().future_vtable.size_of(), align),
+            align,
+        )
+        .unwrap();
+
+        unsafe {
+            std::alloc::dealloc(self.p.as_ptr(), layout);
+        };
     }
 }
 
@@ -251,6 +349,77 @@ impl std::task::Wake for TaskWaker {
     }
 }
 
+unsafe fn task_waker_clone(p: *const ()) -> RawWaker {
+    let weak = unsafe { Weak::from_raw(p) };
+    std::mem::forget(weak.clone());
+    std::mem::forget(weak);
+    RawWaker::new(p, &TASK_WAKER_VTABLE)
+}
+
+unsafe fn task_wake(p: *const ()) {
+    let weak = unsafe { Weak::from_raw(p) };
+    let task = Weak::upgrade(&weak);
+    match task {
+        None => {}
+        Some(task) => {
+            weak.inner()
+                .sender
+                .as_ref()
+                .unwrap()
+                .send(Task::downgrade(&task))
+                .unwrap();
+
+            let buf = &0x01_u64.to_ne_bytes();
+            unsafe {
+                nix::libc::write(
+                    weak.inner().event_fd,
+                    buf.as_ptr().cast::<c_void>(),
+                    buf.len(),
+                );
+            }
+        }
+    }
+}
+
+unsafe fn task_wake_by_ref(p: *const ()) {
+    let weak = unsafe { Weak::from_raw(p) };
+    let task = Weak::upgrade(&weak);
+    match task {
+        None => {}
+        Some(task) => {
+            weak.inner()
+                .sender
+                .as_ref()
+                .unwrap()
+                .send(Task::downgrade(&task))
+                .unwrap();
+
+            let buf = &0x01_u64.to_ne_bytes();
+            unsafe {
+                nix::libc::write(
+                    weak.inner().event_fd,
+                    buf.as_ptr().cast::<c_void>(),
+                    buf.len(),
+                );
+            }
+        }
+    }
+    std::mem::forget(weak);
+}
+
+unsafe fn task_drop(p: *const ()) {
+    let weak = unsafe { Weak::from_raw(p) };
+    drop(weak);
+}
+
+static TASK_WAKER_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(task_waker_clone, task_wake, task_wake_by_ref, task_drop);
+
+fn make_waker(weak: Weak) -> Waker {
+    let raw_waker = RawWaker::new(weak.into_raw(), &TASK_WAKER_VTABLE);
+    unsafe { Waker::from_raw(raw_waker) }
+}
+
 //-----------------------------------------------------------------------------
 
 struct IoContextFrame {
@@ -262,6 +431,7 @@ struct IoContextFrame {
     sender: Sender<Weak>,
     root_task: Option<Weak>,
     local_task_queue: VecDeque<Weak>,
+    event_fd: EventFd,
 }
 
 //-----------------------------------------------------------------------------
@@ -420,6 +590,7 @@ impl IoContext {
             root_task: None,
             ioring,
             local_task_queue: VecDeque::new(),
+            event_fd: nix::sys::eventfd::EventFd::new().unwrap(),
         }));
 
         {
@@ -459,7 +630,7 @@ impl IoContext {
 
         let mut num_completed = 0;
 
-        let event_fd = nix::sys::eventfd::EventFd::new().unwrap();
+        let event_fd = self.p.borrow().event_fd.as_raw_fd();
         let mut event_count = 0_u64;
 
         let ex = self.get_executor();
@@ -470,7 +641,7 @@ impl IoContext {
 
         let mut need_eventfd_read = true;
 
-        let sender = self.p.borrow().sender.clone();
+        // let sender = self.p.borrow().sender.clone();
 
         loop {
             if self.p.borrow().tasks.is_empty() {
@@ -482,21 +653,20 @@ impl IoContext {
                 if let Some(ref w) = m_item {
                     match w.upgrade() {
                         None => continue,
-                        Some(task) => {
+                        Some(mut task) => {
                             (*self.p).borrow_mut().root_task = Some(w.clone());
 
-                            let w = Arc::new(TaskWaker {
-                                weak_ptr: Some(w.clone()),
-                                sender: sender.clone(),
-                                event_fd: event_fd.as_raw_fd(),
-                            })
-                            .into();
+                            // let w = Arc::new(TaskWaker {
+                            //     weak_ptr: Some(w.clone()),
+                            //     sender: sender.clone(),
+                            //     event_fd: event_fd.as_raw_fd(),
+                            // })
+                            // .into();
+
+                            let w = make_waker(w.clone());
 
                             let mut cx = std::task::Context::from_waker(&w);
-                            if let Poll::Ready(()) =
-                                unsafe { Pin::new_unchecked(&mut *(*task.p.as_ptr()).future.get()) }
-                                    .poll(&mut cx)
-                            {
+                            if let Poll::Ready(()) = unsafe { task.poll(&mut cx) } {
                                 (*self.p).borrow_mut().tasks.remove(&task);
                                 num_completed += 1;
                             }
@@ -512,21 +682,20 @@ impl IoContext {
                 if let Ok(ref w) = m_item {
                     match w.upgrade() {
                         None => continue,
-                        Some(task) => {
+                        Some(mut task) => {
                             (*self.p).borrow_mut().root_task = Some(w.clone());
 
-                            let w = Arc::new(TaskWaker {
-                                weak_ptr: Some(w.clone()),
-                                sender: sender.clone(),
-                                event_fd: event_fd.as_raw_fd(),
-                            })
-                            .into();
+                            // let w = Arc::new(TaskWaker {
+                            //     weak_ptr: Some(w.clone()),
+                            //     sender: sender.clone(),
+                            //     event_fd: event_fd.as_raw_fd(),
+                            // })
+                            // .into();
+
+                            let w = make_waker(w.clone());
 
                             let mut cx = std::task::Context::from_waker(&w);
-                            if let Poll::Ready(()) =
-                                unsafe { Pin::new_unchecked(&mut *(*task.p.as_ptr()).future.get()) }
-                                    .poll(&mut cx)
-                            {
+                            if let Poll::Ready(()) = unsafe { task.poll(&mut cx) } {
                                 (*self.p).borrow_mut().tasks.remove(&task);
                                 num_completed += 1;
                             }
@@ -549,7 +718,7 @@ impl IoContext {
                 let sqe = unsafe { &mut *eventfd_sqe };
                 unsafe {
                     let p = std::ptr::from_mut(&mut event_count).cast::<c_void>();
-                    io_uring_prep_read(sqe, event_fd.as_raw_fd(), p, 8, 0);
+                    io_uring_prep_read(sqe, event_fd, p, 8, 0);
                 }
                 sqe.user_data = 0x01; // sentinel value
                 need_eventfd_read = false;
@@ -698,13 +867,14 @@ impl Executor {
         }));
 
         let sender = self.p.borrow().sender.clone();
+        let event_fd = self.p.borrow().event_fd.as_raw_fd();
 
         let wrapped = WrapperFuture {
             f,
             value: value.clone(),
         };
 
-        let task = Task::new(wrapped);
+        let task = Task::new(wrapped, sender.clone(), event_fd);
 
         sender.send(Task::downgrade(&task)).unwrap();
         (*self.p).borrow_mut().tasks.insert(task);

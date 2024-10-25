@@ -84,6 +84,7 @@ impl Timer {
         }
     }
 
+    #[inline]
     pub fn wait(&mut self, dur: Duration) -> TimerFuture {
         let timer_impl = unsafe { &mut *self.p };
         assert!(!timer_impl.timeout_op.initiated);
