@@ -882,3 +882,125 @@ impl Executor {
         SpawnFuture { value, done: false }
     }
 }
+
+//-----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod test {
+    use std::mem::zeroed;
+
+    use nix::libc::{ECANCELED, ETIME};
+
+    use crate::uring::{
+        __kernel_timespec, io_uring, io_uring_cqe, io_uring_cqe_seen, io_uring_get_sqe,
+        io_uring_prep_timeout, io_uring_prep_timeout_remove, io_uring_queue_exit,
+        io_uring_queue_init, io_uring_submit_and_wait, io_uring_wait_cqe,
+    };
+
+    #[test]
+    fn timeout_inline_submit_cancel() {
+        // want to prove that timeouts and their removals are
+        // processed inline with ring submission.
+        // io_uring processes the SQ from left-to-right and if
+        // the operations complete inline, we should see behavior
+        // reflecting this
+        // this is supposed to replicate a user abusing our Timer future's
+        // usage of cancel-on-drop and also proves that a user can generate
+        // any number of CQEs associated with our user_data, and we must
+        // ignore these CQEs as well
+
+        struct DropGuard {
+            ring: *mut io_uring,
+        }
+
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                unsafe { io_uring_queue_exit(self.ring) };
+            }
+        }
+
+        unsafe {
+            let mut ioring = zeroed::<io_uring>();
+            let ring = &raw mut ioring;
+
+            let ret = io_uring_queue_init(64, ring, 0);
+            assert_eq!(ret, 0);
+
+            let _guard = DropGuard { ring };
+
+            let mut ts = __kernel_timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            };
+
+            {
+                let sqe = io_uring_get_sqe(ring);
+                io_uring_prep_timeout(sqe, &raw mut ts, 0, 0);
+                (*sqe).user_data = 1;
+            }
+
+            {
+                let sqe = io_uring_get_sqe(ring);
+                io_uring_prep_timeout_remove(sqe, 1, 0);
+                (*sqe).user_data = 2;
+            }
+
+            {
+                let sqe = io_uring_get_sqe(ring);
+                io_uring_prep_timeout(sqe, &raw mut ts, 0, 0);
+                (*sqe).user_data = 1;
+            }
+
+            {
+                let sqe = io_uring_get_sqe(ring);
+                io_uring_prep_timeout_remove(sqe, 1, 0);
+                (*sqe).user_data = 3;
+            }
+
+            {
+                let sqe = io_uring_get_sqe(ring);
+                io_uring_prep_timeout(sqe, &raw mut ts, 0, 0);
+                (*sqe).user_data = 1;
+            }
+
+            io_uring_submit_and_wait(ring, 1);
+
+            let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
+
+            {
+                io_uring_wait_cqe(ring, &mut cqe);
+                assert_eq!((*cqe).user_data, 2);
+                assert_eq!((*cqe).res, 0);
+                io_uring_cqe_seen(ring, cqe);
+            }
+
+            {
+                io_uring_wait_cqe(ring, &mut cqe);
+                assert_eq!((*cqe).user_data, 3);
+                assert_eq!((*cqe).res, 0);
+                io_uring_cqe_seen(ring, cqe);
+            }
+
+            {
+                io_uring_wait_cqe(ring, &mut cqe);
+                assert_eq!((*cqe).user_data, 1);
+                assert_eq!(-(*cqe).res, ECANCELED);
+                io_uring_cqe_seen(ring, cqe);
+            }
+
+            {
+                io_uring_wait_cqe(ring, &mut cqe);
+                assert_eq!((*cqe).user_data, 1);
+                assert_eq!(-(*cqe).res, ECANCELED);
+                io_uring_cqe_seen(ring, cqe);
+            }
+
+            {
+                io_uring_wait_cqe(ring, &mut cqe);
+                assert_eq!((*cqe).user_data, 1);
+                assert_eq!(-(*cqe).res, ETIME);
+                io_uring_cqe_seen(ring, cqe);
+            }
+        }
+    }
+}
