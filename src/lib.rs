@@ -156,8 +156,7 @@ impl Task {
         }
     }
 
-    // unsafe because if another thread
-    unsafe fn poll(&mut self, cx: &mut Context) -> Poll<()> {
+    fn poll(&mut self, cx: &mut Context) -> Poll<()> {
         let future = unsafe { &mut *self.as_ptr() };
         let future = unsafe { Pin::new_unchecked(future) };
 
@@ -261,7 +260,9 @@ impl Weak {
         unsafe { &*self.p.as_ptr().cast::<TaskInnerHeader>() }
     }
 
-    fn upgrade(&self) -> Option<Task> {
+    // cannot be safely upgraded across thread boundaries
+    // must only be upgraded on the main thread running the ring
+    unsafe fn upgrade(&self) -> Option<Task> {
         let mut c = self.inner().strong.load(Relaxed);
 
         loop {
@@ -635,7 +636,7 @@ impl IoContext {
             loop {
                 let m_item = self.p.borrow_mut().local_task_queue.pop_front();
                 if let Some(ref w) = m_item {
-                    match w.upgrade() {
+                    match unsafe { w.upgrade() } {
                         None => continue,
                         Some(mut task) => {
                             (*self.p).borrow_mut().root_task = Some(w.clone());
@@ -643,7 +644,7 @@ impl IoContext {
                             let w = make_waker(w.clone());
                             let mut cx = std::task::Context::from_waker(&w);
 
-                            if let Poll::Ready(()) = unsafe { task.poll(&mut cx) } {
+                            if let Poll::Ready(()) = task.poll(&mut cx) {
                                 (*self.p).borrow_mut().tasks.remove(&task);
                                 num_completed += 1;
                             }
@@ -657,7 +658,7 @@ impl IoContext {
             loop {
                 let m_item = self.p.borrow().receiver.try_recv();
                 if let Ok(ref w) = m_item {
-                    match w.upgrade() {
+                    match unsafe { w.upgrade() } {
                         None => continue,
                         Some(mut task) => {
                             (*self.p).borrow_mut().root_task = Some(w.clone());
@@ -665,7 +666,7 @@ impl IoContext {
                             let w = make_waker(w.clone());
                             let mut cx = std::task::Context::from_waker(&w);
 
-                            if let Poll::Ready(()) = unsafe { task.poll(&mut cx) } {
+                            if let Poll::Ready(()) = task.poll(&mut cx) {
                                 (*self.p).borrow_mut().tasks.remove(&task);
                                 num_completed += 1;
                             }
