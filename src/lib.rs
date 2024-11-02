@@ -10,6 +10,7 @@
     clippy::too_many_lines
 )]
 #![feature(ptr_metadata)]
+#![feature(box_as_ptr)]
 
 extern crate nix;
 
@@ -63,6 +64,7 @@ use uring::IORING_SETUP_CQSIZE;
 use uring::IORING_SETUP_DEFER_TASKRUN;
 use uring::IORING_SETUP_SINGLE_ISSUER;
 
+pub mod tcp;
 pub mod time;
 mod uring;
 
@@ -154,6 +156,7 @@ impl Task {
         }
     }
 
+    // unsafe because if another thread
     unsafe fn poll(&mut self, cx: &mut Context) -> Poll<()> {
         let future = unsafe { &mut *self.as_ptr() };
         let future = unsafe { Pin::new_unchecked(future) };
@@ -162,7 +165,7 @@ impl Task {
     }
 
     #[must_use]
-    pub fn downgrade(this: &Task) -> Weak {
+    fn downgrade(this: &Task) -> Weak {
         this.inner().weak.fetch_add(1, Relaxed);
 
         Weak {
@@ -235,7 +238,7 @@ impl Hash for Task {
 
 //-----------------------------------------------------------------------------
 
-pub struct Weak {
+struct Weak {
     p: NonNull<u8>,
     phantom: PhantomData<dyn Future<Output = ()> + 'static>,
 }
@@ -328,26 +331,6 @@ unsafe impl Sync for Weak {}
 unsafe impl Send for Weak {}
 
 //-----------------------------------------------------------------------------
-
-pub struct TaskWaker {
-    weak_ptr: Option<Weak>,
-    sender: Sender<Weak>,
-    event_fd: i32,
-}
-
-impl std::task::Wake for TaskWaker {
-    fn wake(self: std::sync::Arc<Self>) {
-        let s = self.sender.clone();
-        if let Some(weak_ptr) = &self.weak_ptr {
-            s.send(weak_ptr.clone()).unwrap();
-
-            let buf = &0x01_u64.to_ne_bytes();
-            unsafe {
-                nix::libc::write(self.event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
-            }
-        }
-    }
-}
 
 unsafe fn task_waker_clone(p: *const ()) -> RawWaker {
     let weak = unsafe { Weak::from_raw(p) };
@@ -465,6 +448,7 @@ unsafe fn release(rc: *mut RefCount) {
 
 enum OpType {
     Timeout,
+    #[allow(dead_code)]
     TimeoutCancel,
 }
 
@@ -656,16 +640,9 @@ impl IoContext {
                         Some(mut task) => {
                             (*self.p).borrow_mut().root_task = Some(w.clone());
 
-                            // let w = Arc::new(TaskWaker {
-                            //     weak_ptr: Some(w.clone()),
-                            //     sender: sender.clone(),
-                            //     event_fd: event_fd.as_raw_fd(),
-                            // })
-                            // .into();
-
                             let w = make_waker(w.clone());
-
                             let mut cx = std::task::Context::from_waker(&w);
+
                             if let Poll::Ready(()) = unsafe { task.poll(&mut cx) } {
                                 (*self.p).borrow_mut().tasks.remove(&task);
                                 num_completed += 1;
@@ -685,16 +662,9 @@ impl IoContext {
                         Some(mut task) => {
                             (*self.p).borrow_mut().root_task = Some(w.clone());
 
-                            // let w = Arc::new(TaskWaker {
-                            //     weak_ptr: Some(w.clone()),
-                            //     sender: sender.clone(),
-                            //     event_fd: event_fd.as_raw_fd(),
-                            // })
-                            // .into();
-
                             let w = make_waker(w.clone());
-
                             let mut cx = std::task::Context::from_waker(&w);
+
                             if let Poll::Ready(()) = unsafe { task.poll(&mut cx) } {
                                 (*self.p).borrow_mut().tasks.remove(&task);
                                 num_completed += 1;
@@ -745,18 +715,21 @@ impl IoContext {
                 let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
                 match op.op_type {
                     OpType::Timeout => {
-                        if !op.eager_dropped {
-                            op.done = true;
-                            op.res = cqe.res;
-                            if let Some(weak) = op.weak.take() {
-                                self.p.borrow_mut().local_task_queue.push_back(weak);
-                            }
-                        }
-                        op.eager_dropped = false;
                         unsafe { release(op.ref_count) };
+
+                        if op.eager_dropped {
+                            drop(unsafe { Box::from_raw(op) });
+                            continue;
+                        }
+
+                        op.done = true;
+                        op.res = cqe.res;
+                        if let Some(weak) = op.weak.take() {
+                            self.p.borrow_mut().local_task_queue.push_back(weak);
+                        }
                     }
                     OpType::TimeoutCancel => {
-                        unsafe { release(op.ref_count) };
+                        todo!()
                     }
                 }
             }
