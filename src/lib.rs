@@ -6,6 +6,7 @@
 #![allow(
     clippy::mutable_key_type,
     clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
     clippy::cast_ptr_alignment,
     clippy::too_many_lines
 )]

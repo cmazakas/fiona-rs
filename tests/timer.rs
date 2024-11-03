@@ -139,7 +139,13 @@ fn timer_early_drop() {
 }
 
 #[test]
+#[inline(never)]
 fn timer_forget_expired() {
+    // this function must be marked inline(never) because if its name disappears,
+    // it's cumbersome to ignore it in an lsan suppression file
+    // preventing it from being inlined ensures that its name is always visible for
+    // the purposes of suppression and matching
+
     // because we allocate operation state per Future, if we forget()
     // a timer future, we should only get a spurious poll() (which is sound)
     // and then a memory leak
