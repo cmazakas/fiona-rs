@@ -8,7 +8,8 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
     clippy::cast_ptr_alignment,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::similar_names
 )]
 #![feature(ptr_metadata)]
 #![feature(box_as_ptr)]
@@ -450,6 +451,7 @@ unsafe fn release(rc: *mut RefCount) {
 
 enum OpType {
     Timeout,
+    TcpAccept,
     #[allow(dead_code)]
     TimeoutCancel,
 }
@@ -514,10 +516,13 @@ struct RunGuard {
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        let frame = &mut *self.p.borrow_mut();
-        let ring = &raw mut frame.ioring;
-        unsafe { submit_ring(ring) };
-        frame.tasks.clear();
+        let ring;
+        {
+            let frame = &mut *self.p.borrow_mut();
+            ring = &raw mut frame.ioring;
+            unsafe { submit_ring(ring) };
+            frame.tasks.clear();
+        }
 
         unsafe { io_uring_get_events(ring) };
         let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
@@ -526,6 +531,9 @@ impl Drop for RunGuard {
             if cqe.user_data != 0 && cqe.user_data != 1 {
                 let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
                 unsafe { release(op.ref_count) };
+                if op.eager_dropped {
+                    drop(unsafe { Box::from_raw(op) });
+                }
             }
 
             unsafe { io_uring_cqe_seen(ring, cqe) };
@@ -733,6 +741,25 @@ impl IoContext {
                     OpType::TimeoutCancel => {
                         todo!()
                     }
+                    OpType::TcpAccept => {
+                        unsafe { release(op.ref_count) };
+
+                        let res = cqe.res;
+
+                        if op.eager_dropped {
+                            drop(unsafe { Box::from_raw(op) });
+                            if res < 0 {
+                                todo!("must close the tcp stream here");
+                            }
+                            continue;
+                        }
+
+                        op.done = true;
+                        op.res = res;
+                        if let Some(weak) = op.weak.take() {
+                            self.p.borrow_mut().local_task_queue.push_back(weak);
+                        }
+                    }
                 }
             }
 
@@ -831,9 +858,9 @@ impl Executor {
         unsafe { &raw mut (*self.p.as_ptr()).ioring }
     }
 
-    // fn get_available_fd(&self) -> Option<u32> {
-    //     self.p.borrow_mut().available_fds.pop_front()
-    // }
+    fn get_available_fd(&self) -> Option<u32> {
+        self.p.borrow_mut().available_fds.pop_front()
+    }
 
     pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T> {
         let value = Rc::new(RefCell::new(SpawnValue {
