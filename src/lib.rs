@@ -45,6 +45,8 @@ use std::task::Waker;
 use nix::libc::c_void;
 
 use nix::sys::eventfd::EventFd;
+use nix::sys::socket::SockaddrStorage;
+use nix::sys::time::TimeSpec;
 use uring::io_uring;
 use uring::io_uring_cq_advance;
 use uring::io_uring_cq_ready;
@@ -450,8 +452,18 @@ unsafe fn release(rc: *mut RefCount) {
 //-----------------------------------------------------------------------------
 
 enum OpType {
-    Timeout,
+    Timeout {
+        dur: TimeSpec,
+    },
     TcpAccept,
+    TcpConnect {
+        addr: SockaddrStorage,
+        port: u16,
+        ts: TimeSpec,
+        needs_socket: bool,
+        got_socket: bool,
+        fd: i32,
+    },
     #[allow(dead_code)]
     TimeoutCancel,
 }
@@ -522,6 +534,7 @@ impl Drop for RunGuard {
             ring = &raw mut frame.ioring;
             unsafe { submit_ring(ring) };
             frame.tasks.clear();
+            frame.local_task_queue.clear();
         }
 
         unsafe { io_uring_get_events(ring) };
@@ -724,7 +737,7 @@ impl IoContext {
 
                 let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
                 match op.op_type {
-                    OpType::Timeout => {
+                    OpType::Timeout { .. } => {
                         unsafe { release(op.ref_count) };
 
                         if op.eager_dropped {
@@ -748,7 +761,7 @@ impl IoContext {
 
                         if op.eager_dropped {
                             drop(unsafe { Box::from_raw(op) });
-                            if res < 0 {
+                            if res >= 0 {
                                 todo!("must close the tcp stream here");
                             }
                             continue;
@@ -758,6 +771,37 @@ impl IoContext {
                         op.res = res;
                         if let Some(weak) = op.weak.take() {
                             self.p.borrow_mut().local_task_queue.push_back(weak);
+                        }
+                    }
+                    OpType::TcpConnect {
+                        ref mut needs_socket,
+                        ref mut got_socket,
+                        ..
+                    } => {
+                        if op.eager_dropped {
+                            // if the Future was eager-dropped:
+                            // * we need to release the borrowed direct descriptor back to the pool
+                            // * if the connect() succeeded, we need to close() it
+
+                            unsafe { release(op.ref_count) };
+                            drop(unsafe { Box::from_raw(op) });
+                            // continue;
+                            todo!();
+                        }
+
+                        if cqe.res < 0 || *got_socket {
+                            unsafe { release(op.ref_count) };
+
+                            op.res = cqe.res;
+                            op.done = true;
+                            if let Some(weak) = op.weak.take() {
+                                self.p.borrow_mut().local_task_queue.push_back(weak);
+                            }
+                            continue;
+                        }
+
+                        if *needs_socket {
+                            *got_socket = true;
                         }
                     }
                 }
@@ -860,6 +904,14 @@ impl Executor {
 
     fn get_available_fd(&self) -> Option<u32> {
         self.p.borrow_mut().available_fds.pop_front()
+    }
+
+    fn reclaim_fd(&self, fd: u32) {
+        self.p.borrow_mut().available_fds.push_back(fd);
+    }
+
+    fn get_root_task(&self) -> Weak {
+        self.p.borrow().root_task.clone().unwrap()
     }
 
     pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T> {

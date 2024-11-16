@@ -9,7 +9,10 @@ use nix::errno::Errno;
 use nix::libc::ETIME;
 use nix::sys::time::TimeSpec;
 
-use crate::uring::{__kernel_timespec, io_uring_get_sqe};
+use crate::uring::{
+    __kernel_timespec, io_uring_get_sqe, io_uring_sqe_set_data, io_uring_sqe_set_data64,
+    io_uring_sqe_set_flags, IOSQE_CQE_SKIP_SUCCESS,
+};
 use crate::uring::{io_uring_prep_timeout, io_uring_prep_timeout_remove};
 use crate::Result;
 use crate::{add_ref, IoUringOp};
@@ -21,7 +24,6 @@ use crate::{Executor, OpType};
 struct TimerImpl {
     ref_count: RefCount,
     ex: Executor,
-    dur: Option<TimeSpec>,
 }
 
 pub struct Timer {
@@ -47,11 +49,7 @@ impl Timer {
             obj: p,
         };
 
-        let timer_impl = TimerImpl {
-            ref_count,
-            ex,
-            dur: None,
-        };
+        let timer_impl = TimerImpl { ref_count, ex };
 
         let p = p.cast::<TimerImpl>();
         unsafe { std::ptr::write(p, timer_impl) };
@@ -66,13 +64,6 @@ impl Timer {
     pub fn wait(&mut self, dur: Duration) -> TimerFuture {
         let timer_impl = unsafe { &mut *self.p };
 
-        timer_impl.dur = Some(TimeSpec::new(
-            dur.as_secs().try_into().unwrap(),
-            dur.subsec_nanos().into(),
-        ));
-
-        let weak = timer_impl.ex.p.borrow().root_task.clone().unwrap();
-
         TimerFuture {
             timer: self,
             completed: false,
@@ -82,8 +73,13 @@ impl Timer {
                 done: false,
                 eager_dropped: false,
                 res: -1,
-                weak: Some(weak),
-                op_type: OpType::Timeout,
+                weak: None,
+                op_type: OpType::Timeout {
+                    dur: TimeSpec::new(
+                        dur.as_secs().try_into().unwrap(),
+                        dur.subsec_nanos().into(),
+                    ),
+                },
             })),
         }
     }
@@ -109,13 +105,8 @@ impl Drop for TimerFuture<'_> {
 
             let user_data = Box::as_mut_ptr(op) as usize as u64;
             unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
-            unsafe { (*sqe).user_data = 0 };
-
-            // TODO: manually add this at some point because bindgen isn't capable of
-            // currently handling IOSQE_CQE_SKIP_SUCCESS_BIT being an enum so it never
-            // generates the appropriate constants
-            //
-            // unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
 
             // TODO: should we eventually remove this? because we now allocate
             // per-Future state, so long as we mark this operation as eager-dropped,
@@ -152,8 +143,6 @@ impl Future for TimerFuture<'_> {
 
                 let res = op.res;
 
-                timer_impl.dur = None;
-
                 self.op = Some(op);
                 if res < 0 {
                     let res = -res;
@@ -167,7 +156,7 @@ impl Future for TimerFuture<'_> {
                 }
             }
             (true, false) => {
-                op.weak = Some(timer_impl.ex.p.borrow().root_task.clone().unwrap());
+                op.weak = Some(timer_impl.ex.get_root_task());
                 self.op = Some(op);
                 Poll::Pending
             }
@@ -177,13 +166,16 @@ impl Future for TimerFuture<'_> {
                 unsafe { reserve_sqes(ring, 1) };
                 let sqe = unsafe { io_uring_get_sqe(ring) };
 
-                let ts = std::ptr::from_mut(timer_impl.dur.as_mut().unwrap());
+                let ts = match op.op_type {
+                    OpType::Timeout { ref mut dur } => &raw mut *dur,
+                    _ => unreachable!(),
+                };
 
                 unsafe { io_uring_prep_timeout(sqe, ts.cast::<__kernel_timespec>(), 0, 0) };
-                unsafe { (*sqe).user_data = Box::as_mut_ptr(&mut op) as usize as u64 };
-                unsafe { add_ref(&raw mut timer_impl.ref_count) };
+                unsafe { io_uring_sqe_set_data(sqe, Box::as_mut_ptr(&mut op).cast()) };
 
-                op.weak = Some(timer_impl.ex.p.borrow().root_task.clone().unwrap());
+                unsafe { add_ref(&raw mut timer_impl.ref_count) };
+                op.weak = Some(timer_impl.ex.get_root_task());
                 op.initiated = true;
                 self.op = Some(op);
                 Poll::Pending

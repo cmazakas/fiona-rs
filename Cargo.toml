@@ -19,4 +19,4 @@ futures = "0.3.30"
 
 [profile.release-with-debug]
 inherits = "release"
-debug = "line-tables-only"
+debug = "full"
