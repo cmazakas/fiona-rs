@@ -2,7 +2,7 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-#![allow(dead_code, clippy::needless_pass_by_value, unused_variables)]
+#![allow(dead_code, unused_variables)]
 
 use std::{
     alloc::Layout,
@@ -54,9 +54,22 @@ struct ClientImpl {
     ts: TimeSpec,
 }
 
+#[repr(C)]
+struct StreamImpl {
+    ref_count: RefCount,
+    ex: Executor,
+    fd: i32,
+    ts: TimeSpec,
+}
+
 pub struct Acceptor {
     p: *mut AcceptorImpl,
     phantom: PhantomData<AcceptorImpl>,
+}
+
+pub struct Stream {
+    p: *mut StreamImpl,
+    phantom: PhantomData<StreamImpl>,
 }
 
 pub struct Client {
@@ -75,6 +88,14 @@ pub struct ConnectFuture<'a> {
     completed: bool,
     op: Option<Box<IoUringOp>>,
 }
+
+pub struct CloseFuture<'a> {
+    stream: &'a mut Stream,
+    completed: bool,
+    op: Option<Box<IoUringOp>>,
+}
+
+//-----------------------------------------------------------------------------
 
 impl Acceptor {
     pub fn new(ex: Executor, ipv4_addr: Ipv4Addr, port: u16) -> Result<Acceptor> {
@@ -152,7 +173,7 @@ impl Acceptor {
         let acceptor_impl = unsafe { &mut *self.p };
         let ref_count = &raw mut acceptor_impl.ref_count;
 
-        let weak = acceptor_impl.ex.p.borrow().root_task.clone().unwrap();
+        let weak = acceptor_impl.ex.get_root_task();
 
         AcceptFuture {
             acceptor: self,
@@ -180,25 +201,22 @@ impl Drop for AcceptorImpl {
     fn drop(&mut self) {
         if self.fd >= 0 {
             let ring = self.ex.ring();
+            let fd = self.fd.try_into().unwrap();
 
             unsafe { reserve_sqes(ring, 1) };
 
             let sqe = unsafe { io_uring_get_sqe(ring) };
-            unsafe { io_uring_prep_close_direct(sqe, self.fd.try_into().unwrap()) };
-            unsafe { (*sqe).user_data = 0 };
+            unsafe { io_uring_prep_close_direct(sqe, fd) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
             unsafe { submit_ring(ring) };
 
-            self.ex
-                .p
-                .borrow_mut()
-                .available_fds
-                .push_back(self.fd.try_into().unwrap());
+            self.ex.reclaim_fd(fd);
         }
     }
 }
 
 impl Future for AcceptFuture<'_> {
-    type Output = Result<i32>;
+    type Output = Result<Stream>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -221,11 +239,12 @@ impl Future for AcceptFuture<'_> {
                     let res = -res;
                     Poll::Ready(Err(Errno::from_raw(res)))
                 } else {
-                    Poll::Ready(Ok(res))
+                    let fd = res;
+                    Poll::Ready(Ok(Stream::new(acceptor_impl.ex.clone(), fd)))
                 }
             }
             (true, false) => {
-                op.weak = Some(acceptor_impl.ex.p.borrow().root_task.clone().unwrap());
+                op.weak = Some(acceptor_impl.ex.get_root_task());
                 self.op = Some(op);
                 Poll::Pending
             }
@@ -233,13 +252,10 @@ impl Future for AcceptFuture<'_> {
             (false, false) => {
                 let ring = acceptor_impl.ex.ring();
 
-                let file_index = acceptor_impl.ex.get_available_fd();
-                if file_index.is_none() {
+                let Some(file_index) = acceptor_impl.ex.get_available_fd() else {
                     self.completed = true;
                     return Poll::Ready(Err(Errno::from_raw(ENFILE)));
-                }
-
-                let file_index = file_index.unwrap();
+                };
 
                 unsafe { reserve_sqes(ring, 1) };
                 let sqe = unsafe { io_uring_get_sqe(ring) };
@@ -258,7 +274,7 @@ impl Future for AcceptFuture<'_> {
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) };
 
                 unsafe { add_ref(&raw mut acceptor_impl.ref_count) };
-                op.weak = Some(acceptor_impl.ex.p.borrow().root_task.clone().unwrap());
+                op.weak = Some(acceptor_impl.ex.get_root_task());
                 op.initiated = true;
                 self.op = Some(op);
                 Poll::Pending
@@ -269,12 +285,15 @@ impl Future for AcceptFuture<'_> {
 
 impl Drop for AcceptFuture<'_> {
     fn drop(&mut self) {
-        let p = self.acceptor.p;
-        let acceptor_impl = unsafe { &mut *p };
+        let acceptor_impl = unsafe { &mut *self.acceptor.p };
 
         let op = self.op.as_mut().unwrap();
 
         if op.initiated && !op.done {
+            // We haven't seen the CQE yet, this means we can't reason about how long
+            // io_uring needs our operation state to stay alive, thus we must leak.
+            // But first, we attempt cancellation across the board for our file descriptor
+
             let ring = acceptor_impl.ex.ring();
             unsafe { reserve_sqes(ring, 1) };
             let sqe = unsafe { io_uring_get_sqe(ring) };
@@ -287,24 +306,74 @@ impl Drop for AcceptFuture<'_> {
                     IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED,
                 );
             }
-            unsafe { (*sqe).user_data = 0 };
+
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
 
             // TODO: same as TimerFuture::drop() comments
 
             op.eager_dropped = true;
             op.weak = None;
             Box::leak(self.op.take().unwrap());
+            return;
+        }
+
+        if !self.completed && op.res >= 0 {
+            // We've seen the CQE and we've successfully accepted a client connection but
+            // we're still eager-dropping the Future (i.e. it never returned Poll::Ready).
+            // Because the user is never going to retrieve the RAII handle to the accepted
+            // connection, we have to remember to close it manually.
+
+            assert!(op.initiated);
+            assert!(op.done);
+
+            let fd = op.res.try_into().unwrap();
+
+            let ring = acceptor_impl.ex.ring();
+
+            unsafe { reserve_sqes(ring, 1) };
+
+            unsafe {
+                let sqe = io_uring_get_sqe(ring);
+                io_uring_prep_close_direct(sqe, fd);
+                io_uring_sqe_set_data64(sqe, 0);
+                io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+            }
+
+            unsafe { submit_ring(ring) };
+            acceptor_impl.ex.reclaim_fd(fd);
         }
     }
 }
 
 //-----------------------------------------------------------------------------
 
+impl Drop for StreamImpl {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            let ring = self.ex.ring();
+            let fd = self.fd.try_into().unwrap();
+
+            unsafe { reserve_sqes(ring, 1) };
+
+            unsafe {
+                let sqe = io_uring_get_sqe(ring);
+                io_uring_prep_close_direct(sqe, fd);
+                io_uring_sqe_set_data64(sqe, 0);
+                io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+            }
+
+            unsafe { submit_ring(ring) };
+            self.ex.reclaim_fd(fd);
+        }
+    }
+}
+
 impl Drop for ClientImpl {
     fn drop(&mut self) {
         if self.fd >= 0 {
             let ring = self.ex.ring();
-            let fd: u32 = self.fd.try_into().unwrap();
+            let fd = self.fd.try_into().unwrap();
 
             unsafe { reserve_sqes(ring, 1) };
 
@@ -322,6 +391,35 @@ impl Drop for ClientImpl {
 }
 
 //-----------------------------------------------------------------------------
+
+impl Stream {
+    #[must_use]
+    fn new(ex: Executor, fd: i32) -> Stream {
+        let layout = Layout::new::<StreamImpl>();
+        let p = unsafe { std::alloc::alloc(layout) };
+
+        let ref_count = RefCount {
+            count: 1,
+            release_impl: release_impl::<StreamImpl>,
+            obj: p,
+        };
+
+        let stream_impl = StreamImpl {
+            ref_count,
+            ex,
+            fd,
+            ts: TimeSpec::from_duration(Duration::from_secs(3)),
+        };
+
+        let p = p.cast::<StreamImpl>();
+        unsafe { std::ptr::write(p, stream_impl) };
+
+        Stream {
+            p,
+            phantom: PhantomData,
+        }
+    }
+}
 
 impl Client {
     #[must_use]
@@ -380,11 +478,21 @@ impl Client {
     }
 }
 
+//-----------------------------------------------------------------------------
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        unsafe { release(self.p.cast::<RefCount>()) };
+    }
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         unsafe { release(self.p.cast::<RefCount>()) };
     }
 }
+
+//-----------------------------------------------------------------------------
 
 impl Future for ConnectFuture<'_> {
     type Output = Result<()>;
@@ -423,12 +531,16 @@ impl Future for ConnectFuture<'_> {
                     unreachable!();
                 };
 
-                let (af, addrlen) = if let Some(x) = addr.as_sockaddr_in() {
-                    (AF_INET, std::mem::size_of_val(x))
-                } else if let Some(x) = addr.as_sockaddr_in6() {
-                    (AF_INET6, std::mem::size_of_val(x))
-                } else {
-                    unreachable!();
+                assert!(*fd < 0);
+
+                let (af, addrlen) = {
+                    if let Some(x) = addr.as_sockaddr_in() {
+                        (AF_INET, std::mem::size_of_val(x))
+                    } else if let Some(x) = addr.as_sockaddr_in6() {
+                        (AF_INET6, std::mem::size_of_val(x))
+                    } else {
+                        unreachable!();
+                    }
                 };
 
                 let Some(file_index) = client_impl.ex.get_available_fd() else {

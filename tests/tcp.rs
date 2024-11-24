@@ -48,9 +48,7 @@ fn tcp_acceptor_hello_world() {
     let port = acceptor.port();
 
     ex.spawn(async move {
-        let fd = acceptor.accept().await.unwrap();
-        assert!(fd >= 0);
-
+        let _stream = acceptor.accept().await.unwrap();
         unsafe { NUM_RUNS += 1 };
     });
 

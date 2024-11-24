@@ -57,16 +57,20 @@ use uring::io_uring_get_sqe;
 use uring::io_uring_params;
 use uring::io_uring_peek_batch_cqe;
 use uring::io_uring_peek_cqe;
+use uring::io_uring_prep_close_direct;
 use uring::io_uring_prep_read;
 use uring::io_uring_queue_init_params;
 use uring::io_uring_register_files_sparse;
 use uring::io_uring_register_ring_fd;
 use uring::io_uring_sq_space_left;
+use uring::io_uring_sqe_set_data64;
+use uring::io_uring_sqe_set_flags;
 use uring::io_uring_submit_and_get_events;
 use uring::io_uring_submit_and_wait;
 use uring::IORING_SETUP_CQSIZE;
 use uring::IORING_SETUP_DEFER_TASKRUN;
 use uring::IORING_SETUP_SINGLE_ISSUER;
+use uring::IOSQE_CQE_SKIP_SUCCESS;
 
 pub mod tcp;
 pub mod time;
@@ -761,8 +765,21 @@ impl IoContext {
 
                         if op.eager_dropped {
                             drop(unsafe { Box::from_raw(op) });
+
                             if res >= 0 {
-                                todo!("must close the tcp stream here");
+                                let fd = op.res.try_into().unwrap();
+
+                                unsafe { reserve_sqes(ring, 1) };
+
+                                unsafe {
+                                    let sqe = io_uring_get_sqe(ring);
+                                    io_uring_prep_close_direct(sqe, fd);
+                                    io_uring_sqe_set_data64(sqe, 0);
+                                    io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+                                }
+
+                                unsafe { submit_ring(ring) };
+                                ex.reclaim_fd(fd);
                             }
                             continue;
                         }
