@@ -536,12 +536,13 @@ impl Drop for RunGuard {
         {
             let frame = &mut *self.p.borrow_mut();
             ring = &raw mut frame.ioring;
-            unsafe { submit_ring(ring) };
             frame.tasks.clear();
             frame.local_task_queue.clear();
         }
 
         unsafe { io_uring_get_events(ring) };
+        unsafe { submit_ring(ring) };
+
         let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
         while unsafe { io_uring_peek_cqe(ring, &raw mut cqe) } == 0 {
             let cqe = unsafe { &mut *cqe };

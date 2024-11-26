@@ -7,7 +7,7 @@ use std::{
 };
 
 async fn timer_op(ex: fiona::Executor, anums: Arc<AtomicI32>) {
-    let mut timer = fiona::time::Timer::new(ex);
+    let timer = fiona::time::Timer::new(ex);
     for _ in 0..10_000 {
         assert!(timer.wait(Duration::from_millis(1)).await.is_ok());
         anums.fetch_add(1, Relaxed);

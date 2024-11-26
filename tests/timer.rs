@@ -56,7 +56,7 @@ fn timer_simple() {
     static mut NUM_RUNS: u64 = 0;
 
     async fn f1(ex: fiona::Executor) {
-        let mut timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(ex);
         let dur = Duration::from_millis(250);
 
         let _guard = DurationGuard::new(dur);
@@ -82,7 +82,7 @@ fn timer_multi() {
     static mut NUM_RUNS: u64 = 0;
 
     async fn f1(ex: fiona::Executor) {
-        let mut timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(ex);
         for _ in 0..3 {
             let dur = Duration::from_millis(250);
             let _guard = DurationGuard::new(dur);
@@ -111,19 +111,22 @@ fn timer_early_drop() {
     static mut NUM_RUNS: u64 = 0;
 
     async fn f1(ex: fiona::Executor) {
-        let dur = Duration::from_millis(100);
-        let mut timer = fiona::time::Timer::new(ex);
-        let mut f = timer.wait(dur);
-        {
-            let w = WakerFuture.await;
-            assert!(std::pin::pin!(&mut f)
-                .poll(&mut std::task::Context::from_waker(&w))
-                .is_pending());
-
-            drop(f);
-        }
+        let dur = Duration::from_millis(200);
+        let timer = fiona::time::Timer::new(ex);
 
         let _guard = DurationGuard::new(dur);
+        for _ in 0..5 {
+            let mut f = timer.wait(dur);
+            {
+                let w = WakerFuture.await;
+                assert!(std::pin::pin!(&mut f)
+                    .poll(&mut std::task::Context::from_waker(&w))
+                    .is_pending());
+
+                drop(f);
+            }
+        }
+
         timer.wait(dur).await.unwrap();
         unsafe { NUM_RUNS += 1 };
     }
@@ -139,7 +142,29 @@ fn timer_early_drop() {
 }
 
 #[test]
+#[should_panic = "assertion failed: !timer_impl.timeout_pending"]
+fn timer_shared_panic() {
+    // we use interior mutability for an ergonomic API but we should never
+    // permit more than one concurrent timeout operation on the Timer object.
+
+    async fn f1(timer: fiona::time::Timer) {
+        timer.wait(Duration::from_millis(250)).await.unwrap();
+    }
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let timer = fiona::time::Timer::new(ex.clone());
+
+    ex.clone().spawn(f1(timer.clone()));
+    ex.clone().spawn(f1(timer.clone()));
+
+    let _n = ioc.run();
+}
+
+#[test]
 #[inline(never)]
+#[should_panic = "assertion failed: !timer_impl.timeout_pending"]
 fn timer_forget_expired() {
     // this function must be marked inline(never) because if its name disappears,
     // it's cumbersome to ignore it in an lsan suppression file
@@ -154,7 +179,7 @@ fn timer_forget_expired() {
     static mut NUM_RUNS: u64 = 0;
 
     async fn f1(ex: fiona::Executor) {
-        let mut timer = fiona::time::Timer::new(ex.clone());
+        let timer = fiona::time::Timer::new(ex.clone());
         let mut f = timer.wait(Duration::from_millis(100));
         {
             let w = WakerFuture.await;
@@ -167,11 +192,10 @@ fn timer_forget_expired() {
 
         {
             let _guard = DurationGuard::new(Duration::from_millis(100));
-            let mut timer2 = fiona::time::Timer::new(ex);
+            let timer2 = fiona::time::Timer::new(ex);
             timer2.wait(Duration::from_millis(100)).await.unwrap();
         }
 
-        let _guard = DurationGuard::new(Duration::from_millis(100));
         timer.wait(Duration::from_millis(100)).await.unwrap();
         unsafe { NUM_RUNS += 1 };
     }
@@ -198,7 +222,7 @@ fn timer_multiple_eager_drops() {
     static mut NUM_RUNS: u64 = 0;
 
     async fn f1(ex: fiona::Executor) {
-        let mut timer = fiona::time::Timer::new(ex.clone());
+        let timer = fiona::time::Timer::new(ex.clone());
         let w = WakerFuture.await;
         let mut cx = std::task::Context::from_waker(&w);
 
@@ -241,7 +265,7 @@ fn timer_multiple_eager_drops() {
 //-----------------------------------------------------------------------------
 
 async fn wait_for<T>(ex: fiona::Executor, dur: Duration, t: T) -> T {
-    let mut timer = fiona::time::Timer::new(ex);
+    let timer = fiona::time::Timer::new(ex);
     timer.wait(dur).await.unwrap();
     t
 }
@@ -286,11 +310,11 @@ fn timer_futures_select() {
     // also test that our waker is correctly implemented as well.
 
     async fn f1(ex: fiona::Executor) {
-        let mut timer1 = fiona::time::Timer::new(ex.clone());
-        let mut timer2 = fiona::time::Timer::new(ex.clone());
-        let mut timer3 = fiona::time::Timer::new(ex.clone());
-        let mut timer4 = fiona::time::Timer::new(ex.clone());
-        let mut timer5 = fiona::time::Timer::new(ex.clone());
+        let timer1 = fiona::time::Timer::new(ex.clone());
+        let timer2 = fiona::time::Timer::new(ex.clone());
+        let timer3 = fiona::time::Timer::new(ex.clone());
+        let timer4 = fiona::time::Timer::new(ex.clone());
+        let timer5 = fiona::time::Timer::new(ex.clone());
 
         {
             let _guard = DurationGuard::new(Duration::from_millis(100));
