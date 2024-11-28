@@ -7,16 +7,16 @@
 use std::{
     alloc::Layout,
     future::Future,
-    marker::PhantomData,
     net::{Ipv4Addr, SocketAddrV4},
     os::fd::AsRawFd,
+    ptr::NonNull,
     task::Poll,
     time::Duration,
 };
 
 use nix::{
     errno::Errno,
-    libc::{AF_INET, AF_INET6, ENFILE, IPPROTO_TCP, SOCK_STREAM},
+    libc::{AF_INET, AF_INET6, ENFILE, IPPROTO_TCP, MSG_WAITALL, SOCK_STREAM},
     sys::{
         socket::{
             bind, getsockname, listen, socket, AddressFamily, Backlog, SockFlag, SockProtocol,
@@ -31,66 +31,67 @@ use crate::{
     uring::{
         io_uring_get_sqe, io_uring_prep_accept_direct, io_uring_prep_cancel_fd,
         io_uring_prep_close_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
-        io_uring_prep_socket_direct, io_uring_register_files_update, io_uring_sqe_set_data,
-        io_uring_sqe_set_data64, io_uring_sqe_set_flags, IORING_ASYNC_CANCEL_ALL,
-        IORING_ASYNC_CANCEL_FD_FIXED, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK,
+        io_uring_prep_send_zc, io_uring_prep_socket_direct, io_uring_register_files_update,
+        io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+        IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED, IOSQE_CQE_SKIP_SUCCESS,
+        IOSQE_FIXED_FILE, IOSQE_IO_LINK,
     },
     Executor, IoUringOp, OpType, RefCount, Result,
 };
 
-#[repr(C)]
 struct AcceptorImpl {
     ref_count: RefCount,
     ex: Executor,
     fd: i32,
     addr: SockaddrStorage,
+    accept_pending: bool,
 }
 
-#[repr(C)]
-struct ClientImpl {
-    ref_count: RefCount,
-    ex: Executor,
-    fd: i32,
-    ts: TimeSpec,
-}
-
-#[repr(C)]
 struct StreamImpl {
     ref_count: RefCount,
     ex: Executor,
     fd: i32,
     ts: TimeSpec,
+    send_pending: bool,
+}
+
+struct ClientImpl {
+    stream: StreamImpl,
+    connect_pending: bool,
 }
 
 pub struct Acceptor {
-    p: *mut AcceptorImpl,
-    phantom: PhantomData<AcceptorImpl>,
+    p: NonNull<AcceptorImpl>,
 }
 
 pub struct Stream {
-    p: *mut StreamImpl,
-    phantom: PhantomData<StreamImpl>,
+    p: NonNull<StreamImpl>,
 }
 
 pub struct Client {
-    p: *mut ClientImpl,
-    phantom: PhantomData<ClientImpl>,
+    p: NonNull<ClientImpl>,
 }
 
 pub struct AcceptFuture<'a> {
-    acceptor: &'a mut Acceptor,
+    acceptor: &'a Acceptor,
     completed: bool,
     op: Option<Box<IoUringOp>>,
 }
 
 pub struct ConnectFuture<'a> {
-    client: &'a mut Client,
+    client: &'a Client,
+    completed: bool,
+    op: Option<Box<IoUringOp>>,
+}
+
+pub struct SendFuture<'a> {
+    stream: &'a Stream,
     completed: bool,
     op: Option<Box<IoUringOp>>,
 }
 
 pub struct CloseFuture<'a> {
-    stream: &'a mut Stream,
+    stream: &'a Stream,
     completed: bool,
     op: Option<Box<IoUringOp>>,
 }
@@ -114,6 +115,8 @@ impl Acceptor {
 
         let ring = ex.ring();
         let fd = socket.as_raw_fd();
+
+        // we need to do this for when `port == 0` (the wildcard port)
         let addr = getsockname::<SockaddrIn>(socket.as_raw_fd())?;
 
         let offset = ex.get_available_fd();
@@ -131,11 +134,12 @@ impl Acceptor {
 
         let layout = Layout::new::<AcceptorImpl>();
         let p = unsafe { std::alloc::alloc(layout) };
+        let p = NonNull::new(p).unwrap();
 
         let ref_count = RefCount {
             count: 1,
             release_impl: release_impl::<AcceptorImpl>,
-            obj: p,
+            obj: p.as_ptr(),
         };
 
         let acceptor_impl = AcceptorImpl {
@@ -143,20 +147,18 @@ impl Acceptor {
             ex,
             fd: offset.try_into().unwrap(),
             addr: SocketAddrV4::new(addr.ip(), addr.port()).into(),
+            accept_pending: false,
         };
 
         let p = p.cast::<AcceptorImpl>();
-        unsafe { std::ptr::write(p, acceptor_impl) };
+        unsafe { std::ptr::write(p.as_ptr(), acceptor_impl) };
 
-        Ok(Acceptor {
-            p,
-            phantom: PhantomData,
-        })
+        Ok(Acceptor { p })
     }
 
     #[must_use]
     pub fn port(&self) -> u16 {
-        let acceptor_impl = unsafe { &*self.p };
+        let acceptor_impl = unsafe { &*self.p.as_ptr() };
         if let Some(addr) = acceptor_impl.addr.as_sockaddr_in() {
             return addr.port();
         }
@@ -169,11 +171,13 @@ impl Acceptor {
     }
 
     #[must_use]
-    pub fn accept(&mut self) -> AcceptFuture<'_> {
-        let acceptor_impl = unsafe { &mut *self.p };
-        let ref_count = &raw mut acceptor_impl.ref_count;
+    pub fn accept(&self) -> AcceptFuture<'_> {
+        assert!(unsafe { !(*self.p.as_ptr()).accept_pending });
 
-        let weak = acceptor_impl.ex.get_root_task();
+        let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
+        acceptor_impl.accept_pending = true;
+
+        let ref_count = &raw mut acceptor_impl.ref_count;
 
         AcceptFuture {
             acceptor: self,
@@ -184,8 +188,8 @@ impl Acceptor {
                 done: false,
                 eager_dropped: false,
                 res: -1,
-                weak: Some(weak),
-                op_type: OpType::TcpAccept,
+                weak: None,
+                op_type: OpType::TcpAccept { fd: -1 },
             })),
         }
     }
@@ -193,7 +197,7 @@ impl Acceptor {
 
 impl Drop for Acceptor {
     fn drop(&mut self) {
-        unsafe { release(self.p.cast::<RefCount>()) };
+        unsafe { release(self.p.cast::<RefCount>().as_ptr()) };
     }
 }
 
@@ -215,6 +219,8 @@ impl Drop for AcceptorImpl {
     }
 }
 
+//-----------------------------------------------------------------------------
+
 impl Future for AcceptFuture<'_> {
     type Output = Result<Stream>;
 
@@ -224,7 +230,7 @@ impl Future for AcceptFuture<'_> {
     ) -> std::task::Poll<Self::Output> {
         assert!(!self.completed);
 
-        let acceptor_impl = unsafe { &mut *self.acceptor.p };
+        let acceptor_impl = unsafe { &mut *self.acceptor.p.as_ptr() };
 
         let mut op = self.op.take().unwrap();
 
@@ -234,12 +240,16 @@ impl Future for AcceptFuture<'_> {
 
                 let res = op.res;
 
-                self.op = Some(op);
                 if res < 0 {
                     let res = -res;
+                    self.op = Some(op);
                     Poll::Ready(Err(Errno::from_raw(res)))
                 } else {
-                    let fd = res;
+                    let OpType::TcpAccept { fd } = op.op_type else {
+                        unreachable!()
+                    };
+
+                    self.op = Some(op);
                     Poll::Ready(Ok(Stream::new(acceptor_impl.ex.clone(), fd)))
                 }
             }
@@ -256,6 +266,14 @@ impl Future for AcceptFuture<'_> {
                     self.completed = true;
                     return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                 };
+
+                {
+                    let OpType::TcpAccept { ref mut fd } = op.op_type else {
+                        unreachable!()
+                    };
+
+                    *fd = file_index.try_into().unwrap();
+                }
 
                 unsafe { reserve_sqes(ring, 1) };
                 let sqe = unsafe { io_uring_get_sqe(ring) };
@@ -285,7 +303,8 @@ impl Future for AcceptFuture<'_> {
 
 impl Drop for AcceptFuture<'_> {
     fn drop(&mut self) {
-        let acceptor_impl = unsafe { &mut *self.acceptor.p };
+        let acceptor_impl = unsafe { &mut *self.acceptor.p.as_ptr() };
+        acceptor_impl.accept_pending = false;
 
         let op = self.op.as_mut().unwrap();
 
@@ -356,35 +375,12 @@ impl Drop for StreamImpl {
 
             unsafe { reserve_sqes(ring, 1) };
 
-            unsafe {
-                let sqe = io_uring_get_sqe(ring);
-                io_uring_prep_close_direct(sqe, fd);
-                io_uring_sqe_set_data64(sqe, 0);
-                io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
-            }
+            let sqe = unsafe { io_uring_get_sqe(ring) };
+            unsafe { io_uring_prep_close_direct(sqe, fd) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
 
-            unsafe { submit_ring(ring) };
-            self.ex.reclaim_fd(fd);
-        }
-    }
-}
-
-impl Drop for ClientImpl {
-    fn drop(&mut self) {
-        if self.fd >= 0 {
-            let ring = self.ex.ring();
-            let fd = self.fd.try_into().unwrap();
-
-            unsafe { reserve_sqes(ring, 1) };
-
-            unsafe {
-                let sqe = io_uring_get_sqe(ring);
-                io_uring_prep_close_direct(sqe, fd);
-                io_uring_sqe_set_data64(sqe, 0);
-                io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
-            }
-
-            unsafe { submit_ring(ring) };
+            // unsafe { submit_ring(ring) };
             self.ex.reclaim_fd(fd);
         }
     }
@@ -396,12 +392,12 @@ impl Stream {
     #[must_use]
     fn new(ex: Executor, fd: i32) -> Stream {
         let layout = Layout::new::<StreamImpl>();
-        let p = unsafe { std::alloc::alloc(layout) };
+        let p = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
 
         let ref_count = RefCount {
             count: 1,
             release_impl: release_impl::<StreamImpl>,
-            obj: p,
+            obj: p.as_ptr(),
         };
 
         let stream_impl = StreamImpl {
@@ -409,50 +405,82 @@ impl Stream {
             ex,
             fd,
             ts: TimeSpec::from_duration(Duration::from_secs(3)),
+            send_pending: false,
         };
 
         let p = p.cast::<StreamImpl>();
-        unsafe { std::ptr::write(p, stream_impl) };
+        unsafe { std::ptr::write(p.as_ptr(), stream_impl) };
 
-        Stream {
-            p,
-            phantom: PhantomData,
+        Stream { p }
+    }
+
+    #[must_use]
+    pub fn send(&self, buf: Vec<u8>) -> SendFuture {
+        assert!(unsafe { !(*self.p.as_ptr()).send_pending });
+
+        let stream_impl = unsafe { &mut *self.p.as_ptr() };
+        stream_impl.send_pending = true;
+
+        let ref_count = &raw mut stream_impl.ref_count;
+
+        SendFuture {
+            stream: self,
+            completed: false,
+            op: Some(Box::new(IoUringOp {
+                ref_count,
+                initiated: false,
+                done: false,
+                eager_dropped: false,
+                res: -1,
+                weak: None,
+                op_type: OpType::TcpSend {
+                    buf,
+                    ts: stream_impl.ts,
+                },
+            })),
         }
     }
 }
+
+//-----------------------------------------------------------------------------
 
 impl Client {
     #[must_use]
     pub fn new(ex: Executor) -> Client {
         let layout = Layout::new::<ClientImpl>();
-        let p = unsafe { std::alloc::alloc(layout) };
+        let p = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
 
         let ref_count = RefCount {
             count: 1,
             release_impl: release_impl::<ClientImpl>,
-            obj: p,
+            obj: p.as_ptr(),
         };
 
         let client_impl = ClientImpl {
-            ref_count,
-            ex,
-            fd: -1,
-            ts: TimeSpec::from_duration(Duration::from_secs(3)),
+            stream: StreamImpl {
+                ref_count,
+                ex,
+                fd: -1,
+                ts: TimeSpec::from_duration(Duration::from_secs(3)),
+                send_pending: false,
+            },
+            connect_pending: false,
         };
 
         let p = p.cast::<ClientImpl>();
-        unsafe { std::ptr::write(p, client_impl) };
+        unsafe { std::ptr::write(p.as_ptr(), client_impl) };
 
-        Client {
-            p,
-            phantom: PhantomData,
-        }
+        Client { p }
     }
 
-    pub fn connect_ipv4(&mut self, addr: Ipv4Addr, port: u16) -> ConnectFuture {
-        let client_impl = unsafe { &mut *self.p };
-        let ref_count = &raw mut client_impl.ref_count;
+    #[must_use]
+    pub fn connect_ipv4(&self, addr: Ipv4Addr, port: u16) -> ConnectFuture {
+        assert!(unsafe { !(*self.p.as_ptr()).connect_pending });
 
+        let client_impl = unsafe { &mut *self.p.as_ptr() };
+        client_impl.connect_pending = true;
+
+        let ref_count = &raw mut client_impl.stream.ref_count;
         let addr = SocketAddrV4::new(addr, port);
 
         ConnectFuture {
@@ -468,7 +496,7 @@ impl Client {
                 op_type: OpType::TcpConnect {
                     addr: SockaddrStorage::from(addr),
                     port,
-                    ts: client_impl.ts,
+                    ts: client_impl.stream.ts,
                     needs_socket: false,
                     got_socket: false,
                     fd: -1,
@@ -476,19 +504,34 @@ impl Client {
             })),
         }
     }
+
+    #[must_use]
+    pub fn as_stream(&self) -> Stream {
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.ref_count };
+        unsafe { add_ref(rc) };
+
+        Stream { p: self.p.cast() }
+    }
+
+    pub async fn send(&self, buf: Vec<u8>) -> Result<Vec<u8>> {
+        let stream = self.as_stream();
+        stream.send(buf).await
+    }
 }
 
 //-----------------------------------------------------------------------------
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        unsafe { release(self.p.cast::<RefCount>()) };
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
+        unsafe { release(rc) };
     }
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
-        unsafe { release(self.p.cast::<RefCount>()) };
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.ref_count };
+        unsafe { release(rc) };
     }
 }
 
@@ -503,19 +546,19 @@ impl Future for ConnectFuture<'_> {
     ) -> Poll<Self::Output> {
         assert!(!self.completed);
 
-        let client_impl = unsafe { &mut *self.client.p };
+        let client_impl = unsafe { &mut *self.client.p.as_ptr() };
 
         let mut op = self.op.take().unwrap();
 
         match (op.initiated, op.done) {
             (false, true) => panic!(),
             (true, false) => {
-                op.weak = Some(client_impl.ex.get_root_task());
+                op.weak = Some(client_impl.stream.ex.get_root_task());
                 self.op = Some(op);
                 Poll::Pending
             }
             (false, false) => {
-                let ring = client_impl.ex.ring();
+                let ring = client_impl.stream.ex.ring();
 
                 let user_data = Box::as_mut_ptr(&mut op);
 
@@ -543,7 +586,7 @@ impl Future for ConnectFuture<'_> {
                     }
                 };
 
-                let Some(file_index) = client_impl.ex.get_available_fd() else {
+                let Some(file_index) = client_impl.stream.ex.get_available_fd() else {
                     return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                 };
 
@@ -591,9 +634,9 @@ impl Future for ConnectFuture<'_> {
                     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
                 }
 
-                unsafe { add_ref(&raw mut client_impl.ref_count) };
+                unsafe { add_ref(&raw mut client_impl.stream.ref_count) };
 
-                op.weak = Some(client_impl.ex.get_root_task());
+                op.weak = Some(client_impl.stream.ex.get_root_task());
                 op.initiated = true;
                 self.op = Some(op);
                 Poll::Pending
@@ -612,12 +655,12 @@ impl Future for ConnectFuture<'_> {
                 };
 
                 if needs_socket && got_socket {
-                    if client_impl.fd >= 0 {
+                    if client_impl.stream.fd >= 0 {
                         self.op = Some(op);
                         todo!();
                     }
 
-                    client_impl.fd = fd;
+                    client_impl.stream.fd = fd;
                 }
 
                 let res = op.res;
@@ -634,7 +677,8 @@ impl Future for ConnectFuture<'_> {
 
 impl Drop for ConnectFuture<'_> {
     fn drop(&mut self) {
-        let client_impl = unsafe { &mut *self.client.p };
+        let client_impl = unsafe { &mut *self.client.p.as_ptr() };
+        client_impl.connect_pending = false;
 
         let op = self.op.as_mut().unwrap();
 
@@ -642,6 +686,95 @@ impl Drop for ConnectFuture<'_> {
             op.eager_dropped = true;
             Box::leak(self.op.take().unwrap());
             todo!();
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+impl Future for SendFuture<'_> {
+    type Output = Result<Vec<u8>>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        assert!(!self.completed);
+
+        let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
+
+        let mut op = self.op.take().unwrap();
+        let user_data = Box::as_mut_ptr(&mut op);
+
+        match (op.initiated, op.done) {
+            (false, true) => panic!(),
+            (true, false) => {
+                op.weak = Some(stream_impl.ex.get_root_task());
+                self.op = Some(op);
+                Poll::Pending
+            }
+            (false, false) => {
+                let ring = stream_impl.ex.ring();
+                unsafe { reserve_sqes(ring, 2) };
+
+                let OpType::TcpSend {
+                    ref mut ts,
+                    ref buf,
+                } = op.op_type
+                else {
+                    unreachable!()
+                };
+
+                {
+                    let sqe = unsafe { io_uring_get_sqe(ring) };
+                    unsafe {
+                        io_uring_prep_send_zc(
+                            sqe,
+                            stream_impl.fd,
+                            buf.as_ptr().cast(),
+                            buf.len(),
+                            MSG_WAITALL,
+                            0,
+                        );
+                    }
+
+                    unsafe { io_uring_sqe_set_data(sqe, user_data.cast()) };
+                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK | IOSQE_FIXED_FILE) }
+                }
+
+                {
+                    let sqe = unsafe { io_uring_get_sqe(ring) };
+                    unsafe { io_uring_prep_link_timeout(sqe, std::ptr::from_mut(ts).cast(), 0) };
+                    unsafe { io_uring_sqe_set_data(sqe, std::ptr::null_mut()) };
+                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+                }
+
+                unsafe { add_ref(&raw mut stream_impl.ref_count) };
+
+                op.weak = Some(stream_impl.ex.get_root_task());
+                op.initiated = true;
+                self.op = Some(op);
+                Poll::Pending
+            }
+            (true, true) => {
+                self.completed = true;
+
+                let OpType::TcpSend {
+                    ref mut ts,
+                    ref mut buf,
+                } = op.op_type
+                else {
+                    unreachable!()
+                };
+
+                let res = op.res;
+                if res < 0 {
+                    self.op = Some(op);
+                    Poll::Ready(Err(Errno::from_raw(-res)))
+                } else {
+                    Poll::Ready(Ok(std::mem::take(buf)))
+                }
+            }
         }
     }
 }

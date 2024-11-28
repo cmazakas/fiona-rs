@@ -67,6 +67,8 @@ use uring::io_uring_sqe_set_data64;
 use uring::io_uring_sqe_set_flags;
 use uring::io_uring_submit_and_get_events;
 use uring::io_uring_submit_and_wait;
+use uring::IORING_CQE_F_MORE;
+use uring::IORING_CQE_F_NOTIF;
 use uring::IORING_SETUP_CQSIZE;
 use uring::IORING_SETUP_DEFER_TASKRUN;
 use uring::IORING_SETUP_SINGLE_ISSUER;
@@ -459,7 +461,9 @@ enum OpType {
     Timeout {
         dur: TimeSpec,
     },
-    TcpAccept,
+    TcpAccept {
+        fd: i32,
+    },
     TcpConnect {
         addr: SockaddrStorage,
         port: u16,
@@ -467,6 +471,10 @@ enum OpType {
         needs_socket: bool,
         got_socket: bool,
         fd: i32,
+    },
+    TcpSend {
+        ts: TimeSpec,
+        buf: Vec<u8>,
     },
     #[allow(dead_code)]
     TimeoutCancel,
@@ -533,12 +541,16 @@ struct RunGuard {
 impl Drop for RunGuard {
     fn drop(&mut self) {
         let ring;
+        let mut tasks;
         {
             let frame = &mut *self.p.borrow_mut();
             ring = &raw mut frame.ioring;
-            frame.tasks.clear();
+
+            tasks = std::mem::take(&mut frame.tasks);
+
             frame.local_task_queue.clear();
         }
+        tasks.clear();
 
         unsafe { io_uring_get_events(ring) };
         unsafe { submit_ring(ring) };
@@ -759,29 +771,30 @@ impl IoContext {
                     OpType::TimeoutCancel => {
                         todo!()
                     }
-                    OpType::TcpAccept => {
+                    OpType::TcpAccept { fd } => {
                         unsafe { release(op.ref_count) };
 
                         let res = cqe.res;
 
                         if op.eager_dropped {
-                            drop(unsafe { Box::from_raw(op) });
-
-                            if res >= 0 {
-                                let fd = op.res.try_into().unwrap();
-
+                            if res < 0 {
+                                drop(unsafe { Box::from_raw(op) });
+                            } else {
                                 unsafe { reserve_sqes(ring, 1) };
 
-                                unsafe {
-                                    let sqe = io_uring_get_sqe(ring);
-                                    io_uring_prep_close_direct(sqe, fd);
-                                    io_uring_sqe_set_data64(sqe, 0);
-                                    io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
-                                }
+                                let fd = fd.try_into().unwrap();
 
-                                unsafe { submit_ring(ring) };
+                                let sqe = unsafe { io_uring_get_sqe(ring) };
+                                unsafe { io_uring_prep_close_direct(sqe, fd) };
+                                unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+
+                                // unsafe { submit_ring(ring) };
+
+                                drop(unsafe { Box::from_raw(op) });
                                 ex.reclaim_fd(fd);
                             }
+
                             continue;
                         }
 
@@ -820,6 +833,29 @@ impl IoContext {
 
                         if *needs_socket {
                             *got_socket = true;
+                        }
+                    }
+                    OpType::TcpSend { ref mut buf, .. } => {
+                        if op.eager_dropped {
+                            unsafe { release(op.ref_count) };
+                            todo!()
+                        }
+
+                        if cqe.flags & IORING_CQE_F_MORE > 0 {
+                            op.res = cqe.res;
+                            if cqe.res >= 0 {
+                                let n: usize = cqe.res.try_into().unwrap();
+                                buf.drain(0..n);
+                            }
+                            continue;
+                        }
+                        assert!(cqe.flags & IORING_CQE_F_NOTIF > 0);
+                        op.done = true;
+
+                        unsafe { release(op.ref_count) };
+
+                        if let Some(weak) = op.weak.take() {
+                            self.p.borrow_mut().local_task_queue.push_back(weak);
                         }
                     }
                 }

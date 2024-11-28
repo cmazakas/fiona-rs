@@ -2,7 +2,7 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-use std::{future::Future, marker::PhantomData, ptr::NonNull, task::Poll, time::Duration};
+use std::{future::Future, ptr::NonNull, task::Poll, time::Duration};
 
 use nix::{errno::Errno, libc::ETIME, sys::time::TimeSpec};
 
@@ -24,7 +24,6 @@ struct TimerImpl {
 
 pub struct Timer {
     p: NonNull<TimerImpl>,
-    phantom: PhantomData<TimerImpl>,
 }
 
 pub struct TimerFuture<'a> {
@@ -58,7 +57,6 @@ impl Timer {
 
         Self {
             p: NonNull::new(p).unwrap(),
-            phantom: PhantomData,
         }
     }
 
@@ -103,10 +101,7 @@ impl Clone for Timer {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
         unsafe { add_ref(rc) };
 
-        Self {
-            p: self.p,
-            phantom: PhantomData,
-        }
+        Self { p: self.p }
     }
 }
 
