@@ -1,5 +1,7 @@
 use std::{future::Future, net::Ipv4Addr, task::Poll, time::Duration};
 
+use futures::FutureExt;
+
 struct WakerFuture;
 
 impl Future for WakerFuture {
@@ -209,4 +211,94 @@ fn tcp_send_hello_world_throwing() {
     });
 
     let _n = ioc.run();
+}
+
+#[test]
+fn test_downcast_destruction() {
+    // Want to prove that we can destruct the Client object via the Stream one.
+
+    let ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let _stream;
+    {
+        let client = fiona::tcp::Client::new(ex);
+        _stream = client.as_stream();
+    }
+}
+
+#[test]
+fn test_accept_select_ready_always() {
+    // Test what happens when an accept would complete immediately succesfully
+    // but the future isn't explicitly handled. This test is useful for handling the
+    // oddities of Future manipulation that crates like futures facilitate. We went
+    // to fundamentally test that we don't introduce fd leaks here and starve the
+    // runtime of descriptors.
+
+    static mut NUM_RUNS: u64 = 0;
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.clone().spawn(async move {
+        let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+        assert!(acceptor.port() != 0);
+
+        let port = acceptor.port();
+
+        // Test that our accept() op completes immediately, but the future is
+        // eager-dropped before we even see the CQE.
+        let client = fiona::tcp::Client::new(ex.clone());
+        client
+            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        let x = futures::select! {
+            _stream = acceptor.accept().fuse() => -1,
+            x = futures::future::ready(1234).fuse() => x,
+        };
+
+        assert_eq!(x, 1234);
+
+        let timer = fiona::time::Timer::new(ex.clone());
+        timer.wait(Duration::from_millis(100)).await.unwrap();
+
+        // Test that we can accept a new connection and that it works correctly.
+        let client2 = fiona::tcp::Client::new(ex.clone());
+        client2
+            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        let stream = acceptor.accept().await.unwrap();
+        let buf = stream
+            .send(String::from("rawr!").into_bytes())
+            .await
+            .unwrap();
+
+        assert!(buf.is_empty());
+
+        // Test the case where an accept() op completes, we see the CQE and the Future +
+        // task are still in scope so we still schedule resumption, but we never
+        // actually poll() the AcceptFuture to completion.
+        let client3 = fiona::tcp::Client::new(ex.clone());
+        client3
+            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        let mut accept_future = acceptor.accept();
+        assert!(futures::poll!(&mut accept_future).is_pending());
+
+        // must time-slice here
+        timer.wait(Duration::from_millis(100)).await.unwrap();
+
+        drop(accept_future);
+        unsafe { NUM_RUNS += 1 };
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+    assert_eq!(unsafe { NUM_RUNS }, n);
 }

@@ -359,7 +359,7 @@ impl Drop for AcceptFuture<'_> {
                 io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
             }
 
-            unsafe { submit_ring(ring) };
+            // unsafe { submit_ring(ring) };
             acceptor_impl.ex.reclaim_fd(fd);
         }
     }

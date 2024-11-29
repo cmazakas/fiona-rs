@@ -730,7 +730,7 @@ impl IoContext {
                     let p = std::ptr::from_mut(&mut event_count).cast::<c_void>();
                     io_uring_prep_read(sqe, event_fd, p, 8, 0);
                 }
-                sqe.user_data = 0x01; // sentinel value
+                unsafe { io_uring_sqe_set_data64(sqe, 0x01) };
                 need_eventfd_read = false;
             }
 
