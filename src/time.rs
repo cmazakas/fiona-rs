@@ -7,7 +7,7 @@ use std::{future::Future, ptr::NonNull, task::Poll, time::Duration};
 use nix::{errno::Errno, libc::ETIME, sys::time::TimeSpec};
 
 use crate::{
-    add_ref, release, release_impl, reserve_sqes,
+    add_obj_ref, add_op_ref, release_impl, release_obj, reserve_sqes,
     uring::{
         __kernel_timespec, io_uring_get_sqe, io_uring_prep_timeout, io_uring_prep_timeout_remove,
         io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
@@ -41,7 +41,8 @@ impl Timer {
         let p = unsafe { std::alloc::alloc(layout) };
 
         let ref_count = RefCount {
-            count: 1,
+            obj_count: 1,
+            op_count: 0,
             release_impl: release_impl::<TimerImpl>,
             obj: p,
         };
@@ -92,14 +93,14 @@ impl Timer {
 impl Drop for Timer {
     fn drop(&mut self) {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
-        unsafe { release(rc) };
+        unsafe { release_obj(rc) };
     }
 }
 
 impl Clone for Timer {
     fn clone(&self) -> Self {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
-        unsafe { add_ref(rc) };
+        unsafe { add_obj_ref(rc) };
 
         Self { p: self.p }
     }
@@ -190,7 +191,7 @@ impl Future for TimerFuture<'_> {
                 unsafe { io_uring_prep_timeout(sqe, ts.cast::<__kernel_timespec>(), 0, 0) };
                 unsafe { io_uring_sqe_set_data(sqe, user_data.cast()) };
 
-                unsafe { add_ref(&raw mut timer_impl.ref_count) };
+                unsafe { add_op_ref(&raw mut timer_impl.ref_count) };
                 op.weak = Some(timer_impl.ex.get_root_task());
                 op.initiated = true;
                 self.op = Some(op);

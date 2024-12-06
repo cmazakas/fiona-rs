@@ -44,6 +44,7 @@ use std::task::Waker;
 
 use nix::libc::c_void;
 
+use nix::libc::ETIME;
 use nix::sys::eventfd::EventFd;
 use nix::sys::socket::SockaddrStorage;
 use nix::sys::time::TimeSpec;
@@ -430,14 +431,22 @@ struct IoContextFrame {
 
 //-----------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct RefCount {
-    count: usize,
+    obj_count: usize,
+    op_count: usize,
     release_impl: unsafe fn(p: *mut u8),
     obj: *mut u8,
 }
 
-unsafe fn add_ref(rc: *mut RefCount) {
-    (*rc).count += 1;
+unsafe fn add_obj_ref(rc: *mut RefCount) {
+    (*rc).obj_count += 1;
+    // println!("add_obj_ref: {:?}", *rc);
+}
+
+unsafe fn add_op_ref(rc: *mut RefCount) {
+    (*rc).op_count += 1;
+    // println!("add_op_ref: {:?}", *rc);
 }
 
 unsafe fn release_impl<T>(p: *mut u8) {
@@ -446,9 +455,20 @@ unsafe fn release_impl<T>(p: *mut u8) {
     std::alloc::dealloc(p, layout);
 }
 
-unsafe fn release(rc: *mut RefCount) {
-    (*rc).count -= 1;
-    if (*rc).count == 0 {
+unsafe fn release_obj(rc: *mut RefCount) {
+    (*rc).obj_count -= 1;
+    // println!("release_obj: {:?}", *rc);
+    if (*rc).obj_count == 0 && (*rc).op_count == 0 {
+        let fp = (*rc).release_impl;
+        let p = (*rc).obj;
+        (fp)(p);
+    }
+}
+
+unsafe fn release_op(rc: *mut RefCount) {
+    (*rc).op_count -= 1;
+    // println!("release_op: {:?}", *rc);
+    if (*rc).obj_count == 0 && (*rc).op_count == 0 {
         let fp = (*rc).release_impl;
         let p = (*rc).obj;
         (fp)(p);
@@ -460,6 +480,11 @@ unsafe fn release(rc: *mut RefCount) {
 enum OpType {
     Timeout {
         dur: TimeSpec,
+    },
+    #[allow(dead_code)]
+    TimeoutCancel,
+    MultishotTimeout {
+        ts: TimeSpec,
     },
     TcpAccept {
         fd: i32,
@@ -476,8 +501,6 @@ enum OpType {
         ts: TimeSpec,
         buf: Vec<u8>,
     },
-    #[allow(dead_code)]
-    TimeoutCancel,
 }
 
 struct IoUringOp {
@@ -534,6 +557,8 @@ unsafe fn reserve_sqes(ring: *mut io_uring, n: u32) {
     }
 }
 
+//-----------------------------------------------------------------------------
+
 struct RunGuard {
     p: Rc<RefCell<IoContextFrame>>,
 }
@@ -552,15 +577,15 @@ impl Drop for RunGuard {
         }
         tasks.clear();
 
-        unsafe { io_uring_get_events(ring) };
         unsafe { submit_ring(ring) };
+        unsafe { io_uring_get_events(ring) };
 
         let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
         while unsafe { io_uring_peek_cqe(ring, &raw mut cqe) } == 0 {
             let cqe = unsafe { &mut *cqe };
             if cqe.user_data != 0 && cqe.user_data != 1 {
                 let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
-                unsafe { release(op.ref_count) };
+                unsafe { release_op(op.ref_count) };
                 if op.eager_dropped {
                     drop(unsafe { Box::from_raw(op) });
                 }
@@ -674,13 +699,13 @@ impl IoContext {
 
             loop {
                 let m_item = self.p.borrow_mut().local_task_queue.pop_front();
-                if let Some(ref w) = m_item {
-                    match unsafe { w.upgrade() } {
+                if let Some(weak) = m_item {
+                    match unsafe { weak.upgrade() } {
                         None => continue,
                         Some(mut task) => {
-                            (*self.p).borrow_mut().root_task = Some(w.clone());
+                            (*self.p).borrow_mut().root_task = Some(weak.clone());
 
-                            let w = make_waker(w.clone());
+                            let w = make_waker(weak);
                             let mut cx = std::task::Context::from_waker(&w);
 
                             if let Poll::Ready(()) = task.poll(&mut cx) {
@@ -696,13 +721,13 @@ impl IoContext {
 
             loop {
                 let m_item = self.p.borrow().receiver.try_recv();
-                if let Ok(ref w) = m_item {
-                    match unsafe { w.upgrade() } {
+                if let Ok(weak) = m_item {
+                    match unsafe { weak.upgrade() } {
                         None => continue,
                         Some(mut task) => {
-                            (*self.p).borrow_mut().root_task = Some(w.clone());
+                            (*self.p).borrow_mut().root_task = Some(weak.clone());
 
-                            let w = make_waker(w.clone());
+                            let w = make_waker(weak);
                             let mut cx = std::task::Context::from_waker(&w);
 
                             if let Poll::Ready(()) = task.poll(&mut cx) {
@@ -726,10 +751,8 @@ impl IoContext {
 
                 let eventfd_sqe = unsafe { io_uring_get_sqe(ring) };
                 let sqe = unsafe { &mut *eventfd_sqe };
-                unsafe {
-                    let p = std::ptr::from_mut(&mut event_count).cast::<c_void>();
-                    io_uring_prep_read(sqe, event_fd, p, 8, 0);
-                }
+                let p = std::ptr::from_mut(&mut event_count).cast::<c_void>();
+                unsafe { io_uring_prep_read(sqe, event_fd, p, 8, 0) };
                 unsafe { io_uring_sqe_set_data64(sqe, 0x01) };
                 need_eventfd_read = false;
             }
@@ -755,7 +778,7 @@ impl IoContext {
                 let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
                 match op.op_type {
                     OpType::Timeout { .. } => {
-                        unsafe { release(op.ref_count) };
+                        unsafe { release_op(op.ref_count) };
 
                         if op.eager_dropped {
                             drop(unsafe { Box::from_raw(op) });
@@ -772,7 +795,7 @@ impl IoContext {
                         todo!()
                     }
                     OpType::TcpAccept { fd } => {
-                        unsafe { release(op.ref_count) };
+                        unsafe { release_op(op.ref_count) };
 
                         let res = cqe.res;
 
@@ -814,14 +837,14 @@ impl IoContext {
                             // * we need to release the borrowed direct descriptor back to the pool
                             // * if the connect() succeeded, we need to close() it
 
-                            unsafe { release(op.ref_count) };
+                            unsafe { release_op(op.ref_count) };
                             drop(unsafe { Box::from_raw(op) });
                             // continue;
                             todo!();
                         }
 
                         if cqe.res < 0 || *got_socket {
-                            unsafe { release(op.ref_count) };
+                            unsafe { release_op(op.ref_count) };
 
                             op.res = cqe.res;
                             op.done = true;
@@ -837,7 +860,7 @@ impl IoContext {
                     }
                     OpType::TcpSend { ref mut buf, .. } => {
                         if op.eager_dropped {
-                            unsafe { release(op.ref_count) };
+                            unsafe { release_op(op.ref_count) };
                             todo!()
                         }
 
@@ -852,11 +875,28 @@ impl IoContext {
                         assert!(cqe.flags & IORING_CQE_F_NOTIF > 0);
                         op.done = true;
 
-                        unsafe { release(op.ref_count) };
+                        unsafe { release_op(op.ref_count) };
 
                         if let Some(weak) = op.weak.take() {
                             self.p.borrow_mut().local_task_queue.push_back(weak);
                         }
+                    }
+                    OpType::MultishotTimeout { .. } => {
+                        if op.eager_dropped {
+                            unsafe { release_op(op.ref_count) };
+                            drop(unsafe { Box::from_raw(op) });
+                            continue;
+                        }
+
+                        if (cqe.flags & IORING_CQE_F_MORE) == 0 {
+                            todo!("reschedule multishot timeout operation");
+                        }
+
+                        if cqe.res == -ETIME {
+                            continue;
+                        }
+
+                        todo!();
                     }
                 }
             }
@@ -870,9 +910,11 @@ impl IoContext {
 
 impl Drop for IoContext {
     fn drop(&mut self) {
-        unsafe {
-            uring::io_uring_queue_exit(self.ring());
+        {
+            let _guard = RunGuard { p: self.p.clone() };
         }
+
+        unsafe { uring::io_uring_queue_exit(self.ring()) };
     }
 }
 

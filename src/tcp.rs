@@ -11,7 +11,7 @@ use std::{
     os::fd::AsRawFd,
     ptr::NonNull,
     task::Poll,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use nix::{
@@ -27,13 +27,14 @@ use nix::{
 };
 
 use crate::{
-    add_ref, release, release_impl, reserve_sqes, submit_ring,
+    add_obj_ref, add_op_ref, release_impl, release_obj, reserve_sqes, submit_ring,
     uring::{
         io_uring_get_sqe, io_uring_prep_accept_direct, io_uring_prep_cancel_fd,
         io_uring_prep_close_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
-        io_uring_prep_send_zc, io_uring_prep_socket_direct, io_uring_register_files_update,
-        io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
-        IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED, IOSQE_CQE_SKIP_SUCCESS,
+        io_uring_prep_send_zc, io_uring_prep_socket_direct, io_uring_prep_timeout,
+        io_uring_prep_timeout_remove, io_uring_register_files_update, io_uring_sqe_set_data,
+        io_uring_sqe_set_data64, io_uring_sqe_set_flags, IORING_ASYNC_CANCEL_ALL,
+        IORING_ASYNC_CANCEL_FD_FIXED, IORING_TIMEOUT_MULTISHOT, IOSQE_CQE_SKIP_SUCCESS,
         IOSQE_FIXED_FILE, IOSQE_IO_LINK,
     },
     Executor, IoUringOp, OpType, RefCount, Result,
@@ -53,6 +54,9 @@ struct StreamImpl {
     fd: i32,
     ts: TimeSpec,
     send_pending: bool,
+    last_send: Instant,
+    last_recv: Instant,
+    timeout_op: Option<Box<IoUringOp>>,
 }
 
 struct ClientImpl {
@@ -137,7 +141,8 @@ impl Acceptor {
         let p = NonNull::new(p).unwrap();
 
         let ref_count = RefCount {
-            count: 1,
+            obj_count: 1,
+            op_count: 0,
             release_impl: release_impl::<AcceptorImpl>,
             obj: p.as_ptr(),
         };
@@ -197,7 +202,7 @@ impl Acceptor {
 
 impl Drop for Acceptor {
     fn drop(&mut self) {
-        unsafe { release(self.p.cast::<RefCount>().as_ptr()) };
+        unsafe { release_obj(self.p.cast::<RefCount>().as_ptr()) };
     }
 }
 
@@ -233,7 +238,6 @@ impl Future for AcceptFuture<'_> {
         let acceptor_impl = unsafe { &mut *self.acceptor.p.as_ptr() };
 
         let mut op = self.op.take().unwrap();
-
         match (op.initiated, op.done) {
             (true, true) => {
                 self.completed = true;
@@ -264,6 +268,7 @@ impl Future for AcceptFuture<'_> {
 
                 let Some(file_index) = acceptor_impl.ex.get_available_fd() else {
                     self.completed = true;
+                    self.op = Some(op);
                     return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                 };
 
@@ -291,7 +296,7 @@ impl Future for AcceptFuture<'_> {
                 unsafe { io_uring_sqe_set_data(sqe, Box::as_mut_ptr(&mut op).cast()) };
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) };
 
-                unsafe { add_ref(&raw mut acceptor_impl.ref_count) };
+                unsafe { add_op_ref(&raw mut acceptor_impl.ref_count) };
                 op.weak = Some(acceptor_impl.ex.get_root_task());
                 op.initiated = true;
                 self.op = Some(op);
@@ -392,24 +397,64 @@ impl Stream {
     #[must_use]
     fn new(ex: Executor, fd: i32) -> Stream {
         let layout = Layout::new::<StreamImpl>();
-        let p = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
+        let p;
 
-        let ref_count = RefCount {
-            count: 1,
-            release_impl: release_impl::<StreamImpl>,
-            obj: p.as_ptr(),
-        };
+        let ring = ex.ring();
 
-        let stream_impl = StreamImpl {
+        {
+            let ptr = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
+
+            let ref_count = RefCount {
+                obj_count: 1,
+                op_count: 0,
+                release_impl: release_impl::<StreamImpl>,
+                obj: ptr.as_ptr(),
+            };
+
+            let stream_impl = StreamImpl {
+                ref_count,
+                ex,
+                fd,
+                ts: TimeSpec::from_duration(Duration::from_secs(3)),
+                send_pending: false,
+                last_send: Instant::now(),
+                last_recv: Instant::now(),
+                timeout_op: None,
+            };
+
+            p = ptr.cast::<StreamImpl>();
+            unsafe { std::ptr::write(p.as_ptr(), stream_impl) };
+        }
+
+        let stream_impl = unsafe { &mut *p.as_ptr() };
+        let ref_count = &raw mut stream_impl.ref_count;
+
+        let mut op = Box::new(IoUringOp {
             ref_count,
-            ex,
-            fd,
-            ts: TimeSpec::from_duration(Duration::from_secs(3)),
-            send_pending: false,
+            initiated: false,
+            done: false,
+            eager_dropped: false,
+            res: -1,
+            weak: None,
+            op_type: OpType::MultishotTimeout { ts: stream_impl.ts },
+        });
+
+        let user_data = Box::as_mut_ptr(&mut op).cast();
+
+        let OpType::MultishotTimeout { ref mut ts } = op.op_type else {
+            unreachable!()
         };
 
-        let p = p.cast::<StreamImpl>();
-        unsafe { std::ptr::write(p.as_ptr(), stream_impl) };
+        let ts = std::ptr::from_mut(ts).cast();
+
+        unsafe { reserve_sqes(ring, 1) };
+        let sqe = unsafe { io_uring_get_sqe(ring) };
+
+        unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
+        unsafe { io_uring_sqe_set_data(sqe, user_data) };
+
+        stream_impl.timeout_op = Some(op);
+        unsafe { add_op_ref(ref_count) };
 
         Stream { p }
     }
@@ -449,9 +494,11 @@ impl Client {
     pub fn new(ex: Executor) -> Client {
         let layout = Layout::new::<ClientImpl>();
         let p = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
+        let ring = ex.ring();
 
         let ref_count = RefCount {
-            count: 1,
+            obj_count: 1,
+            op_count: 0,
             release_impl: release_impl::<ClientImpl>,
             obj: p.as_ptr(),
         };
@@ -463,12 +510,45 @@ impl Client {
                 fd: -1,
                 ts: TimeSpec::from_duration(Duration::from_secs(3)),
                 send_pending: false,
+                last_send: Instant::now(),
+                last_recv: Instant::now(),
+                timeout_op: None,
             },
             connect_pending: false,
         };
 
         let p = p.cast::<ClientImpl>();
         unsafe { std::ptr::write(p.as_ptr(), client_impl) };
+
+        let stream_impl = unsafe { &mut (*p.as_ptr()).stream };
+        let ref_count = &raw mut stream_impl.ref_count;
+
+        let mut op = Box::new(IoUringOp {
+            ref_count,
+            initiated: false,
+            done: false,
+            eager_dropped: false,
+            res: -1,
+            weak: None,
+            op_type: OpType::MultishotTimeout { ts: stream_impl.ts },
+        });
+
+        let user_data = Box::as_mut_ptr(&mut op).cast();
+
+        let OpType::MultishotTimeout { ref mut ts } = op.op_type else {
+            unreachable!()
+        };
+
+        let ts = std::ptr::from_mut(ts).cast();
+
+        unsafe { reserve_sqes(ring, 1) };
+        let sqe = unsafe { io_uring_get_sqe(ring) };
+
+        unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
+        unsafe { io_uring_sqe_set_data(sqe, user_data) };
+
+        stream_impl.timeout_op = Some(op);
+        unsafe { add_op_ref(ref_count) };
 
         Client { p }
     }
@@ -508,7 +588,7 @@ impl Client {
     #[must_use]
     pub fn as_stream(&self) -> Stream {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.ref_count };
-        unsafe { add_ref(rc) };
+        unsafe { add_obj_ref(rc) };
 
         Stream { p: self.p.cast() }
     }
@@ -524,14 +604,48 @@ impl Client {
 impl Drop for Stream {
     fn drop(&mut self) {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
-        unsafe { release(rc) };
+        if unsafe { (*rc).obj_count } == 1 {
+            let stream_impl = unsafe { &mut *self.p.as_ptr() };
+            let ring = stream_impl.ex.ring();
+            unsafe { reserve_sqes(ring, 1) };
+
+            let sqe = unsafe { io_uring_get_sqe(ring) };
+            let mut op = stream_impl.timeout_op.take().unwrap();
+            let user_data = Box::as_mut_ptr(&mut op) as u64;
+            // makes sure this gets cleaned up, not really an eager-dropped operation
+            op.eager_dropped = true;
+            Box::leak(op);
+
+            unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+        }
+
+        unsafe { release_obj(rc) };
     }
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.ref_count };
-        unsafe { release(rc) };
+        if unsafe { (*rc).obj_count } == 1 {
+            let stream_impl = unsafe { &mut (*self.p.as_ptr()).stream };
+            let ring = stream_impl.ex.ring();
+            unsafe { reserve_sqes(ring, 1) };
+
+            let sqe = unsafe { io_uring_get_sqe(ring) };
+            let mut op = stream_impl.timeout_op.take().unwrap();
+            let user_data = Box::as_mut_ptr(&mut op) as u64;
+            // makes sure this gets cleaned up, not really an eager-dropped operation
+            op.eager_dropped = true;
+            Box::leak(op);
+
+            unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+        }
+
+        unsafe { release_obj(rc) };
     }
 }
 
@@ -587,6 +701,7 @@ impl Future for ConnectFuture<'_> {
                 };
 
                 let Some(file_index) = client_impl.stream.ex.get_available_fd() else {
+                    self.op = Some(op);
                     return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                 };
 
@@ -634,7 +749,7 @@ impl Future for ConnectFuture<'_> {
                     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
                 }
 
-                unsafe { add_ref(&raw mut client_impl.stream.ref_count) };
+                unsafe { add_op_ref(&raw mut client_impl.stream.ref_count) };
 
                 op.weak = Some(client_impl.stream.ex.get_root_task());
                 op.initiated = true;
@@ -714,9 +829,6 @@ impl Future for SendFuture<'_> {
                 Poll::Pending
             }
             (false, false) => {
-                let ring = stream_impl.ex.ring();
-                unsafe { reserve_sqes(ring, 2) };
-
                 let OpType::TcpSend {
                     ref mut ts,
                     ref buf,
@@ -724,6 +836,9 @@ impl Future for SendFuture<'_> {
                 else {
                     unreachable!()
                 };
+
+                let ring = stream_impl.ex.ring();
+                unsafe { reserve_sqes(ring, 1) };
 
                 {
                     let sqe = unsafe { io_uring_get_sqe(ring) };
@@ -739,17 +854,10 @@ impl Future for SendFuture<'_> {
                     }
 
                     unsafe { io_uring_sqe_set_data(sqe, user_data.cast()) };
-                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK | IOSQE_FIXED_FILE) }
+                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) }
                 }
 
-                {
-                    let sqe = unsafe { io_uring_get_sqe(ring) };
-                    unsafe { io_uring_prep_link_timeout(sqe, std::ptr::from_mut(ts).cast(), 0) };
-                    unsafe { io_uring_sqe_set_data(sqe, std::ptr::null_mut()) };
-                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-                }
-
-                unsafe { add_ref(&raw mut stream_impl.ref_count) };
+                unsafe { add_op_ref(&raw mut stream_impl.ref_count) };
 
                 op.weak = Some(stream_impl.ex.get_root_task());
                 op.initiated = true;

@@ -1,6 +1,7 @@
 use std::{future::Future, net::Ipv4Addr, task::Poll, time::Duration};
 
 use futures::FutureExt;
+use nix::errno::Errno;
 
 struct WakerFuture;
 
@@ -74,7 +75,7 @@ fn tcp_acceptor_hello_world() {
 }
 
 #[test]
-fn tcp_multiple_accepts() {
+fn test_tcp_multiple_accepts() {
     // Test that we can accept and hold onto multiple TCP sockets at a time.
     // Also test that we can properly recycle fds as well with the runtime.
 
@@ -85,7 +86,12 @@ fn tcp_multiple_accepts() {
     let params = &fiona::IoContextParams {
         sq_entries: 256,
         cq_entries: 1024,
-        nr_files: (1 + 2 * NUM_CLIENTS).try_into().unwrap(),
+        // We use 3 * NUM_CLIENTS because releasing the fds back to the runtime is deferred by
+        // cancelling the timeout op associated with each socket object. Our test should
+        // still properly test recycling of the fds because we have 2 * NUM_CLIENTS sockets per
+        // iteration, and we iterate twice meaning we have 2 * 2 * NUM_CLIENTS total sockets being
+        // used by the entire test over its lifetime.
+        nr_files: (1 + 3 * NUM_CLIENTS).try_into().unwrap(),
     };
 
     let mut ioc = fiona::IoContext::with_params(params);
@@ -295,6 +301,32 @@ fn test_accept_select_ready_always() {
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
         drop(accept_future);
+        unsafe { NUM_RUNS += 1 };
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+    assert_eq!(unsafe { NUM_RUNS }, n);
+}
+
+#[test]
+fn test_tcp_connect_timeout() {
+    // Want to prove that our timeout works for connect() calls.
+    // use one of the IP addresses from the test networks:
+    // 192.0.2.0/24
+    // https://en.wikipedia.org/wiki/Internet_Protocol_version_4#Special-use_addresses
+
+    static mut NUM_RUNS: u64 = 0;
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.clone().spawn(async move {
+        let client = fiona::tcp::Client::new(ex);
+        let m_ok = client.connect_ipv4(Ipv4Addr::new(192, 0, 2, 0), 3301).await;
+        assert!(m_ok.is_err());
+        assert_eq!(m_ok.unwrap_err(), Errno::ECANCELED);
+
         unsafe { NUM_RUNS += 1 };
     });
 
