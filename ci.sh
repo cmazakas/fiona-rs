@@ -11,18 +11,14 @@ clear
 
 CARGO_FLAGS=(--target x86_64-unknown-linux-gnu -Zbuild-std)
 
-export RUSTFLAGS='-Zsanitizer=address'
-cargo test "${CARGO_FLAGS[@]}"
+RUSTFLAGS='-Zsanitizer=address' PKG_CONFIG_PATH="/home/exbigboss/cpp/liburing-asan-install/lib/pkgconfig" LD_LIBRARY_PATH="/home/exbigboss/cpp/liburing-asan-install/lib" cargo test "${CARGO_FLAGS[@]}"
 
-export RUSTFLAGS='-Zsanitizer=thread'
-cargo test "${CARGO_FLAGS[@]}"
+RUSTFLAGS='-Zsanitizer=thread' PKG_CONFIG_PATH="/home/exbigboss/cpp/liburing-install/lib/pkgconfig" LD_LIBRARY_PATH="/home/exbigboss/cpp/liburing-install/lib" cargo test "${CARGO_FLAGS[@]}"
 
-cargo test "${CARGO_FLAGS[@]}"
+PKG_CONFIG_PATH="/home/exbigboss/cpp/liburing-install/lib/pkgconfig" LD_LIBRARY_PATH="/home/exbigboss/cpp/liburing-install/lib" cargo test "${CARGO_FLAGS[@]}"
 
-export RUSTFLAGS='-Zsanitizer=address'
-cargo test "${CARGO_FLAGS[@]}" --release
+RUSTFLAGS='-Zsanitizer=address' PKG_CONFIG_PATH="/home/exbigboss/cpp/liburing-asan-install/lib/pkgconfig" LD_LIBRARY_PATH="/home/exbigboss/cpp/liburing-asan-install/lib" cargo test "${CARGO_FLAGS[@]}" --release
 
-export RUSTFLAGS='-Zsanitizer=thread'
-cargo test "${CARGO_FLAGS[@]}" --release
+RUSTFLAGS='-Zsanitizer=thread' PKG_CONFIG_PATH="/home/exbigboss/cpp/liburing-install/lib/pkgconfig" LD_LIBRARY_PATH="/home/exbigboss/cpp/liburing-install/lib" cargo test "${CARGO_FLAGS[@]}" --release
 
-cargo test "${CARGO_FLAGS[@]}" --release
+PKG_CONFIG_PATH="/home/exbigboss/cpp/liburing-install/lib/pkgconfig" LD_LIBRARY_PATH="/home/exbigboss/cpp/liburing-install/lib" cargo test "${CARGO_FLAGS[@]}" --release
