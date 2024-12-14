@@ -1,3 +1,4 @@
+use core::str;
 use std::{future::Future, net::Ipv4Addr, task::Poll, time::Duration};
 
 use futures::FutureExt;
@@ -332,5 +333,80 @@ fn test_tcp_connect_timeout() {
 
     let n = ioc.run();
     assert_eq!(n, 1);
+    assert_eq!(unsafe { NUM_RUNS }, n);
+}
+
+#[test]
+fn test_tcp_send_recv_hello_world() {
+    // Want to test a simple send-recv pair, using the multishot recv op in the
+    // background.
+
+    static mut NUM_RUNS: u64 = 0;
+
+    let message: &'static str = "hello, world! hopefuly this makes the message long enough such that we finally bundle lmao";
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    let bgid = 0;
+    let num_bufs = 128;
+    let buf_len = 8;
+    ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
+
+    let expected_bufs = message.len() / buf_len + if message.len() % buf_len > 0 { 1 } else { 0 };
+
+    ex.clone().spawn(async move {
+        let stream = acceptor.accept().await.unwrap();
+        stream.set_buf_group(bgid);
+
+        let bufs = stream.recv().await.unwrap();
+
+        assert_eq!(bufs.len(), expected_bufs);
+
+        let mut s = String::new();
+        for buf in bufs.iter() {
+            s.push_str(str::from_utf8(buf.as_slice()).unwrap());
+        }
+
+        assert_eq!(s, message);
+
+        let msg = String::from(message).into_bytes();
+        let _msg = stream.send(msg).await.unwrap();
+
+        unsafe { NUM_RUNS += 1 };
+    });
+
+    ex.clone().spawn(async move {
+        let client = fiona::tcp::Client::new(ex);
+
+        client
+            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        let msg = String::from(message).into_bytes();
+        let _msg = client.send(msg).await.unwrap();
+
+        client.set_buf_group(bgid);
+
+        let bufs = client.recv().await.unwrap();
+
+        assert_eq!(bufs.len(), expected_bufs);
+
+        let mut s = String::new();
+        for buf in bufs.iter() {
+            s.push_str(str::from_utf8(buf.as_slice()).unwrap());
+        }
+
+        assert_eq!(s, message);
+
+        unsafe { NUM_RUNS += 1 };
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
     assert_eq!(unsafe { NUM_RUNS }, n);
 }

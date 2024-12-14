@@ -9,9 +9,9 @@ extern crate pkg_config;
 
 fn main() {
     let liburing_pkg = pkg_config::Config::new()
-        .atleast_version("2.7")
+        .atleast_version("2.9")
         .cargo_metadata(false)
-        .probe("liburing")
+        .probe("liburing-ffi")
         .unwrap();
 
     liburing_pkg

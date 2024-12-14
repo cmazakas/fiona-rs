@@ -13,11 +13,13 @@
 )]
 #![feature(ptr_metadata)]
 #![feature(box_as_ptr)]
+#![feature(vec_into_raw_parts)]
 
 extern crate nix;
 
 use std::alloc::Layout;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -27,6 +29,7 @@ use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::ptr::metadata;
+use std::ptr::null_mut;
 use std::ptr::DynMetadata;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -42,6 +45,7 @@ use std::task::RawWaker;
 use std::task::RawWakerVTable;
 use std::task::Waker;
 
+use nix::errno::Errno;
 use nix::libc::c_void;
 
 use nix::libc::ETIME;
@@ -49,10 +53,15 @@ use nix::sys::eventfd::EventFd;
 use nix::sys::socket::SockaddrStorage;
 use nix::sys::time::TimeSpec;
 use uring::io_uring;
+use uring::io_uring_buf_ring;
+use uring::io_uring_buf_ring_add;
+use uring::io_uring_buf_ring_advance;
+use uring::io_uring_buf_ring_mask;
 use uring::io_uring_cq_advance;
 use uring::io_uring_cq_ready;
 use uring::io_uring_cqe;
 use uring::io_uring_cqe_seen;
+use uring::io_uring_free_buf_ring;
 use uring::io_uring_get_events;
 use uring::io_uring_get_sqe;
 use uring::io_uring_params;
@@ -63,11 +72,13 @@ use uring::io_uring_prep_read;
 use uring::io_uring_queue_init_params;
 use uring::io_uring_register_files_sparse;
 use uring::io_uring_register_ring_fd;
+use uring::io_uring_setup_buf_ring;
 use uring::io_uring_sq_space_left;
 use uring::io_uring_sqe_set_data64;
 use uring::io_uring_sqe_set_flags;
 use uring::io_uring_submit_and_get_events;
 use uring::io_uring_submit_and_wait;
+use uring::IORING_CQE_BUFFER_SHIFT;
 use uring::IORING_CQE_F_MORE;
 use uring::IORING_CQE_F_NOTIF;
 use uring::IORING_SETUP_CQSIZE;
@@ -417,6 +428,33 @@ fn make_waker(weak: Weak) -> Waker {
 
 //-----------------------------------------------------------------------------
 
+struct BufGroup {
+    buf_ring: *mut io_uring_buf_ring,
+    num_bufs: u32,
+    buf_len: usize,
+    bgid: i32,
+    bufs: *mut *mut u8,
+    ring: *mut io_uring,
+}
+
+impl BufGroup {
+    unsafe fn release(&mut self) {
+        io_uring_free_buf_ring(self.ring, self.buf_ring, self.num_bufs, self.bgid);
+
+        let num_bufs = self.num_bufs.try_into().unwrap();
+        let bufs = Vec::<*mut u8>::from_raw_parts(self.bufs, num_bufs, num_bufs);
+
+        for ptr in bufs {
+            if ptr.is_null() {
+                continue;
+            }
+            drop(Vec::<u8>::from_raw_parts(ptr, self.buf_len, self.buf_len));
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+
 struct IoContextFrame {
     ioring: io_uring,
     params: io_uring_params,
@@ -427,6 +465,7 @@ struct IoContextFrame {
     root_task: Option<Weak>,
     local_task_queue: VecDeque<Weak>,
     event_fd: EventFd,
+    buf_groups: HashMap<i32, *mut BufGroup>,
 }
 
 //-----------------------------------------------------------------------------
@@ -498,8 +537,11 @@ enum OpType {
         fd: i32,
     },
     TcpSend {
-        ts: TimeSpec,
         buf: Vec<u8>,
+    },
+    MultishotTcpRecv {
+        bufs: Vec<Vec<u8>>,
+        buf_group: *mut BufGroup,
     },
 }
 
@@ -563,6 +605,17 @@ struct RunGuard {
     p: Rc<RefCell<IoContextFrame>>,
 }
 
+struct CQESeenGuard<'a> {
+    ring: *mut io_uring,
+    cqe: &'a mut io_uring_cqe,
+}
+
+impl Drop for CQESeenGuard<'_> {
+    fn drop(&mut self) {
+        unsafe { io_uring_cqe_seen(self.ring, self.cqe) };
+    }
+}
+
 impl Drop for RunGuard {
     fn drop(&mut self) {
         let ring;
@@ -580,18 +633,27 @@ impl Drop for RunGuard {
         unsafe { submit_ring(ring) };
         unsafe { io_uring_get_events(ring) };
 
+        let mut blacklist = HashSet::<u64>::new();
+
         let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
         while unsafe { io_uring_peek_cqe(ring, &raw mut cqe) } == 0 {
             let cqe = unsafe { &mut *cqe };
-            if cqe.user_data != 0 && cqe.user_data != 1 {
-                let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
+            let user_data = cqe.user_data;
+
+            let _g = CQESeenGuard { ring, cqe };
+
+            if user_data != 0 && user_data != 1 {
+                if blacklist.contains(&user_data) {
+                    continue;
+                }
+
+                blacklist.insert(user_data);
+                let op = unsafe { &mut *(user_data as *mut IoUringOp) };
                 unsafe { release_op(op.ref_count) };
                 if op.eager_dropped {
                     drop(unsafe { Box::from_raw(op) });
                 }
             }
-
-            unsafe { io_uring_cqe_seen(ring, cqe) };
         }
     }
 }
@@ -640,6 +702,7 @@ impl IoContext {
             ioring,
             local_task_queue: VecDeque::new(),
             event_fd: nix::sys::eventfd::EventFd::new().unwrap(),
+            buf_groups: HashMap::new(),
         }));
 
         {
@@ -859,12 +922,17 @@ impl IoContext {
                         }
                     }
                     OpType::TcpSend { ref mut buf, .. } => {
+                        let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
+
                         if op.eager_dropped {
-                            unsafe { release_op(op.ref_count) };
-                            todo!()
+                            if !has_more_cqes {
+                                unsafe { release_op(op.ref_count) };
+                                drop(unsafe { Box::from_raw(op) });
+                            }
+                            continue;
                         }
 
-                        if cqe.flags & IORING_CQE_F_MORE > 0 {
+                        if has_more_cqes {
                             op.res = cqe.res;
                             if cqe.res >= 0 {
                                 let n: usize = cqe.res.try_into().unwrap();
@@ -876,6 +944,63 @@ impl IoContext {
                         op.done = true;
 
                         unsafe { release_op(op.ref_count) };
+
+                        if let Some(weak) = op.weak.take() {
+                            self.p.borrow_mut().local_task_queue.push_back(weak);
+                        }
+                    }
+                    OpType::MultishotTcpRecv {
+                        ref mut bufs,
+                        buf_group,
+                    } => {
+                        // println!(
+                        //     "multishot tcp cqe->res => {} aka {}",
+                        //     cqe.res,
+                        //     Errno::from_raw(-cqe.res)
+                        // );
+
+                        if op.eager_dropped {
+                            // * Have to handle cqe.res > 0, i.e. replenish buffer sequence here.
+                            todo!("hande eager-dropped multishot tcp recv")
+                        }
+
+                        let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
+                        if !has_more_cqes {
+                            op.done = true;
+                            op.res = cqe.res;
+                            unsafe { release_op(op.ref_count) };
+
+                            if let Some(weak) = op.weak.take() {
+                                self.p.borrow_mut().local_task_queue.push_back(weak);
+                            }
+
+                            continue;
+                        }
+
+                        let mut bid =
+                            usize::try_from(cqe.flags >> IORING_CQE_BUFFER_SHIFT).unwrap();
+
+                        let buf_group = unsafe { &mut *buf_group };
+
+                        let buf_len = buf_group.buf_len;
+                        let num_bufs = buf_group.num_bufs;
+                        let num_bufs_mask = usize::try_from(num_bufs - 1).unwrap();
+                        let bufs_ptr = buf_group.bufs;
+
+                        let mut num_bytes = usize::try_from(cqe.res).unwrap();
+                        while num_bytes > 0 {
+                            let to_read = std::cmp::min(num_bytes, buf_len);
+
+                            let p = unsafe { bufs_ptr.add(bid) };
+                            let ptr = unsafe { *p };
+                            unsafe { *p = null_mut() };
+
+                            let buf = unsafe { Vec::from_raw_parts(ptr, to_read, buf_len) };
+                            bufs.push(buf);
+
+                            bid = (bid + 1) & num_bufs_mask;
+                            num_bytes -= to_read;
+                        }
 
                         if let Some(weak) = op.weak.take() {
                             self.p.borrow_mut().local_task_queue.push_back(weak);
@@ -910,8 +1035,15 @@ impl IoContext {
 
 impl Drop for IoContext {
     fn drop(&mut self) {
+        drop(RunGuard { p: self.p.clone() });
+
         {
-            let _guard = RunGuard { p: self.p.clone() };
+            let buf_groups = &mut self.p.borrow_mut().buf_groups;
+            for (_, buf_group) in buf_groups.iter() {
+                unsafe { (**buf_group).release() };
+                drop(unsafe { Box::from_raw(*buf_group) });
+            }
+            buf_groups.clear();
         }
 
         unsafe { uring::io_uring_queue_exit(self.ring()) };
@@ -1008,6 +1140,60 @@ impl Executor {
 
     fn get_root_task(&self) -> Weak {
         self.p.borrow().root_task.clone().unwrap()
+    }
+
+    pub fn register_buf_group(&self, bgid: i32, num_bufs: u32, buf_len: usize) -> Result<()> {
+        let mut ret = 0_i32;
+
+        let ring = self.ring();
+        let nentries = num_bufs;
+        let flags = 0;
+        let err = &mut ret;
+
+        let buf_ring = unsafe { io_uring_setup_buf_ring(ring, nentries, bgid, flags, err) };
+        if buf_ring.is_null() {
+            return Err(Errno::from_raw(-ret));
+        }
+
+        let mut bufs = Vec::<*mut u8>::with_capacity(num_bufs.try_into().unwrap());
+
+        let mask = unsafe { io_uring_buf_ring_mask(num_bufs) };
+        for bid in 0..num_bufs {
+            let buf = Vec::<u8>::with_capacity(buf_len);
+
+            let (addr, _, cap) = buf.into_raw_parts();
+
+            bufs.push(addr);
+
+            unsafe {
+                io_uring_buf_ring_add(
+                    buf_ring,
+                    addr.cast(),
+                    cap.try_into().unwrap(),
+                    bid.try_into().unwrap(),
+                    mask,
+                    bid.try_into().unwrap(),
+                );
+            }
+        }
+
+        unsafe { io_uring_buf_ring_advance(buf_ring, num_bufs.try_into().unwrap()) };
+
+        let (bufs, _, _) = bufs.into_raw_parts();
+
+        self.p.borrow_mut().buf_groups.insert(
+            bgid,
+            Box::into_raw(Box::new(BufGroup {
+                buf_ring,
+                num_bufs,
+                buf_len,
+                bgid,
+                bufs,
+                ring,
+            })),
+        );
+
+        Ok(())
     }
 
     pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T> {
