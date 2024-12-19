@@ -890,6 +890,8 @@ impl Drop for SendFuture<'_> {
     fn drop(&mut self) {
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
 
+        stream_impl.send_pending = false;
+
         let op = self.op.as_mut().unwrap();
         if op.initiated && !op.done {
             let ring = stream_impl.ex.ring();
@@ -993,6 +995,13 @@ impl Future for SendFuture<'_> {
 
 //-----------------------------------------------------------------------------
 
+impl Drop for RecvFuture<'_> {
+    fn drop(&mut self) {
+        let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
+        stream_impl.recv_pending = false;
+    }
+}
+
 impl Future for RecvFuture<'_> {
     type Output = Result<Vec<Vec<u8>>>;
 
@@ -1080,7 +1089,9 @@ impl Future for RecvFuture<'_> {
                 if op.res < 0 {
                     self.completed = true;
                     let res = -op.res;
-                    stream_impl.recv_op = None;
+                    if op.done {
+                        stream_impl.recv_op = None;
+                    }
                     return Poll::Ready(Err(Errno::from_raw(res)));
                 }
 

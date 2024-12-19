@@ -410,3 +410,88 @@ fn test_tcp_send_recv_hello_world() {
     assert_eq!(n, 2);
     assert_eq!(unsafe { NUM_RUNS }, n);
 }
+
+#[test]
+fn test_tcp_recv_buffer_replenishing() {
+    // Want to test that our recv op will eventually replensish the buffer set
+    // upon resumption of a Future.
+
+    static mut NUM_RUNS: u64 = 0;
+
+    let message: &'static str = "hello, world! hopefuly this makes the message long enough such that we finally bundle lmao";
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    let bgid = 0;
+    let num_bufs = 128;
+    let buf_len = 8;
+    let total_bytes = usize::try_from(num_bufs).unwrap() * buf_len;
+
+    ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
+
+    let expected_bufs = message.len() / buf_len + if message.len() % buf_len > 0 { 1 } else { 0 };
+
+    ex.clone().spawn(async move {
+        let stream = acceptor.accept().await.unwrap();
+        stream.set_buf_group(bgid);
+
+        let mut sent = 0;
+        while sent < total_bytes {
+            let bufs = stream.recv().await.unwrap();
+
+            assert_eq!(bufs.len(), expected_bufs);
+
+            let mut s = String::new();
+            for buf in bufs.iter() {
+                s.push_str(str::from_utf8(buf.as_slice()).unwrap());
+            }
+
+            assert_eq!(s, message);
+
+            let msg = String::from(message).into_bytes();
+            let msg = stream.send(msg).await.unwrap();
+            sent += msg.len();
+        }
+
+        unsafe { NUM_RUNS += 1 };
+    });
+
+    ex.clone().spawn(async move {
+        let client = fiona::tcp::Client::new(ex);
+
+        client
+            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        let mut received = 0;
+        while received < total_bytes {
+            let msg = String::from(message).into_bytes();
+            let _msg = client.send(msg).await.unwrap();
+
+            client.set_buf_group(bgid);
+
+            let bufs = client.recv().await.unwrap();
+
+            assert_eq!(bufs.len(), expected_bufs);
+
+            let mut s = String::new();
+            for buf in bufs.iter() {
+                s.push_str(str::from_utf8(buf.as_slice()).unwrap());
+            }
+
+            assert_eq!(s, message);
+            received += s.len();
+        }
+
+        unsafe { NUM_RUNS += 1 };
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+    assert_eq!(unsafe { NUM_RUNS }, n);
+}

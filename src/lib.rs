@@ -466,6 +466,7 @@ struct IoContextFrame {
     local_task_queue: VecDeque<Weak>,
     event_fd: EventFd,
     buf_groups: HashMap<i32, *mut BufGroup>,
+    runguard_blacklist: HashSet<u64>,
 }
 
 //-----------------------------------------------------------------------------
@@ -633,7 +634,7 @@ impl Drop for RunGuard {
         unsafe { submit_ring(ring) };
         unsafe { io_uring_get_events(ring) };
 
-        let mut blacklist = HashSet::<u64>::new();
+        let mut blacklist = std::mem::take(&mut self.p.borrow_mut().runguard_blacklist);
 
         let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
         while unsafe { io_uring_peek_cqe(ring, &raw mut cqe) } == 0 {
@@ -655,6 +656,8 @@ impl Drop for RunGuard {
                 }
             }
         }
+
+        self.p.borrow_mut().runguard_blacklist = blacklist;
     }
 }
 
@@ -703,6 +706,7 @@ impl IoContext {
             local_task_queue: VecDeque::new(),
             event_fd: nix::sys::eventfd::EventFd::new().unwrap(),
             buf_groups: HashMap::new(),
+            runguard_blacklist: HashSet::new(),
         }));
 
         {
