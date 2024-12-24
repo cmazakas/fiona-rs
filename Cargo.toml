@@ -16,6 +16,7 @@ pkg-config = "0.3.31"
 
 [dev-dependencies]
 futures = "0.3.30"
+rand = "0.8.5"
 
 [profile.release-with-debug]
 inherits = "release"

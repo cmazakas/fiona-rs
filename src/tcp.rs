@@ -30,15 +30,15 @@ use nix::{
 use crate::{
     add_obj_ref, add_op_ref, release_impl, release_obj, reserve_sqes, submit_ring,
     uring::{
-        io_uring_get_sqe, io_uring_prep_accept_direct, io_uring_prep_cancel64,
-        io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_connect,
-        io_uring_prep_link_timeout, io_uring_prep_recv_multishot, io_uring_prep_send_zc,
-        io_uring_prep_socket_direct, io_uring_prep_timeout, io_uring_prep_timeout_remove,
-        io_uring_register_files_update, io_uring_sqe_set_buf_group, io_uring_sqe_set_data,
-        io_uring_sqe_set_data64, io_uring_sqe_set_flags, IORING_ASYNC_CANCEL_ALL,
-        IORING_ASYNC_CANCEL_FD_FIXED, IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST,
-        IORING_TIMEOUT_MULTISHOT, IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE,
-        IOSQE_IO_LINK,
+        io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_get_sqe,
+        io_uring_prep_accept_direct, io_uring_prep_cancel64, io_uring_prep_cancel_fd,
+        io_uring_prep_close_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
+        io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_socket_direct,
+        io_uring_prep_timeout, io_uring_prep_timeout_remove, io_uring_register_files_update,
+        io_uring_sqe_set_buf_group, io_uring_sqe_set_data, io_uring_sqe_set_data64,
+        io_uring_sqe_set_flags, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
+        IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT,
+        IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK,
     },
     Executor, IoUringOp, OpType, RefCount, Result,
 };
@@ -56,7 +56,7 @@ struct StreamImpl {
     ex: Executor,
     fd: i32,
     ts: TimeSpec,
-    buf_group: i32,
+    buf_group: u16,
     send_pending: bool,
     recv_pending: bool,
     last_send: Instant,
@@ -427,7 +427,7 @@ impl Stream {
                 ex,
                 fd,
                 ts: TimeSpec::from_duration(Duration::from_secs(3)),
-                buf_group: -1,
+                buf_group: u16::MAX,
                 send_pending: false,
                 recv_pending: false,
                 last_send: Instant::now(),
@@ -473,7 +473,7 @@ impl Stream {
         Stream { p }
     }
 
-    pub fn set_buf_group(&self, bgid: i32) {
+    pub fn set_buf_group(&self, bgid: u16) {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.buf_group = bgid;
     }
@@ -540,7 +540,7 @@ impl Client {
                 ex,
                 fd: -1,
                 ts: TimeSpec::from_duration(Duration::from_secs(3)),
-                buf_group: -1,
+                buf_group: u16::MAX,
                 send_pending: false,
                 recv_pending: false,
                 last_send: Instant::now(),
@@ -627,7 +627,7 @@ impl Client {
         Stream { p: self.p.cast() }
     }
 
-    pub fn set_buf_group(&self, bgid: i32) {
+    pub fn set_buf_group(&self, bgid: u16) {
         let stream_impl = unsafe { &mut (*self.p.as_ptr()).stream };
         stream_impl.buf_group = bgid;
     }
@@ -1016,7 +1016,7 @@ impl Future for RecvFuture<'_> {
 
         match stream_impl.recv_op {
             None => {
-                let bgid = u16::try_from(stream_impl.buf_group).unwrap();
+                let bgid = stream_impl.buf_group;
                 let ioprio =
                     u16::try_from(IORING_RECVSEND_POLL_FIRST | IORING_RECVSEND_BUNDLE).unwrap();
 
@@ -1078,12 +1078,39 @@ impl Future for RecvFuture<'_> {
                     buf_group,
                 } = op.op_type
                 else {
-                    unreachable!()
+                    unreachable!();
                 };
 
                 if !bufs.is_empty() {
                     self.completed = true;
-                    return Poll::Ready(Ok(mem::take(bufs)));
+                    let buf_seq = mem::take(bufs);
+
+                    let buf_group = unsafe { &mut *buf_group };
+                    let mask = buf_group.num_bufs - 1;
+                    let br = buf_group.buf_ring;
+
+                    for buf_offset in 0..buf_seq.len() {
+                        let bid = buf_group.tail.try_into().unwrap();
+
+                        let buf = Vec::<u8>::with_capacity(buf_group.buf_len);
+                        let (addr, _, _) = buf.into_raw_parts();
+                        buf_group.bufs[usize::from(bid)] = addr;
+
+                        let len = buf_group.buf_len.try_into().unwrap();
+                        let addr = addr.cast();
+                        let buf_offset = buf_offset.try_into().unwrap();
+
+                        buf_group.tail = (buf_group.tail + 1) & mask;
+
+                        let mask = mask.try_into().unwrap();
+
+                        unsafe { io_uring_buf_ring_add(br, addr, len, bid, mask, buf_offset) };
+                    }
+
+                    let count = buf_seq.len().try_into().unwrap();
+                    unsafe { io_uring_buf_ring_advance(br, count) };
+
+                    return Poll::Ready(Ok(buf_seq));
                 }
 
                 if op.res < 0 {
@@ -1095,6 +1122,7 @@ impl Future for RecvFuture<'_> {
                     return Poll::Ready(Err(Errno::from_raw(res)));
                 }
 
+                op.weak = Some(stream_impl.ex.get_root_task());
                 Poll::Pending
             }
         }

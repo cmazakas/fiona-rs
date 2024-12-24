@@ -3,6 +3,7 @@ use std::{future::Future, net::Ipv4Addr, task::Poll, time::Duration};
 
 use futures::FutureExt;
 use nix::errno::Errno;
+use rand::SeedableRng;
 
 struct WakerFuture;
 
@@ -418,7 +419,13 @@ fn test_tcp_recv_buffer_replenishing() {
 
     static mut NUM_RUNS: u64 = 0;
 
-    let message: &'static str = "hello, world! hopefuly this makes the message long enough such that we finally bundle lmao";
+    let message_len = 1337;
+    let mut rng = rand::rngs::StdRng::from_seed([0; 32]);
+    let mut message = vec![0; message_len];
+    <[u8] as rand::Fill>::try_fill(message.as_mut_slice(), &mut rng).unwrap();
+
+    let message = message;
+    let chunk_size = 90;
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
@@ -427,69 +434,71 @@ fn test_tcp_recv_buffer_replenishing() {
     let port = acceptor.port();
 
     let bgid = 0;
-    let num_bufs = 128;
+    let num_bufs = 64;
     let buf_len = 8;
     let total_bytes = usize::try_from(num_bufs).unwrap() * buf_len;
 
+    assert!(message.len() > total_bytes);
+
     ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
 
-    let expected_bufs = message.len() / buf_len + if message.len() % buf_len > 0 { 1 } else { 0 };
+    {
+        let message = message.clone();
+        ex.clone().spawn(async move {
+            let stream = acceptor.accept().await.unwrap();
+            stream.set_buf_group(bgid);
 
-    ex.clone().spawn(async move {
-        let stream = acceptor.accept().await.unwrap();
-        stream.set_buf_group(bgid);
+            let mut acc_msg = Vec::new();
 
-        let mut sent = 0;
-        while sent < total_bytes {
-            let bufs = stream.recv().await.unwrap();
+            while acc_msg.len() < message_len {
+                let bufs = stream.recv().await.unwrap();
 
-            assert_eq!(bufs.len(), expected_bufs);
+                let mut msg = Vec::new();
+                for buf in bufs.iter() {
+                    msg.extend_from_slice(buf);
+                }
 
-            let mut s = String::new();
-            for buf in bufs.iter() {
-                s.push_str(str::from_utf8(buf.as_slice()).unwrap());
+                acc_msg.extend_from_slice(&msg);
+
+                let msg = stream.send(msg).await.unwrap();
+                assert!(msg.is_empty());
             }
 
-            assert_eq!(s, message);
+            assert_eq!(acc_msg, message);
+            unsafe { NUM_RUNS += 1 };
+        });
+    }
 
-            let msg = String::from(message).into_bytes();
-            let msg = stream.send(msg).await.unwrap();
-            sent += msg.len();
-        }
+    {
+        let message = message.clone();
+        ex.clone().spawn(async move {
+            let client = fiona::tcp::Client::new(ex);
 
-        unsafe { NUM_RUNS += 1 };
-    });
-
-    ex.clone().spawn(async move {
-        let client = fiona::tcp::Client::new(ex);
-
-        client
-            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
-            .await
-            .unwrap();
-
-        let mut received = 0;
-        while received < total_bytes {
-            let msg = String::from(message).into_bytes();
-            let _msg = client.send(msg).await.unwrap();
+            client
+                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                .await
+                .unwrap();
 
             client.set_buf_group(bgid);
 
-            let bufs = client.recv().await.unwrap();
+            let mut acc_msg = Vec::new();
 
-            assert_eq!(bufs.len(), expected_bufs);
+            for chunk in message.chunks(chunk_size) {
+                let msg = chunk.to_vec();
+                let msg = client.send(msg).await.unwrap();
+                assert!(msg.is_empty());
 
-            let mut s = String::new();
-            for buf in bufs.iter() {
-                s.push_str(str::from_utf8(buf.as_slice()).unwrap());
+                let bufs = client.recv().await.unwrap();
+
+                for buf in bufs.iter() {
+                    acc_msg.extend_from_slice(buf);
+                }
             }
 
-            assert_eq!(s, message);
-            received += s.len();
-        }
-
-        unsafe { NUM_RUNS += 1 };
-    });
+            assert_eq!(acc_msg, message);
+            unsafe { NUM_RUNS += 1 };
+        });
+    }
 
     let n = ioc.run();
     assert_eq!(n, 2);

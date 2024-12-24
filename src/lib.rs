@@ -432,24 +432,26 @@ struct BufGroup {
     buf_ring: *mut io_uring_buf_ring,
     num_bufs: u32,
     buf_len: usize,
-    bgid: i32,
-    bufs: *mut *mut u8,
+    bgid: u16,
+    bufs: Vec<*mut u8>,
     ring: *mut io_uring,
+    tail: u32,
 }
 
 impl BufGroup {
     unsafe fn release(&mut self) {
-        io_uring_free_buf_ring(self.ring, self.buf_ring, self.num_bufs, self.bgid);
+        io_uring_free_buf_ring(self.ring, self.buf_ring, self.num_bufs, self.bgid.into());
 
-        let num_bufs = self.num_bufs.try_into().unwrap();
-        let bufs = Vec::<*mut u8>::from_raw_parts(self.bufs, num_bufs, num_bufs);
+        let bufs = &mut self.bufs;
 
-        for ptr in bufs {
+        for ptr in bufs.iter() {
             if ptr.is_null() {
                 continue;
             }
-            drop(Vec::<u8>::from_raw_parts(ptr, self.buf_len, self.buf_len));
+            drop(Vec::<u8>::from_raw_parts(*ptr, self.buf_len, self.buf_len));
         }
+
+        bufs.shrink_to_fit();
     }
 }
 
@@ -465,7 +467,7 @@ struct IoContextFrame {
     root_task: Option<Weak>,
     local_task_queue: VecDeque<Weak>,
     event_fd: EventFd,
-    buf_groups: HashMap<i32, *mut BufGroup>,
+    buf_groups: HashMap<u16, *mut BufGroup>,
     runguard_blacklist: HashSet<u64>,
 }
 
@@ -614,6 +616,29 @@ struct CQESeenGuard<'a> {
 impl Drop for CQESeenGuard<'_> {
     fn drop(&mut self) {
         unsafe { io_uring_cqe_seen(self.ring, self.cqe) };
+    }
+}
+
+struct CQEAdvanceGuard {
+    ring: *mut io_uring,
+    n: usize,
+}
+
+impl Drop for CQEAdvanceGuard {
+    fn drop(&mut self) {
+        if self.n > 0 {
+            unsafe { io_uring_cq_advance(self.ring, self.n.try_into().unwrap()) };
+        }
+    }
+}
+
+struct IncrGuard<'a> {
+    n: &'a mut usize,
+}
+
+impl Drop for IncrGuard<'_> {
+    fn drop(&mut self) {
+        *self.n += 1;
     }
 }
 
@@ -831,7 +856,11 @@ impl IoContext {
             let num_cqes = unsafe { io_uring_peek_batch_cqe(ring, cqes.as_mut_ptr(), num_ready) };
             unsafe { cqes.set_len(num_cqes as usize) };
 
+            let mut guard = CQEAdvanceGuard { ring, n: 0 };
+
             for cqe in &mut cqes {
+                let _g = IncrGuard { n: &mut guard.n };
+
                 let cqe = unsafe { &mut **cqe };
                 if cqe.user_data == 0 {
                     continue;
@@ -963,47 +992,82 @@ impl IoContext {
                         //     Errno::from_raw(-cqe.res)
                         // );
 
-                        if op.eager_dropped {
-                            // * Have to handle cqe.res > 0, i.e. replenish buffer sequence here.
-                            todo!("hande eager-dropped multishot tcp recv")
-                        }
-
                         let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
+
                         if !has_more_cqes {
                             op.done = true;
-                            op.res = cqe.res;
                             unsafe { release_op(op.ref_count) };
+                        }
 
-                            if let Some(weak) = op.weak.take() {
-                                self.p.borrow_mut().local_task_queue.push_back(weak);
+                        if op.eager_dropped {
+                            debug_assert!(!has_more_cqes);
+
+                            if cqe.res > 0 {
+                                let buf_group = unsafe { &mut *buf_group };
+                                let mask = buf_group.num_bufs - 1;
+                                let br = buf_group.buf_ring;
+
+                                let len = buf_group.buf_len;
+
+                                let num_bytes = usize::try_from(cqe.res).unwrap();
+
+                                let num_buffers =
+                                    (num_bytes / len) + usize::from(num_bytes % len > 0);
+
+                                for buf_offset in 0..num_buffers {
+                                    let bid = buf_group.tail.try_into().unwrap();
+
+                                    let buf = Vec::<u8>::with_capacity(buf_group.buf_len);
+                                    let (addr, _, _) = buf.into_raw_parts();
+                                    buf_group.bufs[usize::from(bid)] = addr;
+
+                                    let len = buf_group.buf_len.try_into().unwrap();
+                                    let addr = addr.cast();
+                                    let buf_offset = buf_offset.try_into().unwrap();
+
+                                    buf_group.tail = (buf_group.tail + 1) & mask;
+
+                                    let mask = mask.try_into().unwrap();
+
+                                    unsafe {
+                                        io_uring_buf_ring_add(br, addr, len, bid, mask, buf_offset);
+                                    }
+                                }
+
+                                let count = num_buffers.try_into().unwrap();
+                                unsafe { io_uring_buf_ring_advance(br, count) };
                             }
 
+                            drop(unsafe { Box::from_raw(op) });
                             continue;
                         }
 
-                        let mut bid =
-                            usize::try_from(cqe.flags >> IORING_CQE_BUFFER_SHIFT).unwrap();
+                        op.res = cqe.res;
+                        if op.res > 0 {
+                            let mut bid =
+                                usize::try_from(cqe.flags >> IORING_CQE_BUFFER_SHIFT).unwrap();
 
-                        let buf_group = unsafe { &mut *buf_group };
+                            let buf_group = unsafe { &mut *buf_group };
 
-                        let buf_len = buf_group.buf_len;
-                        let num_bufs = buf_group.num_bufs;
-                        let num_bufs_mask = usize::try_from(num_bufs - 1).unwrap();
-                        let bufs_ptr = buf_group.bufs;
+                            let buf_len = buf_group.buf_len;
+                            let num_bufs = buf_group.num_bufs;
+                            let num_bufs_mask = usize::try_from(num_bufs - 1).unwrap();
+                            let ring_bufs = &mut buf_group.bufs;
 
-                        let mut num_bytes = usize::try_from(cqe.res).unwrap();
-                        while num_bytes > 0 {
-                            let to_read = std::cmp::min(num_bytes, buf_len);
+                            let mut num_bytes = usize::try_from(cqe.res).unwrap();
+                            while num_bytes > 0 {
+                                let to_read = std::cmp::min(num_bytes, buf_len);
 
-                            let p = unsafe { bufs_ptr.add(bid) };
-                            let ptr = unsafe { *p };
-                            unsafe { *p = null_mut() };
+                                let p = &mut ring_bufs[bid];
+                                let ptr = *p;
+                                *p = null_mut();
 
-                            let buf = unsafe { Vec::from_raw_parts(ptr, to_read, buf_len) };
-                            bufs.push(buf);
+                                let buf = unsafe { Vec::from_raw_parts(ptr, to_read, buf_len) };
+                                bufs.push(buf);
 
-                            bid = (bid + 1) & num_bufs_mask;
-                            num_bytes -= to_read;
+                                bid = (bid + 1) & num_bufs_mask;
+                                num_bytes -= to_read;
+                            }
                         }
 
                         if let Some(weak) = op.weak.take() {
@@ -1029,8 +1093,6 @@ impl IoContext {
                     }
                 }
             }
-
-            unsafe { io_uring_cq_advance(ring, num_cqes) };
         }
 
         num_completed
@@ -1146,7 +1208,7 @@ impl Executor {
         self.p.borrow().root_task.clone().unwrap()
     }
 
-    pub fn register_buf_group(&self, bgid: i32, num_bufs: u32, buf_len: usize) -> Result<()> {
+    pub fn register_buf_group(&self, bgid: u16, num_bufs: u32, buf_len: usize) -> Result<()> {
         let mut ret = 0_i32;
 
         let ring = self.ring();
@@ -1154,7 +1216,7 @@ impl Executor {
         let flags = 0;
         let err = &mut ret;
 
-        let buf_ring = unsafe { io_uring_setup_buf_ring(ring, nentries, bgid, flags, err) };
+        let buf_ring = unsafe { io_uring_setup_buf_ring(ring, nentries, bgid.into(), flags, err) };
         if buf_ring.is_null() {
             return Err(Errno::from_raw(-ret));
         }
@@ -1183,8 +1245,6 @@ impl Executor {
 
         unsafe { io_uring_buf_ring_advance(buf_ring, num_bufs.try_into().unwrap()) };
 
-        let (bufs, _, _) = bufs.into_raw_parts();
-
         self.p.borrow_mut().buf_groups.insert(
             bgid,
             Box::into_raw(Box::new(BufGroup {
@@ -1194,6 +1254,7 @@ impl Executor {
                 bgid,
                 bufs,
                 ring,
+                tail: 0,
             })),
         );
 
