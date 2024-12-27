@@ -504,3 +504,78 @@ fn test_tcp_recv_buffer_replenishing() {
     assert_eq!(n, 2);
     assert_eq!(unsafe { NUM_RUNS }, n);
 }
+
+fn bufs_to_string(bufs: Vec<Vec<u8>>) -> String {
+    let mut s = String::new();
+    for buf in bufs {
+        s.push_str(str::from_utf8(&buf).unwrap());
+    }
+    s
+}
+
+#[test]
+fn test_tcp_recv_timeout() {
+    // Test that our recv operation can timeout and then be restarted.
+
+    static mut NUM_RUNS: u64 = 0;
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.clone().spawn(async move {
+        let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+        let port = acceptor.port();
+
+        let bgid = 0;
+        let num_bufs = 64;
+        let buf_len = 8;
+
+        ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
+
+        ex.clone().spawn(async move {
+            let client = fiona::tcp::Client::new(ex.clone());
+
+            client
+                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            client.set_buf_group(bgid);
+
+            let msg = String::from("hello, world!");
+            let mut msg = client.send(msg.into_bytes()).await.unwrap();
+            assert!(msg.is_empty());
+            msg.extend_from_slice("hello, world!".as_bytes());
+
+            let timer = fiona::time::Timer::new(ex);
+            timer.wait(Duration::from_millis(600)).await.unwrap();
+
+            let msg = client.send(msg).await.unwrap();
+            assert!(msg.is_empty());
+
+            unsafe { NUM_RUNS += 1 };
+        });
+
+        let stream = acceptor.accept().await.unwrap();
+        stream.set_buf_group(bgid);
+        stream.set_timeout(Duration::from_millis(500));
+
+        let bufs = stream.recv().await.unwrap();
+        assert_eq!(bufs_to_string(bufs), "hello, world!");
+
+        let err = stream.recv().await.unwrap_err();
+        assert_eq!(err, Errno::ECANCELED);
+
+        let bufs = stream.recv().await.unwrap();
+        assert_eq!(bufs_to_string(bufs), "hello, world!");
+
+        let err = stream.recv().await.unwrap_err();
+        assert_eq!(err, Errno::ECANCELED);
+
+        unsafe { NUM_RUNS += 1 };
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+    assert_eq!(unsafe { NUM_RUNS }, n);
+}

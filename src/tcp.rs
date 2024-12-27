@@ -34,11 +34,12 @@ use crate::{
         io_uring_prep_accept_direct, io_uring_prep_cancel64, io_uring_prep_cancel_fd,
         io_uring_prep_close_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
         io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_socket_direct,
-        io_uring_prep_timeout, io_uring_prep_timeout_remove, io_uring_register_files_update,
-        io_uring_sqe_set_buf_group, io_uring_sqe_set_data, io_uring_sqe_set_data64,
-        io_uring_sqe_set_flags, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
-        IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT,
-        IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK,
+        io_uring_prep_timeout, io_uring_prep_timeout_remove, io_uring_prep_timeout_update,
+        io_uring_register_files_update, io_uring_sqe_set_buf_group, io_uring_sqe_set_data,
+        io_uring_sqe_set_data64, io_uring_sqe_set_flags, IORING_ASYNC_CANCEL_ALL,
+        IORING_ASYNC_CANCEL_FD_FIXED, IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST,
+        IORING_TIMEOUT_MULTISHOT, IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE,
+        IOSQE_IO_LINK,
     },
     Executor, IoUringOp, OpType, RefCount, Result,
 };
@@ -51,18 +52,18 @@ struct AcceptorImpl {
     accept_pending: bool,
 }
 
-struct StreamImpl {
+pub(crate) struct StreamImpl {
+    pub(crate) fd: i32,
+    pub(crate) send_pending: bool,
+    pub(crate) recv_op: Option<Box<IoUringOp>>,
+    pub(crate) last_send: Instant,
+    pub(crate) last_recv: Instant,
     ref_count: RefCount,
     ex: Executor,
-    fd: i32,
     ts: TimeSpec,
     buf_group: u16,
-    send_pending: bool,
     recv_pending: bool,
-    last_send: Instant,
-    last_recv: Instant,
     timeout_op: Option<Box<IoUringOp>>,
-    recv_op: Option<Box<IoUringOp>>,
 }
 
 struct ClientImpl {
@@ -450,20 +451,23 @@ impl Stream {
             eager_dropped: false,
             res: -1,
             weak: None,
-            op_type: OpType::MultishotTimeout { ts: stream_impl.ts },
+            op_type: OpType::MultishotTimeout {
+                ts: stream_impl.ts,
+                stream: p.as_ptr(),
+            },
         });
 
         let user_data = Box::as_mut_ptr(&mut op).cast();
 
-        let OpType::MultishotTimeout { ref mut ts } = op.op_type else {
+        let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
             unreachable!()
         };
 
-        let ts = std::ptr::from_mut(ts).cast();
+        let ts = ptr::from_mut(ts).cast();
 
         unsafe { reserve_sqes(ring, 1) };
-        let sqe = unsafe { io_uring_get_sqe(ring) };
 
+        let sqe = unsafe { io_uring_get_sqe(ring) };
         unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
         unsafe { io_uring_sqe_set_data(sqe, user_data) };
 
@@ -476,6 +480,9 @@ impl Stream {
     pub fn set_buf_group(&self, bgid: u16) {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.buf_group = bgid;
+
+        // TODO: eventually handle rescheduling/cancelling the recv op when this
+        // gets called or at least figure out the correct behavior.
     }
 
     #[must_use]
@@ -485,6 +492,7 @@ impl Stream {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.send_pending = true;
 
+        let last_send = &raw mut stream_impl.last_send;
         let ref_count = &raw mut stream_impl.ref_count;
 
         SendFuture {
@@ -497,23 +505,47 @@ impl Stream {
                 eager_dropped: false,
                 res: -1,
                 weak: None,
-                op_type: OpType::TcpSend { buf },
+                op_type: OpType::TcpSend { buf, last_send },
             })),
         }
     }
 
     #[must_use]
     pub fn recv(&self) -> RecvFuture {
-        assert!(unsafe { !(*self.p.as_ptr()).recv_pending });
-
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
+        assert!(!stream_impl.recv_pending);
         stream_impl.recv_pending = true;
-
-        let ref_count = &raw mut stream_impl.ref_count;
 
         RecvFuture {
             stream: self,
             completed: false,
+        }
+    }
+
+    pub fn set_timeout(&self, dur: Duration) {
+        let stream_impl = unsafe { &mut *self.p.as_ptr() };
+
+        stream_impl.ts = TimeSpec::from_duration(dur);
+
+        if let Some(ref mut timeout_op) = stream_impl.timeout_op {
+            let ring = stream_impl.ex.ring();
+
+            unsafe { reserve_sqes(ring, 1) };
+
+            let sqe = unsafe { io_uring_get_sqe(ring) };
+            let user_data = Box::as_mut_ptr(timeout_op) as u64;
+
+            let OpType::MultishotTimeout { ref mut ts, .. } = timeout_op.op_type else {
+                unreachable!()
+            };
+
+            *ts = stream_impl.ts;
+            let flags = 0;
+            let ts = ptr::from_mut(ts).cast();
+
+            unsafe { io_uring_prep_timeout_update(sqe, ts, user_data, flags) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
         }
     }
 }
@@ -564,12 +596,15 @@ impl Client {
             eager_dropped: false,
             res: -1,
             weak: None,
-            op_type: OpType::MultishotTimeout { ts: stream_impl.ts },
+            op_type: OpType::MultishotTimeout {
+                ts: stream_impl.ts,
+                stream: &raw mut *stream_impl,
+            },
         });
 
         let user_data = Box::as_mut_ptr(&mut op).cast();
 
-        let OpType::MultishotTimeout { ref mut ts } = op.op_type else {
+        let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
             unreachable!()
         };
 
@@ -657,26 +692,26 @@ impl Drop for Stream {
             unsafe { reserve_sqes(ring, num_sqes) };
 
             {
-                let sqe = unsafe { io_uring_get_sqe(ring) };
                 let mut op = stream_impl.timeout_op.take().unwrap();
                 let user_data = Box::as_mut_ptr(&mut op) as u64;
                 // makes sure this gets cleaned up, not really an eager-dropped operation
                 op.eager_dropped = true;
                 Box::leak(op);
 
+                let sqe = unsafe { io_uring_get_sqe(ring) };
                 unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
                 unsafe { io_uring_sqe_set_data64(sqe, 0) };
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
             }
 
             if stream_impl.recv_op.is_some() {
-                let sqe = unsafe { io_uring_get_sqe(ring) };
                 let mut op = stream_impl.recv_op.take().unwrap();
                 let user_data = Box::as_mut_ptr(&mut op) as u64;
                 // makes sure this gets cleaned up, not really an eager-dropped operation
                 op.eager_dropped = true;
                 Box::leak(op);
 
+                let sqe = unsafe { io_uring_get_sqe(ring) };
                 unsafe { io_uring_prep_cancel64(sqe, user_data, 0) };
                 unsafe { io_uring_sqe_set_data64(sqe, 0) };
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
@@ -941,7 +976,7 @@ impl Future for SendFuture<'_> {
                 Poll::Pending
             }
             (false, false) => {
-                let OpType::TcpSend { ref buf } = op.op_type else {
+                let OpType::TcpSend { ref buf, .. } = op.op_type else {
                     unreachable!()
                 };
 
@@ -975,7 +1010,7 @@ impl Future for SendFuture<'_> {
             (true, true) => {
                 self.completed = true;
 
-                let OpType::TcpSend { ref mut buf } = op.op_type else {
+                let OpType::TcpSend { ref mut buf, .. } = op.op_type else {
                     unreachable!()
                 };
 
@@ -1036,6 +1071,9 @@ impl Future for RecvFuture<'_> {
                     Some(buf_group) => *buf_group,
                 };
 
+                stream_impl.last_recv = Instant::now();
+                let last_recv: *mut Instant = &raw mut stream_impl.last_recv;
+
                 let mut op = Box::new(IoUringOp {
                     ref_count,
                     initiated: false,
@@ -1046,6 +1084,7 @@ impl Future for RecvFuture<'_> {
                     op_type: OpType::MultishotTcpRecv {
                         bufs: Vec::new(),
                         buf_group,
+                        last_recv,
                     },
                 });
 
@@ -1076,6 +1115,7 @@ impl Future for RecvFuture<'_> {
                 let OpType::MultishotTcpRecv {
                     ref mut bufs,
                     buf_group,
+                    ..
                 } = op.op_type
                 else {
                     unreachable!();
