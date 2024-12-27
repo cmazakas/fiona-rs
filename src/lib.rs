@@ -886,218 +886,13 @@ impl IoContext {
 
                 let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
                 match op.op_type {
-                    OpType::Timeout { .. } => {
-                        unsafe { release_op(op.ref_count) };
-
-                        if op.eager_dropped {
-                            drop(unsafe { Box::from_raw(op) });
-                            continue;
-                        }
-
-                        op.done = true;
-                        op.res = cqe.res;
-                        if let Some(weak) = op.weak.take() {
-                            self.p.borrow_mut().local_task_queue.push_back(weak);
-                        }
-                    }
-                    OpType::TimeoutCancel => {
-                        todo!()
-                    }
-                    OpType::TcpAccept { fd } => {
-                        unsafe { release_op(op.ref_count) };
-
-                        let res = cqe.res;
-
-                        if op.eager_dropped {
-                            if res < 0 {
-                                drop(unsafe { Box::from_raw(op) });
-                            } else {
-                                unsafe { reserve_sqes(ring, 1) };
-
-                                let fd = fd.try_into().unwrap();
-
-                                let sqe = unsafe { io_uring_get_sqe(ring) };
-                                unsafe { io_uring_prep_close_direct(sqe, fd) };
-                                unsafe { io_uring_sqe_set_data64(sqe, 0) };
-                                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-
-                                // unsafe { submit_ring(ring) };
-
-                                drop(unsafe { Box::from_raw(op) });
-                                ex.reclaim_fd(fd);
-                            }
-
-                            continue;
-                        }
-
-                        op.done = true;
-                        op.res = res;
-                        if let Some(weak) = op.weak.take() {
-                            self.p.borrow_mut().local_task_queue.push_back(weak);
-                        }
-                    }
-                    OpType::TcpConnect {
-                        ref mut needs_socket,
-                        ref mut got_socket,
-                        ..
-                    } => {
-                        if op.eager_dropped {
-                            // if the Future was eager-dropped:
-                            // * we need to release the borrowed direct descriptor back to the pool
-                            // * if the connect() succeeded, we need to close() it
-
-                            unsafe { release_op(op.ref_count) };
-                            drop(unsafe { Box::from_raw(op) });
-                            // continue;
-                            todo!();
-                        }
-
-                        if cqe.res < 0 || *got_socket {
-                            unsafe { release_op(op.ref_count) };
-
-                            op.res = cqe.res;
-                            op.done = true;
-                            if let Some(weak) = op.weak.take() {
-                                self.p.borrow_mut().local_task_queue.push_back(weak);
-                            }
-                            continue;
-                        }
-
-                        if *needs_socket {
-                            *got_socket = true;
-                        }
-                    }
-                    OpType::TcpSend {
-                        ref mut buf,
-                        last_send,
-                    } => {
-                        let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
-
-                        if op.eager_dropped {
-                            if !has_more_cqes {
-                                unsafe { release_op(op.ref_count) };
-                                drop(unsafe { Box::from_raw(op) });
-                            }
-                            continue;
-                        }
-
-                        unsafe { *last_send = Instant::now() };
-
-                        if has_more_cqes {
-                            op.res = cqe.res;
-                            if cqe.res >= 0 {
-                                let n: usize = cqe.res.try_into().unwrap();
-                                buf.drain(0..n);
-                            }
-                            continue;
-                        }
-                        assert!(cqe.flags & IORING_CQE_F_NOTIF > 0);
-                        op.done = true;
-
-                        unsafe { release_op(op.ref_count) };
-
-                        if let Some(weak) = op.weak.take() {
-                            self.p.borrow_mut().local_task_queue.push_back(weak);
-                        }
-                    }
-                    OpType::MultishotTcpRecv {
-                        ref mut bufs,
-                        buf_group,
-                        last_recv,
-                    } => {
-                        // println!(
-                        //     "multishot tcp cqe->res => {} aka {}",
-                        //     cqe.res,
-                        //     Errno::from_raw(-cqe.res)
-                        // );
-
-                        let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
-
-                        if !has_more_cqes {
-                            op.done = true;
-                            unsafe { release_op(op.ref_count) };
-                        }
-
-                        if op.eager_dropped {
-                            debug_assert!(!has_more_cqes);
-
-                            if cqe.res > 0 {
-                                let buf_group = unsafe { &mut *buf_group };
-                                let mask = buf_group.num_bufs - 1;
-                                let br = buf_group.buf_ring;
-
-                                let len = buf_group.buf_len;
-
-                                let num_bytes = usize::try_from(cqe.res).unwrap();
-
-                                let num_buffers =
-                                    (num_bytes / len) + usize::from(num_bytes % len > 0);
-
-                                for buf_offset in 0..num_buffers {
-                                    let bid = buf_group.tail.try_into().unwrap();
-
-                                    let buf = Vec::<u8>::with_capacity(buf_group.buf_len);
-                                    let (addr, _, _) = buf.into_raw_parts();
-                                    buf_group.bufs[usize::from(bid)] = addr;
-
-                                    let len = buf_group.buf_len.try_into().unwrap();
-                                    let addr = addr.cast();
-                                    let buf_offset = buf_offset.try_into().unwrap();
-
-                                    buf_group.tail = (buf_group.tail + 1) & mask;
-
-                                    let mask = mask.try_into().unwrap();
-
-                                    unsafe {
-                                        io_uring_buf_ring_add(br, addr, len, bid, mask, buf_offset);
-                                    }
-                                }
-
-                                let count = num_buffers.try_into().unwrap();
-                                unsafe { io_uring_buf_ring_advance(br, count) };
-                            }
-
-                            drop(unsafe { Box::from_raw(op) });
-                            continue;
-                        }
-
-                        unsafe { *last_recv = Instant::now() };
-
-                        op.res = cqe.res;
-                        if op.res > 0 {
-                            let mut bid =
-                                usize::try_from(cqe.flags >> IORING_CQE_BUFFER_SHIFT).unwrap();
-
-                            let buf_group = unsafe { &mut *buf_group };
-
-                            let buf_len = buf_group.buf_len;
-                            let num_bufs = buf_group.num_bufs;
-                            let num_bufs_mask = usize::try_from(num_bufs - 1).unwrap();
-                            let ring_bufs = &mut buf_group.bufs;
-
-                            let mut num_bytes = usize::try_from(cqe.res).unwrap();
-                            while num_bytes > 0 {
-                                let to_read = std::cmp::min(num_bytes, buf_len);
-
-                                let p = &mut ring_bufs[bid];
-                                let ptr = *p;
-                                *p = null_mut();
-
-                                let buf = unsafe { Vec::from_raw_parts(ptr, to_read, buf_len) };
-                                bufs.push(buf);
-
-                                bid = (bid + 1) & num_bufs_mask;
-                                num_bytes -= to_read;
-                            }
-                        }
-
-                        if let Some(weak) = op.weak.take() {
-                            self.p.borrow_mut().local_task_queue.push_back(weak);
-                        }
-                    }
-                    OpType::MultishotTimeout { .. } => {
-                        on_multishot_timeout(op, cqe, ring);
-                    }
+                    OpType::Timeout { .. } => on_timeout(op, cqe, ring, &ex),
+                    OpType::TimeoutCancel => todo!(),
+                    OpType::TcpAccept { .. } => on_tcp_accept(op, cqe, ring, &ex),
+                    OpType::TcpConnect { .. } => on_tcp_connect(op, cqe, ring, &ex),
+                    OpType::TcpSend { .. } => on_tcp_send(op, cqe, ring, &ex),
+                    OpType::MultishotTcpRecv { .. } => on_multishot_tcp_recv(op, cqe, ring, &ex),
+                    OpType::MultishotTimeout { .. } => on_multishot_timeout(op, cqe, ring),
                 }
             }
         }
@@ -1106,14 +901,253 @@ impl IoContext {
     }
 }
 
-fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring) {
+fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor) {
+    unsafe { release_op(op.ref_count) };
+
     if op.eager_dropped {
+        drop(unsafe { Box::from_raw(op) });
+        return;
+    }
+
+    op.done = true;
+    op.res = cqe.res;
+    if let Some(weak) = op.weak.take() {
+        ex.p.borrow_mut().local_task_queue.push_back(weak);
+    }
+}
+
+fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring, ex: &Executor) {
+    unsafe { release_op(op.ref_count) };
+
+    let res = cqe.res;
+
+    if op.eager_dropped {
+        if res < 0 {
+            drop(unsafe { Box::from_raw(op) });
+        } else {
+            let OpType::TcpAccept { fd } = op.op_type else {
+                unreachable!()
+            };
+
+            unsafe { reserve_sqes(ring, 1) };
+
+            let fd = fd.try_into().unwrap();
+
+            let sqe = unsafe { io_uring_get_sqe(ring) };
+            unsafe { io_uring_prep_close_direct(sqe, fd) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+
+            // unsafe { submit_ring(ring) };
+
+            drop(unsafe { Box::from_raw(op) });
+            ex.reclaim_fd(fd);
+        }
+
+        return;
+    }
+
+    op.done = true;
+    op.res = res;
+    if let Some(weak) = op.weak.take() {
+        ex.p.borrow_mut().local_task_queue.push_back(weak);
+    }
+}
+
+fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor) {
+    if op.eager_dropped {
+        // if the Future was eager-dropped:
+        // * we need to release the borrowed direct descriptor back to the pool
+        // * if the connect() succeeded, we need to close() it
+
+        unsafe { release_op(op.ref_count) };
+        drop(unsafe { Box::from_raw(op) });
+        // continue;
+        todo!();
+    }
+
+    let OpType::TcpConnect {
+        ref mut needs_socket,
+        ref mut got_socket,
+        ..
+    } = op.op_type
+    else {
+        unreachable!()
+    };
+
+    if cqe.res < 0 || *got_socket {
+        unsafe { release_op(op.ref_count) };
+
+        op.res = cqe.res;
+        op.done = true;
+        if let Some(weak) = op.weak.take() {
+            ex.p.borrow_mut().local_task_queue.push_back(weak);
+        }
+        return;
+    }
+
+    if *needs_socket {
+        *got_socket = true;
+    }
+}
+
+fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor) {
+    let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
+
+    if op.eager_dropped {
+        if !has_more_cqes {
+            unsafe { release_op(op.ref_count) };
+            drop(unsafe { Box::from_raw(op) });
+        }
+        return;
+    }
+
+    let OpType::TcpSend {
+        ref mut buf,
+        last_send,
+    } = op.op_type
+    else {
+        unreachable!()
+    };
+
+    unsafe { *last_send = Instant::now() };
+
+    if has_more_cqes {
+        op.res = cqe.res;
+        if cqe.res >= 0 {
+            let n: usize = cqe.res.try_into().unwrap();
+            buf.drain(0..n);
+        }
+        return;
+    }
+    assert!(cqe.flags & IORING_CQE_F_NOTIF > 0);
+    op.done = true;
+
+    unsafe { release_op(op.ref_count) };
+
+    if let Some(weak) = op.weak.take() {
+        ex.p.borrow_mut().local_task_queue.push_back(weak);
+    }
+}
+
+fn on_multishot_tcp_recv(
+    op: &mut IoUringOp,
+    cqe: &mut io_uring_cqe,
+    _ring: *mut io_uring,
+    ex: &Executor,
+) {
+    // println!(
+    //     "multishot tcp cqe->res => {} aka {}",
+    //     cqe.res,
+    //     Errno::from_raw(-cqe.res)
+    // );
+
+    let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
+
+    if !has_more_cqes {
+        op.done = true;
+        unsafe { release_op(op.ref_count) };
+    }
+
+    let OpType::MultishotTcpRecv {
+        ref mut bufs,
+        buf_group,
+        last_recv,
+    } = op.op_type
+    else {
+        unreachable!()
+    };
+
+    if op.eager_dropped {
+        debug_assert!(!has_more_cqes);
+
+        if cqe.res > 0 {
+            let buf_group = unsafe { &mut *buf_group };
+            let mask = buf_group.num_bufs - 1;
+            let br = buf_group.buf_ring;
+
+            let len = buf_group.buf_len;
+
+            let num_bytes = usize::try_from(cqe.res).unwrap();
+
+            let num_buffers = (num_bytes / len) + usize::from(num_bytes % len > 0);
+
+            for buf_offset in 0..num_buffers {
+                let bid = buf_group.tail.try_into().unwrap();
+
+                let buf = Vec::<u8>::with_capacity(buf_group.buf_len);
+                let (addr, _, _) = buf.into_raw_parts();
+                buf_group.bufs[usize::from(bid)] = addr;
+
+                let len = buf_group.buf_len.try_into().unwrap();
+                let addr = addr.cast();
+                let buf_offset = buf_offset.try_into().unwrap();
+
+                buf_group.tail = (buf_group.tail + 1) & mask;
+
+                let mask = mask.try_into().unwrap();
+
+                unsafe {
+                    io_uring_buf_ring_add(br, addr, len, bid, mask, buf_offset);
+                }
+            }
+
+            let count = num_buffers.try_into().unwrap();
+            unsafe { io_uring_buf_ring_advance(br, count) };
+        }
+
+        drop(unsafe { Box::from_raw(op) });
+        return;
+    }
+
+    unsafe { *last_recv = Instant::now() };
+
+    op.res = cqe.res;
+    if op.res > 0 {
+        let mut bid = usize::try_from(cqe.flags >> IORING_CQE_BUFFER_SHIFT).unwrap();
+
+        let buf_group = unsafe { &mut *buf_group };
+
+        let buf_len = buf_group.buf_len;
+        let num_bufs = buf_group.num_bufs;
+        let num_bufs_mask = usize::try_from(num_bufs - 1).unwrap();
+        let ring_bufs = &mut buf_group.bufs;
+
+        let mut num_bytes = usize::try_from(cqe.res).unwrap();
+        while num_bytes > 0 {
+            let to_read = std::cmp::min(num_bytes, buf_len);
+
+            let p = &mut ring_bufs[bid];
+            let ptr = *p;
+            *p = null_mut();
+
+            let buf = unsafe { Vec::from_raw_parts(ptr, to_read, buf_len) };
+            bufs.push(buf);
+
+            bid = (bid + 1) & num_bufs_mask;
+            num_bytes -= to_read;
+        }
+    }
+
+    if let Some(weak) = op.weak.take() {
+        ex.p.borrow_mut().local_task_queue.push_back(weak);
+    }
+}
+
+fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring) {
+    let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
+
+    let io_object_dropped = op.eager_dropped;
+    if io_object_dropped {
+        if has_more_cqes {
+            return;
+        }
+
         unsafe { release_op(op.ref_count) };
         drop(unsafe { Box::from_raw(op) });
         return;
     }
 
-    let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
     if !has_more_cqes {
         let user_data: *mut IoUringOp = &raw mut *op;
         let user_data = user_data.cast();
