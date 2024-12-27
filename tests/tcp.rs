@@ -517,12 +517,7 @@ fn bufs_to_string(bufs: Vec<Vec<u8>>) -> String {
 fn test_tcp_recv_timeout() {
     // Test that our recv operation can timeout and then be restarted.
 
-    static mut NUM_RUNS: u64 = 0;
-
-    let mut ioc = fiona::IoContext::new();
-    let ex = ioc.get_executor();
-
-    ex.clone().spawn(async move {
+    async fn server_timeout(ex: fiona::Executor) {
         let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
         let port = acceptor.port();
 
@@ -548,7 +543,7 @@ fn test_tcp_recv_timeout() {
             msg.extend_from_slice("hello, world!".as_bytes());
 
             let timer = fiona::time::Timer::new(ex);
-            timer.wait(Duration::from_millis(600)).await.unwrap();
+            timer.wait(Duration::from_millis(1000)).await.unwrap();
 
             let msg = client.send(msg).await.unwrap();
             assert!(msg.is_empty());
@@ -573,9 +568,71 @@ fn test_tcp_recv_timeout() {
         assert_eq!(err, Errno::ECANCELED);
 
         unsafe { NUM_RUNS += 1 };
-    });
+    }
+
+    async fn client_timeout(ex: fiona::Executor) {
+        let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+        let port = acceptor.port();
+
+        let bgid = 1;
+        let num_bufs = 64;
+        let buf_len = 8;
+
+        ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
+
+        let ex2 = ex.clone();
+        ex.clone().spawn(async move {
+            let client = fiona::tcp::Client::new(ex2.clone());
+
+            client
+                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            client.set_buf_group(bgid);
+            client.set_timeout(Duration::from_millis(500));
+
+            let bufs = client.recv().await.unwrap();
+            assert_eq!(bufs_to_string(bufs), "wonderful day");
+
+            let err = client.recv().await.unwrap_err();
+            assert_eq!(err, Errno::ECANCELED);
+
+            let bufs = client.recv().await.unwrap();
+            assert_eq!(bufs_to_string(bufs), "wonderful day");
+
+            let err = client.recv().await.unwrap_err();
+            assert_eq!(err, Errno::ECANCELED);
+
+            unsafe { NUM_RUNS += 1 };
+        });
+
+        let stream = acceptor.accept().await.unwrap();
+        stream.set_buf_group(bgid);
+
+        let msg = String::from("wonderful day");
+        let mut msg = stream.send(msg.into_bytes()).await.unwrap();
+        assert!(msg.is_empty());
+        msg.extend_from_slice("wonderful day".as_bytes());
+
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(1000)).await.unwrap();
+
+        let msg = stream.send(msg).await.unwrap();
+        assert!(msg.is_empty());
+
+        unsafe { NUM_RUNS += 1 };
+    }
+
+    static mut NUM_RUNS: u64 = 0;
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.clone().spawn(server_timeout(ex.clone()));
+    ex.clone().spawn(client_timeout(ex.clone()));
 
     let n = ioc.run();
-    assert_eq!(n, 2);
+    assert_eq!(n, 4);
     assert_eq!(unsafe { NUM_RUNS }, n);
 }

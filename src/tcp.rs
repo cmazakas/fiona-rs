@@ -667,6 +667,11 @@ impl Client {
         stream_impl.buf_group = bgid;
     }
 
+    pub fn set_timeout(&self, dur: Duration) {
+        let stream = self.as_stream();
+        stream.set_timeout(dur);
+    }
+
     pub async fn send(&self, buf: Vec<u8>) -> Result<Vec<u8>> {
         let stream = self.as_stream();
         stream.send(buf).await
