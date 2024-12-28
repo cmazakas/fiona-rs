@@ -19,7 +19,7 @@ fn main() {
         .iter()
         .for_each(|path_buf| println!("cargo::rustc-link-search={}", path_buf.to_str().unwrap()));
 
-    println!("cargo::rustc-link-lib=uring-ffi");
+    println!("cargo::rustc-link-lib=static=uring-ffi");
 
     let bindings = bindgen::Builder::default()
         .clang_args(
