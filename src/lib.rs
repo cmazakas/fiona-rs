@@ -1036,12 +1036,6 @@ fn on_multishot_tcp_recv(
     _ring: *mut io_uring,
     ex: &Executor,
 ) {
-    // println!(
-    //     "multishot tcp cqe->res => {} aka {}",
-    //     cqe.res,
-    //     Errno::from_raw(-cqe.res)
-    // );
-
     let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
 
     if !has_more_cqes {
@@ -1180,9 +1174,13 @@ fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut i
 
     let now = Instant::now();
     let stream_impl = unsafe { &mut *stream };
-    if (stream_impl.recv_op.is_some() && now.duration_since(stream_impl.last_recv) > dur)
-        || (stream_impl.send_pending && now.duration_since(stream_impl.last_send) > dur)
-    {
+
+    let recv_expired =
+        stream_impl.recv_op.is_some() && now.duration_since(stream_impl.last_recv) > dur;
+
+    let send_expired = stream_impl.send_pending && now.duration_since(stream_impl.last_send) > dur;
+
+    if recv_expired || send_expired {
         unsafe { reserve_sqes(ring, 1) };
 
         let sqe = unsafe { io_uring_get_sqe(ring) };
