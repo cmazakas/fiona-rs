@@ -780,6 +780,25 @@ impl IoContext {
     }
 
     pub fn run(&mut self) -> u64 {
+        fn on_work_item(weak: Weak, ex: &Executor) -> u64 {
+            match unsafe { weak.upgrade() } {
+                None => 0,
+                Some(mut task) => {
+                    ex.p.borrow_mut().root_task = Some(weak.clone());
+
+                    let w = make_waker(weak);
+                    let mut cx = std::task::Context::from_waker(&w);
+
+                    if let Poll::Ready(()) = task.poll(&mut cx) {
+                        ex.p.borrow_mut().tasks.remove(&task);
+                        1
+                    } else {
+                        0
+                    }
+                }
+            }
+        }
+
         let _guard = RunGuard { p: self.p.clone() };
 
         let mut num_completed = 0;
@@ -795,8 +814,6 @@ impl IoContext {
 
         let mut need_eventfd_read = true;
 
-        // let sender = self.p.borrow().sender.clone();
-
         loop {
             if self.p.borrow().tasks.is_empty() {
                 break;
@@ -805,20 +822,7 @@ impl IoContext {
             loop {
                 let m_item = self.p.borrow_mut().local_task_queue.pop_front();
                 if let Some(weak) = m_item {
-                    match unsafe { weak.upgrade() } {
-                        None => continue,
-                        Some(mut task) => {
-                            (*self.p).borrow_mut().root_task = Some(weak.clone());
-
-                            let w = make_waker(weak);
-                            let mut cx = std::task::Context::from_waker(&w);
-
-                            if let Poll::Ready(()) = task.poll(&mut cx) {
-                                (*self.p).borrow_mut().tasks.remove(&task);
-                                num_completed += 1;
-                            }
-                        }
-                    }
+                    num_completed += on_work_item(weak, &ex);
                 } else {
                     break;
                 }
@@ -827,20 +831,7 @@ impl IoContext {
             loop {
                 let m_item = self.p.borrow().receiver.try_recv();
                 if let Ok(weak) = m_item {
-                    match unsafe { weak.upgrade() } {
-                        None => continue,
-                        Some(mut task) => {
-                            (*self.p).borrow_mut().root_task = Some(weak.clone());
-
-                            let w = make_waker(weak);
-                            let mut cx = std::task::Context::from_waker(&w);
-
-                            if let Poll::Ready(()) = task.poll(&mut cx) {
-                                (*self.p).borrow_mut().tasks.remove(&task);
-                                num_completed += 1;
-                            }
-                        }
-                    }
+                    num_completed += on_work_item(weak, &ex);
                 } else {
                     break;
                 }
@@ -863,7 +854,7 @@ impl IoContext {
             }
 
             let ret = unsafe { io_uring_submit_and_wait(ring, 1) };
-            assert!(ret >= 0);
+            debug_assert!(ret >= 0);
 
             let num_ready = unsafe { io_uring_cq_ready(ring) };
             let num_cqes = unsafe { io_uring_peek_batch_cqe(ring, cqes.as_mut_ptr(), num_ready) };
