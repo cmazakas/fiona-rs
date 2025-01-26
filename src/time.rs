@@ -2,18 +2,20 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
+extern crate liburing_rs;
+
 use std::{future::Future, ptr::NonNull, task::Poll, time::Duration};
 
 use nix::{errno::Errno, libc::ETIME, sys::time::TimeSpec};
 
+use liburing_rs::{
+    __kernel_timespec, io_uring_get_sqe, io_uring_prep_timeout, io_uring_prep_timeout_remove,
+    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags, IOSQE_CQE_SKIP_SUCCESS,
+};
+
 use crate::{
-    add_obj_ref, add_op_ref, release_impl, release_obj, reserve_sqes,
-    uring::{
-        __kernel_timespec, io_uring_get_sqe, io_uring_prep_timeout, io_uring_prep_timeout_remove,
-        io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
-        IOSQE_CQE_SKIP_SUCCESS,
-    },
-    Executor, IoUringOp, OpType, RefCount, Result,
+    add_obj_ref, add_op_ref, release_impl, release_obj, reserve_sqes, Executor, IoUringOp, OpType,
+    RefCount, Result,
 };
 
 struct TimerImpl {

@@ -15,6 +15,7 @@
 #![feature(box_as_ptr)]
 #![feature(vec_into_raw_parts)]
 
+extern crate liburing_rs;
 extern crate nix;
 
 use std::alloc::Layout;
@@ -56,49 +57,25 @@ use nix::sys::eventfd::EventFd;
 use nix::sys::socket::SockaddrStorage;
 use nix::sys::time::TimeSpec;
 use tcp::StreamImpl;
-use uring::io_uring;
-use uring::io_uring_buf_ring;
-use uring::io_uring_buf_ring_add;
-use uring::io_uring_buf_ring_advance;
-use uring::io_uring_buf_ring_mask;
-use uring::io_uring_cq_advance;
-use uring::io_uring_cq_ready;
-use uring::io_uring_cqe;
-use uring::io_uring_cqe_seen;
-use uring::io_uring_free_buf_ring;
-use uring::io_uring_get_events;
-use uring::io_uring_get_sqe;
-use uring::io_uring_params;
-use uring::io_uring_peek_batch_cqe;
-use uring::io_uring_peek_cqe;
-use uring::io_uring_prep_cancel_fd;
-use uring::io_uring_prep_close_direct;
-use uring::io_uring_prep_read;
-use uring::io_uring_prep_timeout;
-use uring::io_uring_queue_init_params;
-use uring::io_uring_register_files_sparse;
-use uring::io_uring_register_ring_fd;
-use uring::io_uring_setup_buf_ring;
-use uring::io_uring_sq_space_left;
-use uring::io_uring_sqe_set_data;
-use uring::io_uring_sqe_set_data64;
-use uring::io_uring_sqe_set_flags;
-use uring::io_uring_submit_and_get_events;
-use uring::io_uring_submit_and_wait;
-use uring::IORING_ASYNC_CANCEL_ALL;
-use uring::IORING_ASYNC_CANCEL_FD_FIXED;
-use uring::IORING_CQE_BUFFER_SHIFT;
-use uring::IORING_CQE_F_MORE;
-use uring::IORING_CQE_F_NOTIF;
-use uring::IORING_SETUP_CQSIZE;
-use uring::IORING_SETUP_DEFER_TASKRUN;
-use uring::IORING_SETUP_SINGLE_ISSUER;
-use uring::IORING_TIMEOUT_MULTISHOT;
-use uring::IOSQE_CQE_SKIP_SUCCESS;
+
+use liburing_rs::io_uring_queue_exit;
+use liburing_rs::{
+    io_uring, io_uring_buf_ring, io_uring_buf_ring_add, io_uring_buf_ring_advance,
+    io_uring_buf_ring_mask, io_uring_cq_advance, io_uring_cq_ready, io_uring_cqe,
+    io_uring_cqe_seen, io_uring_free_buf_ring, io_uring_get_events, io_uring_get_sqe,
+    io_uring_params, io_uring_peek_batch_cqe, io_uring_peek_cqe, io_uring_prep_cancel_fd,
+    io_uring_prep_close_direct, io_uring_prep_read, io_uring_prep_timeout,
+    io_uring_queue_init_params, io_uring_register_files_sparse, io_uring_register_ring_fd,
+    io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe_set_data,
+    io_uring_sqe_set_data64, io_uring_sqe_set_flags, io_uring_submit_and_get_events,
+    io_uring_submit_and_wait, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
+    IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IORING_SETUP_CQSIZE,
+    IORING_SETUP_DEFER_TASKRUN, IORING_SETUP_SINGLE_ISSUER, IORING_TIMEOUT_MULTISHOT,
+    IOSQE_CQE_SKIP_SUCCESS,
+};
 
 pub mod tcp;
 pub mod time;
-mod uring;
 
 pub type Result<T> = std::result::Result<T, nix::Error>;
 
@@ -1196,7 +1173,7 @@ impl Drop for IoContext {
             buf_groups.clear();
         }
 
-        unsafe { uring::io_uring_queue_exit(self.ring()) };
+        unsafe { io_uring_queue_exit(self.ring()) };
     }
 }
 
@@ -1376,7 +1353,7 @@ mod test {
 
     use nix::libc::{ECANCELED, ETIME};
 
-    use crate::uring::{
+    use liburing_rs::{
         __kernel_timespec, io_uring, io_uring_cqe, io_uring_cqe_seen, io_uring_get_sqe,
         io_uring_prep_timeout, io_uring_prep_timeout_remove, io_uring_queue_exit,
         io_uring_queue_init, io_uring_submit_and_wait, io_uring_wait_cqe,
