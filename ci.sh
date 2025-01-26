@@ -12,9 +12,9 @@ clear
 CARGO_FLAGS=(--target x86_64-unknown-linux-gnu -Zbuild-std)
 
 RUSTFLAGS='-Zsanitizer=address' cargo test "${CARGO_FLAGS[@]}"
-RUSTFLAGS='-Zsanitizer=thread' cargo test "${CARGO_FLAGS[@]}"
+RUSTFLAGS='-Zsanitizer=thread' cargo test "${CARGO_FLAGS[@]}" -- --test-threads=1
 cargo test "${CARGO_FLAGS[@]}"
 
 RUSTFLAGS='-Zsanitizer=address' cargo test "${CARGO_FLAGS[@]}" --release
-RUSTFLAGS='-Zsanitizer=thread' cargo test "${CARGO_FLAGS[@]}" --release
+RUSTFLAGS='-Zsanitizer=thread' cargo test "${CARGO_FLAGS[@]}" --release -- --test-threads=1
 cargo test "${CARGO_FLAGS[@]}" --release
