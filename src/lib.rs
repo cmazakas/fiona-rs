@@ -18,53 +18,42 @@
 extern crate liburing_rs;
 extern crate nix;
 
-use std::alloc::Layout;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::collections::VecDeque;
-use std::future::Future;
-use std::hash::Hash;
-use std::marker::PhantomData;
-use std::ops::Deref;
-use std::os::fd::AsRawFd;
-use std::pin::Pin;
-use std::ptr;
-use std::ptr::metadata;
-use std::ptr::null_mut;
-use std::ptr::DynMetadata;
-use std::ptr::NonNull;
-use std::rc::Rc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Acquire;
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::Ordering::Release;
-use std::sync::mpsc::Receiver;
-use std::sync::mpsc::Sender;
-use std::task::Context;
-use std::task::Poll;
-use std::task::RawWaker;
-use std::task::RawWakerVTable;
-use std::task::Waker;
-use std::time::Duration;
-use std::time::Instant;
+use std::{
+    alloc::Layout,
+    cell::RefCell,
+    collections::{HashMap, HashSet, VecDeque},
+    future::Future,
+    hash::Hash,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ops::Deref,
+    os::fd::AsRawFd,
+    pin::Pin,
+    ptr::{self, metadata, null_mut, DynMetadata, NonNull},
+    rc::Rc,
+    sync::{
+        atomic::{
+            AtomicU64,
+            Ordering::{Acquire, Relaxed, Release},
+        },
+        mpsc::{Receiver, Sender},
+    },
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    time::{Duration, Instant},
+};
 
-use nix::errno::Errno;
-use nix::libc::c_void;
+use nix::{
+    errno::Errno,
+    libc::{c_void, ETIME},
+    sys::{eventfd::EventFd, socket::SockaddrStorage, time::TimeSpec},
+};
 
-use nix::libc::ETIME;
-use nix::sys::eventfd::EventFd;
-use nix::sys::socket::SockaddrStorage;
-use nix::sys::time::TimeSpec;
-use tcp::StreamImpl;
-
-use liburing_rs::io_uring_queue_exit;
 use liburing_rs::{
     io_uring, io_uring_buf_ring, io_uring_buf_ring_add, io_uring_buf_ring_advance,
     io_uring_buf_ring_mask, io_uring_cq_advance, io_uring_cq_ready, io_uring_cqe,
     io_uring_cqe_seen, io_uring_free_buf_ring, io_uring_get_events, io_uring_get_sqe,
     io_uring_params, io_uring_peek_batch_cqe, io_uring_peek_cqe, io_uring_prep_cancel_fd,
-    io_uring_prep_close_direct, io_uring_prep_read, io_uring_prep_timeout,
+    io_uring_prep_close_direct, io_uring_prep_read, io_uring_prep_timeout, io_uring_queue_exit,
     io_uring_queue_init_params, io_uring_register_files_sparse, io_uring_register_ring_fd,
     io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe_set_data,
     io_uring_sqe_set_data64, io_uring_sqe_set_flags, io_uring_submit_and_get_events,
@@ -77,11 +66,13 @@ use liburing_rs::{
 pub mod tcp;
 pub mod time;
 
+use tcp::StreamImpl;
+
 pub type Result<T> = std::result::Result<T, nix::Error>;
 
 //-----------------------------------------------------------------------------
 
-#[repr(C, align(128))]
+#[repr(C, align(64))]
 struct AlignedAtomicU64(AtomicU64);
 
 impl Deref for AlignedAtomicU64 {
@@ -90,6 +81,8 @@ impl Deref for AlignedAtomicU64 {
         &self.0
     }
 }
+
+//-----------------------------------------------------------------------------
 
 struct TaskInnerHeader {
     strong: AlignedAtomicU64,
@@ -188,31 +181,35 @@ impl Drop for Task {
         if self.inner().strong.fetch_sub(1, Release) > 1 {
             return;
         }
-
-        // delay the Acquire semantics until we know we need to drop() the Future
         self.inner().strong.load(Acquire);
 
         unsafe { std::ptr::drop_in_place(self.as_ptr()) };
-        unsafe { &mut *self.p.as_ptr().cast::<TaskInnerHeader>() }.sender = None;
 
         if self.inner().weak.fetch_sub(1, Release) > 1 {
             return;
         }
-
         self.inner().weak.load(Acquire);
 
-        let align = std::cmp::max(
-            align_of::<TaskInnerHeader>(),
-            self.inner().future_vtable.align_of(),
-        );
+        unsafe {
+            std::ptr::drop_in_place(self.p.as_ptr().cast::<TaskInnerHeader>());
+        };
 
-        let offset = align_up(size_of::<TaskInnerHeader>(), align);
+        let layout = {
+            let align = std::cmp::max(
+                align_of::<TaskInnerHeader>(),
+                self.inner().future_vtable.align_of(),
+            );
 
-        let layout = Layout::from_size_align(
-            align_up(offset + self.inner().future_vtable.size_of(), align),
-            align,
-        )
-        .unwrap();
+            let offset = align_up(size_of::<TaskInnerHeader>(), align);
+
+            let layout = Layout::from_size_align(
+                align_up(offset + self.inner().future_vtable.size_of(), align),
+                align,
+            )
+            .unwrap();
+
+            layout
+        };
 
         unsafe {
             std::alloc::dealloc(self.p.as_ptr(), layout);
@@ -304,21 +301,28 @@ impl Drop for Weak {
         if self.inner().weak.fetch_sub(1, Release) > 1 {
             return;
         }
-
         self.inner().weak.load(Acquire);
 
-        let align = std::cmp::max(
-            align_of::<TaskInnerHeader>(),
-            self.inner().future_vtable.align_of(),
-        );
+        unsafe {
+            std::ptr::drop_in_place(self.p.as_ptr().cast::<TaskInnerHeader>());
+        };
 
-        let offset = align_up(size_of::<TaskInnerHeader>(), align);
+        let layout = {
+            let align = std::cmp::max(
+                align_of::<TaskInnerHeader>(),
+                self.inner().future_vtable.align_of(),
+            );
 
-        let layout = Layout::from_size_align(
-            align_up(offset + self.inner().future_vtable.size_of(), align),
-            align,
-        )
-        .unwrap();
+            let offset = align_up(size_of::<TaskInnerHeader>(), align);
+
+            let layout = Layout::from_size_align(
+                align_up(offset + self.inner().future_vtable.size_of(), align),
+                align,
+            )
+            .unwrap();
+
+            layout
+        };
 
         unsafe {
             std::alloc::dealloc(self.p.as_ptr(), layout);
@@ -351,53 +355,32 @@ unsafe fn task_waker_clone(p: *const ()) -> RawWaker {
 
 unsafe fn task_wake(p: *const ()) {
     let weak = unsafe { Weak::from_raw(p) };
-    let task = Weak::upgrade(&weak);
-    match task {
-        None => {}
-        Some(task) => {
-            weak.inner()
-                .sender
-                .as_ref()
-                .unwrap()
-                .send(Task::downgrade(&task))
-                .unwrap();
-
-            let buf = &0x01_u64.to_ne_bytes();
-            unsafe {
-                nix::libc::write(
-                    weak.inner().event_fd,
-                    buf.as_ptr().cast::<c_void>(),
-                    buf.len(),
-                );
-            }
+    if let Some(sender) = weak.inner().sender.as_ref() {
+        sender.send(weak.clone()).unwrap();
+        let buf = &0x01_u64.to_ne_bytes();
+        unsafe {
+            nix::libc::write(
+                weak.inner().event_fd,
+                buf.as_ptr().cast::<c_void>(),
+                buf.len(),
+            );
         }
     }
 }
 
 unsafe fn task_wake_by_ref(p: *const ()) {
-    let weak = unsafe { Weak::from_raw(p) };
-    let task = Weak::upgrade(&weak);
-    match task {
-        None => {}
-        Some(task) => {
-            weak.inner()
-                .sender
-                .as_ref()
-                .unwrap()
-                .send(Task::downgrade(&task))
-                .unwrap();
-
-            let buf = &0x01_u64.to_ne_bytes();
-            unsafe {
-                nix::libc::write(
-                    weak.inner().event_fd,
-                    buf.as_ptr().cast::<c_void>(),
-                    buf.len(),
-                );
-            }
+    let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
+    if let Some(sender) = weak.inner().sender.as_ref() {
+        sender.send(ManuallyDrop::into_inner(weak.clone())).unwrap();
+        let buf = &0x01_u64.to_ne_bytes();
+        unsafe {
+            nix::libc::write(
+                weak.inner().event_fd,
+                buf.as_ptr().cast::<c_void>(),
+                buf.len(),
+            );
         }
     }
-    std::mem::forget(weak);
 }
 
 unsafe fn task_drop(p: *const ()) {
