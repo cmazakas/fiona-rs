@@ -646,8 +646,10 @@ fn test_tcp_recv_timeout() {
 }
 
 #[test]
-fn test_tcp_connection_stress_test() {
-    const NR_FILES: u32 = 100;
+fn test_tcp_connection_stress_test_no_cq_overflow() {
+    const NR_FILES: u32 = 500;
+    const CQ_ENTRIES: u32 = 16 * 1024;
+
     const SERVER_BGID: u16 = 27;
     const CLIENT_BGID: u16 = 72;
     const MSG_LEN: usize = 1024;
@@ -657,7 +659,105 @@ fn test_tcp_connection_stress_test() {
     fn make_io_context() -> fiona::IoContext {
         let params = &fiona::IoContextParams {
             sq_entries: 256,
-            cq_entries: 1024,
+            cq_entries: CQ_ENTRIES,
+            nr_files: 1 + 2 * NR_FILES,
+        };
+
+        fiona::IoContext::with_params(params)
+    }
+
+    fn client(port: u16) {
+        let mut ioc = make_io_context();
+        let ex = ioc.get_executor();
+        ex.register_buf_group(CLIENT_BGID, 4 * 1024, 1024).unwrap();
+
+        ex.clone().spawn(async move {
+            for _ in 0..(TOTAL_CONNS / NR_FILES) {
+                for _ in 0..NR_FILES {
+                    let ex2 = ex.clone();
+                    ex.clone().spawn(async move {
+                        let mut message = vec![0; MSG_LEN];
+                        {
+                            let mut rng = rand::rngs::StdRng::from_entropy();
+                            <[u8] as rand::Fill>::try_fill(message.as_mut_slice(), &mut rng)
+                                .unwrap();
+                        }
+
+                        let client = fiona::tcp::Client::new(ex2);
+                        client
+                            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                            .await
+                            .unwrap();
+
+                        let msg_copy = message.clone();
+                        let message = client.send(message).await.unwrap();
+                        assert!(message.is_empty());
+
+                        client.set_buf_group(CLIENT_BGID);
+
+                        let bufs = client.recv().await.unwrap();
+                        let buf = flatten_bufs(bufs);
+
+                        assert_eq!(buf, msg_copy);
+                    });
+                }
+            }
+        });
+
+        let n = ioc.run();
+        assert_eq!(n, (1 + TOTAL_CONNS).into());
+    }
+
+    let mut ioc = make_io_context();
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.clone().spawn(async move {
+        ex.register_buf_group(SERVER_BGID, 4 * 1024, 1024).unwrap();
+
+        let mut conns = 0;
+        while conns < TOTAL_CONNS {
+            let stream = acceptor.accept().await.unwrap();
+            ex.clone().spawn(async move {
+                stream.set_buf_group(SERVER_BGID);
+
+                let bufs = stream.recv().await.unwrap();
+                let send_buf = flatten_bufs(bufs);
+                assert!(!send_buf.is_empty());
+
+                let send_buf = stream.send(send_buf).await.unwrap();
+
+                assert!(send_buf.is_empty());
+            });
+            conns += 1;
+        }
+    });
+
+    let t = std::thread::spawn(move || client(port));
+
+    let n = ioc.run();
+    t.join().unwrap();
+
+    assert_eq!(n, (1 + TOTAL_CONNS).into());
+}
+
+#[test]
+fn test_tcp_connection_stress_test_cq_overflow() {
+    const NR_FILES: u32 = 500;
+    const CQ_ENTRIES: u32 = 1024;
+
+    const SERVER_BGID: u16 = 27;
+    const CLIENT_BGID: u16 = 72;
+    const MSG_LEN: usize = 1024;
+
+    const TOTAL_CONNS: u32 = 3 * NR_FILES;
+
+    fn make_io_context() -> fiona::IoContext {
+        let params = &fiona::IoContextParams {
+            sq_entries: 256,
+            cq_entries: CQ_ENTRIES,
             nr_files: 1 + 3 * NR_FILES,
         };
 

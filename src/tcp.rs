@@ -31,14 +31,15 @@ use nix::{
 
 use liburing_rs::{
     io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_get_sqe,
-    io_uring_prep_accept_direct, io_uring_prep_cancel64, io_uring_prep_cancel_fd,
-    io_uring_prep_close_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
-    io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_socket_direct,
-    io_uring_prep_timeout, io_uring_prep_timeout_remove, io_uring_register_files_update,
-    io_uring_sqe_set_buf_group, io_uring_sqe_set_data, io_uring_sqe_set_data64,
-    io_uring_sqe_set_flags, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
-    IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT,
-    IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK,
+    io_uring_prep_accept_direct, io_uring_prep_cancel, io_uring_prep_cancel64,
+    io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_connect,
+    io_uring_prep_link_timeout, io_uring_prep_recv_multishot, io_uring_prep_send_zc,
+    io_uring_prep_socket_direct, io_uring_prep_timeout, io_uring_prep_timeout_remove,
+    io_uring_register_files_update, io_uring_sqe_set_buf_group, io_uring_sqe_set_data,
+    io_uring_sqe_set_data64, io_uring_sqe_set_flags, IORING_ASYNC_CANCEL_ALL,
+    IORING_ASYNC_CANCEL_FD_FIXED, IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST,
+    IORING_TIMEOUT_MULTISHOT, IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE,
+    IOSQE_IO_LINK,
 };
 
 use crate::{
@@ -400,6 +401,7 @@ impl Drop for StreamImpl {
             unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
 
             // unsafe { submit_ring(ring) };
+            println!("going to reclaim the fd now!");
             self.ex.reclaim_fd(fd);
         }
     }
@@ -715,15 +717,17 @@ impl Drop for Stream {
 
             if stream_impl.recv_op.is_some() {
                 let mut op = stream_impl.recv_op.take().unwrap();
-                let user_data = Box::as_mut_ptr(&mut op) as u64;
-                // makes sure this gets cleaned up, not really an eager-dropped operation
-                op.eager_dropped = true;
-                Box::leak(op);
+                if !op.done {
+                    let user_data = Box::as_mut_ptr(&mut op) as u64;
+                    // makes sure this gets cleaned up, not really an eager-dropped operation
+                    op.eager_dropped = true;
+                    Box::leak(op);
 
-                let sqe = unsafe { io_uring_get_sqe(ring) };
-                unsafe { io_uring_prep_cancel64(sqe, user_data, 0) };
-                unsafe { io_uring_sqe_set_data64(sqe, 0) };
-                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+                    let sqe = unsafe { io_uring_get_sqe(ring) };
+                    unsafe { io_uring_prep_cancel64(sqe, user_data, 0) };
+                    unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+                }
             }
         }
 
@@ -742,29 +746,31 @@ impl Drop for Client {
             unsafe { reserve_sqes(ring, num_sqes) };
 
             {
-                let sqe = unsafe { io_uring_get_sqe(ring) };
                 let mut op = stream_impl.timeout_op.take().unwrap();
                 let user_data = Box::as_mut_ptr(&mut op) as u64;
                 // makes sure this gets cleaned up, not really an eager-dropped operation
                 op.eager_dropped = true;
                 Box::leak(op);
 
+                let sqe = unsafe { io_uring_get_sqe(ring) };
                 unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
                 unsafe { io_uring_sqe_set_data64(sqe, 0) };
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
             }
 
             if stream_impl.recv_op.is_some() {
-                let sqe = unsafe { io_uring_get_sqe(ring) };
                 let mut op = stream_impl.recv_op.take().unwrap();
-                let user_data = Box::as_mut_ptr(&mut op) as u64;
-                // makes sure this gets cleaned up, not really an eager-dropped operation
-                op.eager_dropped = true;
-                Box::leak(op);
+                if !op.done {
+                    let user_data = Box::as_mut_ptr(&mut op) as u64;
+                    // makes sure this gets cleaned up, not really an eager-dropped operation
+                    op.eager_dropped = true;
+                    Box::leak(op);
 
-                unsafe { io_uring_prep_cancel64(sqe, user_data, 0) };
-                unsafe { io_uring_sqe_set_data64(sqe, 0) };
-                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+                    let sqe = unsafe { io_uring_get_sqe(ring) };
+                    unsafe { io_uring_prep_cancel64(sqe, user_data, 0) };
+                    unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+                }
             }
         }
 
@@ -919,11 +925,22 @@ impl Drop for ConnectFuture<'_> {
         client_impl.connect_pending = false;
 
         let op = self.op.as_mut().unwrap();
-
         if op.initiated && !op.done {
+            let mut op = self.op.take().unwrap();
             op.eager_dropped = true;
-            Box::leak(self.op.take().unwrap());
-            todo!();
+
+            let user_data = Box::as_mut_ptr(&mut op);
+
+            let ring = client_impl.stream.ex.ring();
+            unsafe { reserve_sqes(ring, 1) };
+
+            let sqe = unsafe { io_uring_get_sqe(ring) };
+
+            unsafe { io_uring_prep_cancel(sqe, user_data.cast(), IORING_ASYNC_CANCEL_ALL as i32) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+
+            Box::leak(op);
         }
     }
 }

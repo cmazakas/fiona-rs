@@ -9,7 +9,8 @@
     clippy::missing_errors_doc,
     clippy::cast_ptr_alignment,
     clippy::too_many_lines,
-    clippy::similar_names
+    clippy::similar_names,
+    clippy::cast_possible_wrap
 )]
 #![feature(ptr_metadata)]
 #![feature(box_as_ptr)]
@@ -639,20 +640,25 @@ impl Drop for RunGuard {
             let cqe = unsafe { &mut *cqe };
             let user_data = cqe.user_data;
 
-            let _g = CQESeenGuard { ring, cqe };
+            {
+                let _g = CQESeenGuard { ring, cqe };
 
-            if user_data != 0 && user_data != 1 {
-                if blacklist.contains(&user_data) {
-                    continue;
-                }
+                if user_data != 0 && user_data != 1 {
+                    if blacklist.contains(&user_data) {
+                        continue;
+                    }
 
-                blacklist.insert(user_data);
-                let op = unsafe { &mut *(user_data as *mut IoUringOp) };
-                unsafe { release_op(op.ref_count) };
-                if op.eager_dropped {
-                    drop(unsafe { Box::from_raw(op) });
+                    blacklist.insert(user_data);
+                    let op = unsafe { &mut *(user_data as *mut IoUringOp) };
+                    unsafe { release_op(op.ref_count) };
+                    if op.eager_dropped {
+                        drop(unsafe { Box::from_raw(op) });
+                    }
                 }
             }
+
+            // unsafe { submit_ring(ring) };
+            unsafe { io_uring_get_events(ring) };
         }
 
         self.p.borrow_mut().runguard_blacklist = blacklist;
@@ -826,6 +832,7 @@ impl IoContext {
                 let _g = IncrGuard { n: &mut guard.n };
 
                 let cqe = unsafe { &mut **cqe };
+
                 if cqe.user_data == 0 {
                     continue;
                 }
@@ -988,12 +995,6 @@ fn on_multishot_tcp_recv(
     ex: &Executor,
 ) {
     let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
-
-    if !has_more_cqes {
-        op.done = true;
-        unsafe { release_op(op.ref_count) };
-    }
-
     let OpType::MultishotTcpRecv {
         ref mut bufs,
         buf_group,
@@ -1004,7 +1005,7 @@ fn on_multishot_tcp_recv(
     };
 
     if op.eager_dropped {
-        debug_assert!(!has_more_cqes);
+        // assert!(!has_more_cqes);
 
         if cqe.res > 0 {
             let buf_group = unsafe { &mut *buf_group };
@@ -1041,8 +1042,20 @@ fn on_multishot_tcp_recv(
             unsafe { io_uring_buf_ring_advance(br, count) };
         }
 
+        if has_more_cqes {
+            return;
+        }
+
+        op.done = true;
+        unsafe { release_op(op.ref_count) };
+
         drop(unsafe { Box::from_raw(op) });
         return;
+    }
+
+    if !has_more_cqes {
+        op.done = true;
+        unsafe { release_op(op.ref_count) };
     }
 
     unsafe { *last_recv = Instant::now() };
