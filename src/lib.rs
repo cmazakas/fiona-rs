@@ -1254,11 +1254,13 @@ impl Executor {
     }
 
     fn get_available_fd(&self) -> Option<u32> {
-        self.p.borrow_mut().available_fds.pop_front()
+        let fds = &mut self.p.borrow_mut().available_fds;
+        fds.pop_front()
     }
 
     fn reclaim_fd(&self, fd: u32) {
-        self.p.borrow_mut().available_fds.push_back(fd);
+        let fds = &mut self.p.borrow_mut().available_fds;
+        fds.push_back(fd);
     }
 
     fn get_root_task(&self) -> Weak {

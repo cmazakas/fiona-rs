@@ -401,7 +401,6 @@ impl Drop for StreamImpl {
             unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
 
             // unsafe { submit_ring(ring) };
-            println!("going to reclaim the fd now!");
             self.ex.reclaim_fd(fd);
         }
     }

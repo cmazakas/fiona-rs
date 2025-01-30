@@ -1,7 +1,7 @@
 use core::str;
 use std::{future::Future, net::Ipv4Addr, task::Poll, time::Duration};
 
-use futures::FutureExt;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use nix::errno::Errno;
 use rand::SeedableRng;
 
@@ -660,7 +660,7 @@ fn test_tcp_connection_stress_test_no_cq_overflow() {
         let params = &fiona::IoContextParams {
             sq_entries: 256,
             cq_entries: CQ_ENTRIES,
-            nr_files: 1 + 2 * NR_FILES,
+            nr_files: 2 * NR_FILES,
         };
 
         fiona::IoContext::with_params(params)
@@ -673,33 +673,45 @@ fn test_tcp_connection_stress_test_no_cq_overflow() {
 
         ex.clone().spawn(async move {
             for _ in 0..(TOTAL_CONNS / NR_FILES) {
-                for _ in 0..NR_FILES {
-                    let ex2 = ex.clone();
-                    ex.clone().spawn(async move {
-                        let mut message = vec![0; MSG_LEN];
-                        {
-                            let mut rng = rand::rngs::StdRng::from_entropy();
-                            <[u8] as rand::Fill>::try_fill(message.as_mut_slice(), &mut rng)
+                let mut tasks: FuturesUnordered<fiona::SpawnFuture<()>> = (0..NR_FILES)
+                    .map(|_| {
+                        let ex2 = ex.clone();
+                        ex.clone().spawn(async move {
+                            let mut message = vec![0; MSG_LEN];
+                            {
+                                let mut rng = rand::rngs::StdRng::from_entropy();
+                                <[u8] as rand::Fill>::try_fill(message.as_mut_slice(), &mut rng)
+                                    .unwrap();
+                            }
+
+                            let timer = fiona::time::Timer::new(ex2.clone());
+                            timer
+                                .wait(Duration::from_millis(message[0].into()))
+                                .await
                                 .unwrap();
-                        }
 
-                        let client = fiona::tcp::Client::new(ex2);
-                        client
-                            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                            .await
-                            .unwrap();
+                            let client = fiona::tcp::Client::new(ex2);
+                            client
+                                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                                .await
+                                .unwrap();
 
-                        let msg_copy = message.clone();
-                        let message = client.send(message).await.unwrap();
-                        assert!(message.is_empty());
+                            let msg_copy = message.clone();
+                            let message = client.send(message).await.unwrap();
+                            assert!(message.is_empty());
 
-                        client.set_buf_group(CLIENT_BGID);
+                            client.set_buf_group(CLIENT_BGID);
 
-                        let bufs = client.recv().await.unwrap();
-                        let buf = flatten_bufs(bufs);
+                            let bufs = client.recv().await.unwrap();
+                            let buf = flatten_bufs(bufs);
 
-                        assert_eq!(buf, msg_copy);
-                    });
+                            assert_eq!(buf, msg_copy);
+                        })
+                    })
+                    .collect();
+
+                while !tasks.is_empty() {
+                    tasks.next().await.unwrap();
                 }
             }
         });
@@ -746,7 +758,7 @@ fn test_tcp_connection_stress_test_no_cq_overflow() {
 #[test]
 fn test_tcp_connection_stress_test_cq_overflow() {
     const NR_FILES: u32 = 500;
-    const CQ_ENTRIES: u32 = 1024;
+    const CQ_ENTRIES: u32 = 512;
 
     const SERVER_BGID: u16 = 27;
     const CLIENT_BGID: u16 = 72;
@@ -758,7 +770,7 @@ fn test_tcp_connection_stress_test_cq_overflow() {
         let params = &fiona::IoContextParams {
             sq_entries: 256,
             cq_entries: CQ_ENTRIES,
-            nr_files: 1 + 3 * NR_FILES,
+            nr_files: 2 * NR_FILES,
         };
 
         fiona::IoContext::with_params(params)
@@ -771,33 +783,45 @@ fn test_tcp_connection_stress_test_cq_overflow() {
 
         ex.clone().spawn(async move {
             for _ in 0..(TOTAL_CONNS / NR_FILES) {
-                for _ in 0..NR_FILES {
-                    let ex2 = ex.clone();
-                    ex.clone().spawn(async move {
-                        let mut message = vec![0; MSG_LEN];
-                        {
-                            let mut rng = rand::rngs::StdRng::from_entropy();
-                            <[u8] as rand::Fill>::try_fill(message.as_mut_slice(), &mut rng)
+                let mut tasks: FuturesUnordered<fiona::SpawnFuture<()>> = (0..NR_FILES)
+                    .map(|_idx| {
+                        let ex2 = ex.clone();
+                        ex.clone().spawn(async move {
+                            let mut message = vec![0; MSG_LEN];
+                            {
+                                let mut rng = rand::rngs::StdRng::from_entropy();
+                                <[u8] as rand::Fill>::try_fill(message.as_mut_slice(), &mut rng)
+                                    .unwrap();
+                            }
+
+                            let timer = fiona::time::Timer::new(ex2.clone());
+                            timer
+                                .wait(Duration::from_millis(message[0].into()))
+                                .await
                                 .unwrap();
-                        }
 
-                        let client = fiona::tcp::Client::new(ex2);
-                        client
-                            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                            .await
-                            .unwrap();
+                            let client = fiona::tcp::Client::new(ex2);
+                            client
+                                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                                .await
+                                .unwrap();
 
-                        let msg_copy = message.clone();
-                        let message = client.send(message).await.unwrap();
-                        assert!(message.is_empty());
+                            let msg_copy = message.clone();
+                            let message = client.send(message).await.unwrap();
+                            assert!(message.is_empty());
 
-                        client.set_buf_group(CLIENT_BGID);
+                            client.set_buf_group(CLIENT_BGID);
 
-                        let bufs = client.recv().await.unwrap();
-                        let buf = flatten_bufs(bufs);
+                            let bufs = client.recv().await.unwrap();
+                            let buf = flatten_bufs(bufs);
 
-                        assert_eq!(buf, msg_copy);
-                    });
+                            assert_eq!(buf, msg_copy);
+                        })
+                    })
+                    .collect();
+
+                while !tasks.is_empty() {
+                    tasks.next().await.unwrap();
                 }
             }
         });
