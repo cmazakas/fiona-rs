@@ -43,8 +43,8 @@ use liburing_rs::{
 };
 
 use crate::{
-    add_obj_ref, add_op_ref, release_impl, release_obj, reserve_sqes, submit_ring, Executor,
-    IoUringOp, OpType, RefCount, Result,
+    add_obj_ref, add_op_ref, make_io_uring_op, release_impl, release_obj, reserve_sqes,
+    submit_ring, Executor, IoUringOp, OpType, RefCount, Result,
 };
 
 struct AcceptorImpl {
@@ -202,15 +202,10 @@ impl Acceptor {
         AcceptFuture {
             acceptor: self,
             completed: false,
-            op: Some(Box::new(IoUringOp {
+            op: Some(Box::new(make_io_uring_op(
                 ref_count,
-                initiated: false,
-                done: false,
-                eager_dropped: false,
-                res: -1,
-                weak: None,
-                op_type: OpType::TcpAccept { fd: -1 },
-            })),
+                OpType::TcpAccept { fd: -1 },
+            ))),
         }
     }
 }
@@ -273,7 +268,7 @@ impl Future for AcceptFuture<'_> {
                 }
             }
             (true, false) => {
-                op.weak = Some(acceptor_impl.ex.get_root_task());
+                op.local_waker = Some(cx.local_waker().clone());
                 self.op = Some(op);
                 Poll::Pending
             }
@@ -312,7 +307,7 @@ impl Future for AcceptFuture<'_> {
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) };
 
                 unsafe { add_op_ref(&raw mut acceptor_impl.ref_count) };
-                op.weak = Some(acceptor_impl.ex.get_root_task());
+                op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
                 self.op = Some(op);
                 Poll::Pending
@@ -352,7 +347,7 @@ impl Drop for AcceptFuture<'_> {
             // TODO: same as TimerFuture::drop() comments
 
             op.eager_dropped = true;
-            op.weak = None;
+            op.local_waker = None;
             Box::leak(self.op.take().unwrap());
             return;
         }
@@ -447,18 +442,13 @@ impl Stream {
         let stream_impl = unsafe { &mut *p.as_ptr() };
         let ref_count = &raw mut stream_impl.ref_count;
 
-        let mut op = Box::new(IoUringOp {
+        let mut op = Box::new(make_io_uring_op(
             ref_count,
-            initiated: false,
-            done: false,
-            eager_dropped: false,
-            res: -1,
-            weak: None,
-            op_type: OpType::MultishotTimeout {
+            OpType::MultishotTimeout {
                 ts: stream_impl.ts,
                 stream: p.as_ptr(),
             },
-        });
+        ));
 
         let user_data = Box::as_mut_ptr(&mut op).cast();
 
@@ -502,15 +492,10 @@ impl Stream {
         SendFuture {
             stream: self,
             completed: false,
-            op: Some(Box::new(IoUringOp {
+            op: Some(Box::new(make_io_uring_op(
                 ref_count,
-                initiated: false,
-                done: false,
-                eager_dropped: false,
-                res: -1,
-                weak: None,
-                op_type: OpType::TcpSend { buf, last_send },
-            })),
+                OpType::TcpSend { buf, last_send },
+            ))),
         }
     }
 
@@ -594,18 +579,13 @@ impl Client {
         let stream_impl = unsafe { &mut (*p.as_ptr()).stream };
         let ref_count = &raw mut stream_impl.ref_count;
 
-        let mut op = Box::new(IoUringOp {
+        let mut op = Box::new(make_io_uring_op(
             ref_count,
-            initiated: false,
-            done: false,
-            eager_dropped: false,
-            res: -1,
-            weak: None,
-            op_type: OpType::MultishotTimeout {
+            OpType::MultishotTimeout {
                 ts: stream_impl.ts,
                 stream: &raw mut *stream_impl,
             },
-        });
+        ));
 
         let user_data = Box::as_mut_ptr(&mut op).cast();
 
@@ -640,14 +620,9 @@ impl Client {
         ConnectFuture {
             client: self,
             completed: false,
-            op: Some(Box::new(IoUringOp {
+            op: Some(Box::new(make_io_uring_op(
                 ref_count,
-                initiated: false,
-                done: false,
-                eager_dropped: false,
-                res: -1,
-                weak: None,
-                op_type: OpType::TcpConnect {
+                OpType::TcpConnect {
                     addr: SockaddrStorage::from(addr),
                     port,
                     ts: client_impl.stream.ts,
@@ -655,7 +630,7 @@ impl Client {
                     got_socket: false,
                     fd: -1,
                 },
-            })),
+            ))),
         }
     }
 
@@ -795,7 +770,7 @@ impl Future for ConnectFuture<'_> {
         match (op.initiated, op.done) {
             (false, true) => panic!(),
             (true, false) => {
-                op.weak = Some(client_impl.stream.ex.get_root_task());
+                op.local_waker = Some(cx.local_waker().clone());
                 self.op = Some(op);
                 Poll::Pending
             }
@@ -879,7 +854,7 @@ impl Future for ConnectFuture<'_> {
 
                 unsafe { add_op_ref(&raw mut client_impl.stream.ref_count) };
 
-                op.weak = Some(client_impl.stream.ex.get_root_task());
+                op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
                 self.op = Some(op);
                 Poll::Pending
@@ -973,7 +948,7 @@ impl Drop for SendFuture<'_> {
             // TODO: same as TimerFuture::drop() comments
 
             op.eager_dropped = true;
-            op.weak = None;
+            op.local_waker = None;
             Box::leak(self.op.take().unwrap());
         }
     }
@@ -996,7 +971,7 @@ impl Future for SendFuture<'_> {
         match (op.initiated, op.done) {
             (false, true) => panic!(),
             (true, false) => {
-                op.weak = Some(stream_impl.ex.get_root_task());
+                op.local_waker = Some(cx.local_waker().clone());
                 self.op = Some(op);
                 Poll::Pending
             }
@@ -1027,7 +1002,7 @@ impl Future for SendFuture<'_> {
 
                 unsafe { add_op_ref(&raw mut stream_impl.ref_count) };
 
-                op.weak = Some(stream_impl.ex.get_root_task());
+                op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
                 self.op = Some(op);
                 Poll::Pending
@@ -1099,19 +1074,14 @@ impl Future for RecvFuture<'_> {
                 stream_impl.last_recv = Instant::now();
                 let last_recv: *mut Instant = &raw mut stream_impl.last_recv;
 
-                let mut op = Box::new(IoUringOp {
+                let mut op = Box::new(make_io_uring_op(
                     ref_count,
-                    initiated: false,
-                    done: false,
-                    eager_dropped: false,
-                    res: -1,
-                    weak: None,
-                    op_type: OpType::MultishotTcpRecv {
+                    OpType::MultishotTcpRecv {
                         bufs: Vec::new(),
                         buf_group,
                         last_recv,
                     },
-                });
+                ));
 
                 let user_data = Box::as_mut_ptr(&mut op).cast();
 
@@ -1131,7 +1101,7 @@ impl Future for RecvFuture<'_> {
                 unsafe { add_op_ref(ref_count) };
 
                 op.initiated = true;
-                op.weak = Some(stream_impl.ex.get_root_task());
+                op.local_waker = Some(cx.local_waker().clone());
                 stream_impl.recv_op = Some(op);
 
                 Poll::Pending
@@ -1187,7 +1157,7 @@ impl Future for RecvFuture<'_> {
                     return Poll::Ready(Err(Errno::from_raw(res)));
                 }
 
-                op.weak = Some(stream_impl.ex.get_root_task());
+                op.local_waker = Some(cx.local_waker().clone());
                 Poll::Pending
             }
         }

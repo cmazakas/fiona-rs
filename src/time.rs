@@ -14,8 +14,8 @@ use liburing_rs::{
 };
 
 use crate::{
-    add_obj_ref, add_op_ref, release_impl, release_obj, reserve_sqes, Executor, IoUringOp, OpType,
-    RefCount, Result,
+    add_obj_ref, add_op_ref, make_io_uring_op, release_impl, release_obj, reserve_sqes, Executor,
+    IoUringOp, OpType, RefCount, Result,
 };
 
 struct TimerImpl {
@@ -71,23 +71,20 @@ impl Timer {
 
         timer_impl.timeout_pending = true;
 
+        let ref_count = &raw mut timer_impl.ref_count;
+
         TimerFuture {
             timer: self,
             completed: false,
-            op: Some(Box::new(IoUringOp {
-                ref_count: &raw mut timer_impl.ref_count,
-                initiated: false,
-                done: false,
-                eager_dropped: false,
-                res: -1,
-                weak: None,
-                op_type: OpType::Timeout {
+            op: Some(Box::new(make_io_uring_op(
+                ref_count,
+                OpType::Timeout {
                     dur: TimeSpec::new(
                         dur.as_secs().try_into().unwrap(),
                         dur.subsec_nanos().into(),
                     ),
                 },
-            })),
+            ))),
         }
     }
 }
@@ -135,7 +132,7 @@ impl Drop for TimerFuture<'_> {
             // unsafe { submit_ring(ring) };
 
             op.eager_dropped = true;
-            op.weak = None;
+            op.local_waker = None;
             Box::leak(self.op.take().unwrap());
         }
     }
@@ -146,7 +143,7 @@ impl Future for TimerFuture<'_> {
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         assert!(!self.completed);
 
@@ -173,7 +170,7 @@ impl Future for TimerFuture<'_> {
                 }
             }
             (true, false) => {
-                op.weak = Some(timer_impl.ex.get_root_task());
+                op.local_waker = Some(cx.local_waker().clone());
                 self.op = Some(op);
                 Poll::Pending
             }
@@ -194,7 +191,7 @@ impl Future for TimerFuture<'_> {
                 unsafe { io_uring_sqe_set_data(sqe, user_data.cast()) };
 
                 unsafe { add_op_ref(&raw mut timer_impl.ref_count) };
-                op.weak = Some(timer_impl.ex.get_root_task());
+                op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
                 self.op = Some(op);
                 Poll::Pending

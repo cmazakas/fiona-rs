@@ -2,6 +2,7 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
+#![feature(ptr_metadata, box_as_ptr, vec_into_raw_parts, local_waker)]
 #![warn(clippy::pedantic)]
 #![allow(
     clippy::mutable_key_type,
@@ -12,9 +13,6 @@
     clippy::similar_names,
     clippy::cast_possible_wrap
 )]
-#![feature(ptr_metadata)]
-#![feature(box_as_ptr)]
-#![feature(vec_into_raw_parts)]
 
 extern crate liburing_rs;
 extern crate nix;
@@ -39,7 +37,7 @@ use std::{
         },
         mpsc::{Receiver, Sender},
     },
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{Context, ContextBuilder, LocalWaker, Poll, RawWaker, RawWakerVTable, Waker},
     time::{Duration, Instant},
 };
 
@@ -399,6 +397,46 @@ fn make_waker(weak: Weak) -> Waker {
 
 //-----------------------------------------------------------------------------
 
+unsafe fn task_local_waker_clone(p: *const ()) -> RawWaker {
+    let weak = unsafe { Weak::from_raw(p) };
+    std::mem::forget(weak.clone());
+    std::mem::forget(weak);
+    RawWaker::new(p, &TASK_LOCAL_WAKER_VTABLE)
+}
+
+unsafe fn task_local_wake(p: *const ()) {
+    let weak = unsafe { Weak::from_raw(p) };
+    if let Some(sender) = weak.inner().sender.as_ref() {
+        sender.send(weak.clone()).unwrap();
+    }
+}
+
+unsafe fn task_local_wake_by_ref(p: *const ()) {
+    let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
+    if let Some(sender) = weak.inner().sender.as_ref() {
+        sender.send(ManuallyDrop::into_inner(weak.clone())).unwrap();
+    }
+}
+
+unsafe fn task_local_drop(p: *const ()) {
+    let weak = unsafe { Weak::from_raw(p) };
+    drop(weak);
+}
+
+static TASK_LOCAL_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    task_local_waker_clone,
+    task_local_wake,
+    task_local_wake_by_ref,
+    task_local_drop,
+);
+
+fn make_local_waker(weak: Weak) -> LocalWaker {
+    let raw_waker = RawWaker::new(weak.into_raw(), &TASK_LOCAL_WAKER_VTABLE);
+    unsafe { LocalWaker::from_raw(raw_waker) }
+}
+
+//-----------------------------------------------------------------------------
+
 struct BufGroup {
     buf_ring: *mut io_uring_buf_ring,
     num_bufs: u32,
@@ -435,8 +473,6 @@ struct IoContextFrame {
     tasks: HashSet<Task>,
     receiver: Receiver<Weak>,
     sender: Sender<Weak>,
-    root_task: Option<Weak>,
-    local_task_queue: VecDeque<Weak>,
     event_fd: EventFd,
     buf_groups: HashMap<u16, *mut BufGroup>,
     runguard_blacklist: HashSet<u64>,
@@ -528,8 +564,20 @@ struct IoUringOp {
     done: bool,
     eager_dropped: bool,
     res: i32,
-    weak: Option<Weak>,
     op_type: OpType,
+    local_waker: Option<LocalWaker>,
+}
+
+fn make_io_uring_op(ref_count: *mut RefCount, op_type: OpType) -> IoUringOp {
+    IoUringOp {
+        ref_count,
+        initiated: false,
+        done: false,
+        eager_dropped: false,
+        res: -1,
+        local_waker: None,
+        op_type,
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -625,8 +673,6 @@ impl Drop for RunGuard {
             ring = &raw mut frame.ioring;
 
             tasks = std::mem::take(&mut frame.tasks);
-
-            frame.local_task_queue.clear();
         }
         tasks.clear();
 
@@ -705,9 +751,7 @@ impl IoContext {
             available_fds: VecDeque::new(),
             receiver: rx,
             sender: tx,
-            root_task: None,
             ioring,
-            local_task_queue: VecDeque::new(),
             event_fd: nix::sys::eventfd::EventFd::new().unwrap(),
             buf_groups: HashMap::new(),
             runguard_blacklist: HashSet::new(),
@@ -750,10 +794,10 @@ impl IoContext {
             match unsafe { weak.upgrade() } {
                 None => 0,
                 Some(mut task) => {
-                    ex.p.borrow_mut().root_task = Some(weak.clone());
+                    let w = make_waker(weak.clone());
+                    let lw = make_local_waker(weak);
 
-                    let w = make_waker(weak);
-                    let mut cx = std::task::Context::from_waker(&w);
+                    let mut cx = ContextBuilder::from_waker(&w).local_waker(&lw).build();
 
                     if let Poll::Ready(()) = task.poll(&mut cx) {
                         ex.p.borrow_mut().tasks.remove(&task);
@@ -786,15 +830,6 @@ impl IoContext {
             }
 
             loop {
-                let m_item = self.p.borrow_mut().local_task_queue.pop_front();
-                if let Some(weak) = m_item {
-                    num_completed += on_work_item(weak, &ex);
-                } else {
-                    break;
-                }
-            }
-
-            loop {
                 let m_item = self.p.borrow().receiver.try_recv();
                 if let Ok(weak) = m_item {
                     num_completed += on_work_item(weak, &ex);
@@ -803,7 +838,6 @@ impl IoContext {
                 }
             }
 
-            // TODO: clean this up at some point
             if self.p.borrow().tasks.is_empty() {
                 break;
             }
@@ -860,6 +894,7 @@ impl IoContext {
 }
 
 fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor) {
+    let _ = ex;
     unsafe { release_op(op.ref_count) };
 
     if op.eager_dropped {
@@ -869,8 +904,9 @@ fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, 
 
     op.done = true;
     op.res = cqe.res;
-    if let Some(weak) = op.weak.take() {
-        ex.p.borrow_mut().local_task_queue.push_back(weak);
+
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
     }
 }
 
@@ -907,12 +943,14 @@ fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring
 
     op.done = true;
     op.res = res;
-    if let Some(weak) = op.weak.take() {
-        ex.p.borrow_mut().local_task_queue.push_back(weak);
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
     }
 }
 
 fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor) {
+    let _ = ex;
+
     if op.eager_dropped {
         // if the Future was eager-dropped:
         // * we need to release the borrowed direct descriptor back to the pool
@@ -938,8 +976,8 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
 
         op.res = cqe.res;
         op.done = true;
-        if let Some(weak) = op.weak.take() {
-            ex.p.borrow_mut().local_task_queue.push_back(weak);
+        if let Some(local_waker) = op.local_waker.take() {
+            local_waker.wake();
         }
         return;
     }
@@ -950,6 +988,8 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
 }
 
 fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor) {
+    let _ = ex;
+
     let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
 
     if op.eager_dropped {
@@ -983,8 +1023,8 @@ fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
 
     unsafe { release_op(op.ref_count) };
 
-    if let Some(weak) = op.weak.take() {
-        ex.p.borrow_mut().local_task_queue.push_back(weak);
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
     }
 }
 
@@ -994,6 +1034,8 @@ fn on_multishot_tcp_recv(
     _ring: *mut io_uring,
     ex: &Executor,
 ) {
+    let _ = ex;
+
     let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
     let OpType::MultishotTcpRecv {
         ref mut bufs,
@@ -1005,8 +1047,6 @@ fn on_multishot_tcp_recv(
     };
 
     if op.eager_dropped {
-        // assert!(!has_more_cqes);
-
         if cqe.res > 0 {
             let buf_group = unsafe { &mut *buf_group };
             let mask = buf_group.num_bufs - 1;
@@ -1087,8 +1127,8 @@ fn on_multishot_tcp_recv(
         }
     }
 
-    if let Some(weak) = op.weak.take() {
-        ex.p.borrow_mut().local_task_queue.push_back(weak);
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
     }
 }
 
@@ -1261,10 +1301,6 @@ impl Executor {
     fn reclaim_fd(&self, fd: u32) {
         let fds = &mut self.p.borrow_mut().available_fds;
         fds.push_back(fd);
-    }
-
-    fn get_root_task(&self) -> Weak {
-        self.p.borrow().root_task.clone().unwrap()
     }
 
     pub fn register_buf_group(&self, bgid: u16, num_bufs: u32, buf_len: usize) -> Result<()> {

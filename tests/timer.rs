@@ -275,32 +275,66 @@ fn timer_futures_unordered() {
     // we should be able to use a wrapper library like the futures crate and have
     // things complete in the proper unordered order
 
-    async fn launch_timers(ex: fiona::Executor) {
-        let _guard = DurationGuard::new(Duration::from_millis(400));
+    {
+        async fn launch_timers(ex: fiona::Executor) {
+            let _guard = DurationGuard::new(Duration::from_millis(400));
 
-        let f1 = ex.spawn(wait_for(ex.clone(), Duration::from_millis(300), 3));
-        let f2 = ex.spawn(wait_for(ex.clone(), Duration::from_millis(400), 4));
-        let f3 = ex.spawn(wait_for(ex.clone(), Duration::from_millis(100), 1));
-        let f4 = ex.spawn(wait_for(ex.clone(), Duration::from_millis(200), 2));
+            let f1 = ex.spawn(wait_for(ex.clone(), Duration::from_millis(300), 3));
+            let f2 = ex.spawn(wait_for(ex.clone(), Duration::from_millis(400), 4));
+            let f3 = ex.spawn(wait_for(ex.clone(), Duration::from_millis(100), 1));
+            let f4 = ex.spawn(wait_for(ex.clone(), Duration::from_millis(200), 2));
 
-        let futures = [f1, f2, f3, f4];
-        let mut unordered: futures::stream::FuturesUnordered<fiona::SpawnFuture<i32>> =
-            futures.into_iter().collect();
+            let futures = [f1, f2, f3, f4];
+            let mut unordered: futures::stream::FuturesUnordered<fiona::SpawnFuture<i32>> =
+                futures.into_iter().collect();
 
-        let mut i = 1;
-        while let Some(x) = unordered.next().await {
-            assert_eq!(x, i);
-            i += 1;
+            assert!(!unordered.is_empty());
+
+            let mut i = 1;
+            while !unordered.is_empty() {
+                let x = unordered.next().await.unwrap();
+                assert_eq!(x, i);
+                i += 1;
+            }
         }
+
+        let mut ioc = fiona::IoContext::new();
+        let ex = ioc.get_executor();
+
+        ex.spawn(launch_timers(ex.clone()));
+
+        let n = ioc.run();
+        assert_eq!(n, 5);
     }
 
-    let mut ioc = fiona::IoContext::new();
-    let ex = ioc.get_executor();
+    {
+        async fn launch_timers(ex: fiona::Executor) {
+            let _guard = DurationGuard::new(Duration::from_millis(400));
 
-    ex.spawn(launch_timers(ex.clone()));
+            let f1 = wait_for(ex.clone(), Duration::from_millis(300), 3);
+            let f2 = wait_for(ex.clone(), Duration::from_millis(400), 4);
+            let f3 = wait_for(ex.clone(), Duration::from_millis(100), 1);
+            let f4 = wait_for(ex.clone(), Duration::from_millis(200), 2);
 
-    let n = ioc.run();
-    assert_eq!(n, 5);
+            let futures = [f1, f2, f3, f4];
+            let mut tasks: futures::stream::FuturesUnordered<_> = futures.into_iter().collect();
+
+            let mut i = 1;
+            while !tasks.is_empty() {
+                let x = tasks.next().await.unwrap();
+                assert_eq!(x, i);
+                i += 1;
+            }
+        }
+
+        let mut ioc = fiona::IoContext::new();
+        let ex = ioc.get_executor();
+
+        ex.spawn(launch_timers(ex.clone()));
+
+        let n = ioc.run();
+        assert_eq!(n, 1);
+    }
 }
 
 #[test]

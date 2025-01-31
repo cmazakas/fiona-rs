@@ -673,8 +673,8 @@ fn test_tcp_connection_stress_test_no_cq_overflow() {
 
         ex.clone().spawn(async move {
             for _ in 0..(TOTAL_CONNS / NR_FILES) {
-                let mut tasks: FuturesUnordered<fiona::SpawnFuture<()>> = (0..NR_FILES)
-                    .map(|_| {
+                let mut tasks: FuturesUnordered<fiona::SpawnFuture<u32>> = (0..NR_FILES)
+                    .map(|idx| {
                         let ex2 = ex.clone();
                         ex.clone().spawn(async move {
                             let mut message = vec![0; MSG_LEN];
@@ -706,6 +706,7 @@ fn test_tcp_connection_stress_test_no_cq_overflow() {
                             let buf = flatten_bufs(bufs);
 
                             assert_eq!(buf, msg_copy);
+                            idx
                         })
                     })
                     .collect();
