@@ -77,7 +77,7 @@ fn tcp_acceptor_hello_world() {
 }
 
 #[test]
-fn test_tcp_multiple_accepts() {
+fn tcp_multiple_accepts() {
     // Test that we can accept and hold onto multiple TCP sockets at a time.
     // Also test that we can properly recycle fds as well with the runtime.
 
@@ -312,7 +312,7 @@ fn test_accept_select_ready_always() {
 }
 
 #[test]
-fn test_tcp_connect_timeout() {
+fn tcp_connect_timeout() {
     // Want to prove that our timeout works for connect() calls.
     // use one of the IP addresses from the test networks:
     // 192.0.2.0/24
@@ -338,7 +338,7 @@ fn test_tcp_connect_timeout() {
 }
 
 #[test]
-fn test_tcp_send_recv_hello_world() {
+fn tcp_send_recv_hello_world() {
     // Want to test a simple send-recv pair, using the multishot recv op in the
     // background.
 
@@ -413,7 +413,7 @@ fn test_tcp_send_recv_hello_world() {
 }
 
 #[test]
-fn test_tcp_recv_buffer_replenishing() {
+fn tcp_recv_buffer_replenishing() {
     // Want to test that our recv op will eventually replensish the buffer set
     // upon resumption of a Future.
 
@@ -522,7 +522,7 @@ fn flatten_bufs(bufs: Vec<Vec<u8>>) -> Vec<u8> {
 }
 
 #[test]
-fn test_tcp_recv_timeout() {
+fn tcp_recv_timeout() {
     // Test that our recv operation can timeout and then be restarted.
 
     async fn server_timeout(ex: fiona::Executor) {
@@ -646,7 +646,7 @@ fn test_tcp_recv_timeout() {
 }
 
 #[test]
-fn test_tcp_connection_stress_test_no_cq_overflow() {
+fn tcp_connection_stress_test_no_cq_overflow() {
     const NR_FILES: u32 = 500;
     const CQ_ENTRIES: u32 = 16 * 1024;
 
@@ -757,7 +757,7 @@ fn test_tcp_connection_stress_test_no_cq_overflow() {
 }
 
 #[test]
-fn test_tcp_connection_stress_test_cq_overflow() {
+fn tcp_connection_stress_test_cq_overflow() {
     const NR_FILES: u32 = 500;
     const CQ_ENTRIES: u32 = 512;
 
