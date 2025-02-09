@@ -9,7 +9,7 @@ edition = "2021"
 
 [dependencies]
 nix = { version = "0.29.0", features = ["event", "socket", "net"] }
-axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "2d96e393576efc105d756ad66ea8cd66112462f4" }
+axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "056da4c1c390d81377b97bf9095b0691439690c1" }
 
 [dev-dependencies]
 futures = "0.3.30"
