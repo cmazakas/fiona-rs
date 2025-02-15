@@ -2,7 +2,7 @@ use core::str;
 use std::{future::Future, net::Ipv4Addr, task::Poll, time::Duration};
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use nix::errno::Errno;
+use nix::{errno::Errno, libc::EISCONN};
 use rand::SeedableRng;
 
 struct WakerFuture;
@@ -864,4 +864,38 @@ fn tcp_connection_stress_test_cq_overflow() {
     t.join().unwrap();
 
     assert_eq!(n, (1 + TOTAL_CONNS).into());
+}
+
+#[test]
+fn tcp_double_connect() {
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.clone().spawn(async move {
+        let stream = acceptor.accept().await.unwrap();
+
+        let timer = fiona::time::Timer::new(stream.get_executor());
+        timer.wait(Duration::from_millis(250)).await.unwrap();
+    });
+
+    // sequential double-connect
+    ex.clone().spawn(async move {
+        let client = fiona::tcp::Client::new(ex);
+        client
+            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        let err = client
+            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, Errno::from_raw(EISCONN));
+    });
+
+    ioc.run();
 }

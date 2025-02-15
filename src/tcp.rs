@@ -470,6 +470,12 @@ impl Stream {
         Stream { p }
     }
 
+    #[must_use]
+    pub fn get_executor(&self) -> Executor {
+        let stream_impl = unsafe { &mut *self.p.as_ptr() };
+        stream_impl.ex.clone()
+    }
+
     pub fn set_buf_group(&self, bgid: u16) {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.buf_group = bgid;
@@ -803,18 +809,25 @@ impl Future for ConnectFuture<'_> {
                     }
                 };
 
-                let Some(file_index) = client_impl.stream.ex.get_available_fd() else {
-                    self.op = Some(op);
-                    return Poll::Ready(Err(Errno::from_raw(ENFILE)));
-                };
+                let file_index;
 
-                *fd = file_index.try_into().unwrap();
+                *needs_socket = client_impl.stream.fd < 0;
 
-                unsafe { reserve_sqes(ring, 3) };
+                if *needs_socket {
+                    let Some(file_idx) = client_impl.stream.ex.get_available_fd() else {
+                        self.op = Some(op);
+                        return Poll::Ready(Err(Errno::from_raw(ENFILE)));
+                    };
 
-                {
-                    *needs_socket = true;
+                    *fd = file_idx.try_into().unwrap();
+                    file_index = file_idx;
+                } else {
+                    file_index = client_impl.stream.fd.try_into().unwrap();
+                }
 
+                unsafe { reserve_sqes(ring, if *needs_socket { 3 } else { 2 }) };
+
+                if *needs_socket {
                     let sqe = unsafe { io_uring_get_sqe(ring) };
 
                     unsafe {
