@@ -89,6 +89,7 @@ struct TaskInnerHeader {
     future_vtable: DynMetadata<dyn Future<Output = ()> + 'static>,
     sender: Option<Sender<Weak>>,
     event_fd: i32,
+    ex: *const RefCell<IoContextFrame>,
 }
 
 //-----------------------------------------------------------------------------
@@ -108,6 +109,7 @@ impl Task {
         f: F,
         sender: Sender<Weak>,
         event_fd: i32,
+        ex: Executor,
     ) -> Task {
         let layout = Layout::new::<TaskInnerHeader>()
             .extend(Layout::for_value(&f))
@@ -124,6 +126,7 @@ impl Task {
             future_vtable: metadata(std::ptr::from_ref(&f as &dyn Future<Output = ()>)),
             sender: Some(sender),
             event_fd,
+            ex: Rc::into_raw(ex.p),
         };
 
         unsafe { std::ptr::write(p.as_ptr().cast::<TaskInnerHeader>(), header) };
@@ -183,6 +186,7 @@ impl Drop for Task {
         self.inner().strong.load(Acquire);
 
         unsafe { std::ptr::drop_in_place(self.as_ptr()) };
+        drop(unsafe { Rc::from_raw(self.inner().ex) });
 
         if self.inner().weak.fetch_sub(1, Release) > 1 {
             return;
@@ -406,15 +410,17 @@ unsafe fn task_local_waker_clone(p: *const ()) -> RawWaker {
 
 unsafe fn task_local_wake(p: *const ()) {
     let weak = unsafe { Weak::from_raw(p) };
-    if let Some(sender) = weak.inner().sender.as_ref() {
-        sender.send(weak.clone()).unwrap();
+    if let Some(_task) = weak.upgrade() {
+        let ex = &*weak.inner().ex;
+        ex.borrow_mut().local_task_queue.push_back(weak);
     }
 }
 
 unsafe fn task_local_wake_by_ref(p: *const ()) {
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
-    if let Some(sender) = weak.inner().sender.as_ref() {
-        sender.send(ManuallyDrop::into_inner(weak.clone())).unwrap();
+    if let Some(_task) = weak.upgrade() {
+        let ex = &*weak.inner().ex;
+        ex.borrow_mut().local_task_queue.push_back((*weak).clone());
     }
 }
 
@@ -476,6 +482,7 @@ struct IoContextFrame {
     event_fd: EventFd,
     buf_groups: HashMap<u16, *mut BufGroup>,
     runguard_blacklist: HashSet<u64>,
+    local_task_queue: VecDeque<Weak>,
 }
 
 //-----------------------------------------------------------------------------
@@ -755,6 +762,7 @@ impl IoContext {
             event_fd: nix::sys::eventfd::EventFd::new().unwrap(),
             buf_groups: HashMap::new(),
             runguard_blacklist: HashSet::new(),
+            local_task_queue: VecDeque::new(),
         }));
 
         {
@@ -829,13 +837,14 @@ impl IoContext {
                 break;
             }
 
-            loop {
-                let m_item = self.p.borrow().receiver.try_recv();
-                if let Ok(weak) = m_item {
-                    num_completed += on_work_item(weak, &ex);
-                } else {
-                    break;
-                }
+            let try_local_recv = || self.p.borrow_mut().local_task_queue.pop_front();
+            while let Some(weak) = try_local_recv() {
+                num_completed += on_work_item(weak, &ex);
+            }
+
+            let try_recv = || self.p.borrow().receiver.try_recv();
+            while let Ok(weak) = try_recv() {
+                num_completed += on_work_item(weak, &ex);
             }
 
             if self.p.borrow().tasks.is_empty() {
@@ -1370,7 +1379,7 @@ impl Executor {
             value: value.clone(),
         };
 
-        let task = Task::new(wrapped, sender.clone(), event_fd);
+        let task = Task::new(wrapped, sender.clone(), event_fd, self.clone());
 
         sender.send(Task::downgrade(&task)).unwrap();
         (*self.p).borrow_mut().tasks.insert(task);

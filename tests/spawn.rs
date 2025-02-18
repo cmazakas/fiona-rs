@@ -2,13 +2,15 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
+#![feature(local_waker)]
+
 use std::{
     cell::{Cell, RefCell},
     future::{poll_fn, Future},
     pin::Pin,
     rc::Rc,
     sync::Arc,
-    task::Poll,
+    task::{LocalWaker, Poll},
     thread::JoinHandle,
     time::Duration,
 };
@@ -66,6 +68,18 @@ impl Future for WakerFuture {
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         Poll::Ready(cx.waker().clone())
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+struct LocalWakerFuture;
+
+impl Future for LocalWakerFuture {
+    type Output = LocalWaker;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        Poll::Ready(cx.local_waker().clone())
     }
 }
 
@@ -436,8 +450,8 @@ fn await_manually_polled() {
     async fn f1(ex: fiona::Executor) {
         let w = WakerFuture.await;
 
-        // test the case where we manually poll a sibling task, attaching ourselves as the continuation
-        // our task then immediately finishes
+        // test the case where we manually poll a sibling task, attaching ourselves as
+        // the continuation our task then immediately finishes
         //
         let f = std::pin::pin!(ex.spawn(f2()));
 
@@ -623,4 +637,27 @@ fn await_futures_unordered() {
 
     let n = ioc.run();
     assert_eq!(n, 5);
+}
+
+#[test]
+fn await_local_waker_outlives() {
+    let p = Rc::<RefCell<Option<LocalWaker>>>::new(RefCell::new(None));
+    {
+        let mut ioc = fiona::IoContext::new();
+        let ex = ioc.get_executor();
+
+        {
+            let p = p.clone();
+            ex.spawn(async move {
+                let local_waker = LocalWakerFuture.await;
+                *(*p).borrow_mut() = Some(local_waker);
+            });
+        }
+
+        ioc.run();
+    }
+
+    let local_waker = (*p).take().unwrap();
+    local_waker.wake_by_ref();
+    local_waker.wake();
 }
