@@ -119,9 +119,11 @@ fn timer_early_drop() {
             let mut f = timer.wait(dur);
             {
                 let w = WakerFuture.await;
-                assert!(std::pin::pin!(&mut f)
-                    .poll(&mut std::task::Context::from_waker(&w))
-                    .is_pending());
+                assert!(
+                    std::pin::pin!(&mut f)
+                        .poll(&mut std::task::Context::from_waker(&w))
+                        .is_pending()
+                );
 
                 drop(f);
             }
@@ -183,9 +185,11 @@ fn timer_forget_expired() {
         let mut f = timer.wait(Duration::from_millis(100));
         {
             let w = WakerFuture.await;
-            assert!(std::pin::pin!(&mut f)
-                .poll(&mut std::task::Context::from_waker(&w))
-                .is_pending());
+            assert!(
+                std::pin::pin!(&mut f)
+                    .poll(&mut std::task::Context::from_waker(&w))
+                    .is_pending()
+            );
 
             std::mem::forget(f);
         }

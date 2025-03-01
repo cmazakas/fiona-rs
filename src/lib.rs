@@ -28,7 +28,7 @@ use std::{
     ops::Deref,
     os::fd::AsRawFd,
     pin::Pin,
-    ptr::{self, metadata, null_mut, DynMetadata, NonNull},
+    ptr::{self, DynMetadata, NonNull, metadata, null_mut},
     rc::Rc,
     sync::{
         atomic::{
@@ -43,23 +43,23 @@ use std::{
 
 use nix::{
     errno::Errno,
-    libc::{c_void, ETIME},
+    libc::{ETIME, c_void},
     sys::{eventfd::EventFd, socket::SockaddrStorage, time::TimeSpec},
 };
 
 use liburing_rs::{
-    io_uring, io_uring_buf_ring, io_uring_buf_ring_add, io_uring_buf_ring_advance,
-    io_uring_buf_ring_mask, io_uring_cq_advance, io_uring_cq_ready, io_uring_cqe,
-    io_uring_cqe_seen, io_uring_free_buf_ring, io_uring_get_events, io_uring_get_sqe,
-    io_uring_params, io_uring_peek_batch_cqe, io_uring_peek_cqe, io_uring_prep_cancel_fd,
+    IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED, IORING_CQE_BUFFER_SHIFT,
+    IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IORING_SETUP_CQSIZE, IORING_SETUP_DEFER_TASKRUN,
+    IORING_SETUP_SINGLE_ISSUER, IORING_TIMEOUT_MULTISHOT, IOSQE_CQE_SKIP_SUCCESS, io_uring,
+    io_uring_buf_ring, io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask,
+    io_uring_cq_advance, io_uring_cq_ready, io_uring_cqe, io_uring_cqe_seen,
+    io_uring_free_buf_ring, io_uring_get_events, io_uring_get_sqe, io_uring_params,
+    io_uring_peek_batch_cqe, io_uring_peek_cqe, io_uring_prep_cancel_fd,
     io_uring_prep_close_direct, io_uring_prep_read, io_uring_prep_timeout, io_uring_queue_exit,
     io_uring_queue_init_params, io_uring_register_files_sparse, io_uring_register_ring_fd,
     io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe_set_data,
     io_uring_sqe_set_data64, io_uring_sqe_set_flags, io_uring_submit_and_get_events,
-    io_uring_submit_and_wait, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
-    IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IORING_SETUP_CQSIZE,
-    IORING_SETUP_DEFER_TASKRUN, IORING_SETUP_SINGLE_ISSUER, IORING_TIMEOUT_MULTISHOT,
-    IOSQE_CQE_SKIP_SUCCESS,
+    io_uring_submit_and_wait,
 };
 
 pub mod tcp;
@@ -289,12 +289,12 @@ impl Weak {
                     return Some(Task {
                         p: self.p,
                         phantom: PhantomData,
-                    })
+                    });
                 }
                 Err(c2) => {
                     c = c2;
                 }
-            };
+            }
         }
     }
 }
@@ -410,16 +410,16 @@ unsafe fn task_local_waker_clone(p: *const ()) -> RawWaker {
 
 unsafe fn task_local_wake(p: *const ()) {
     let weak = unsafe { Weak::from_raw(p) };
-    if let Some(_task) = weak.upgrade() {
-        let ex = &*weak.inner().ex;
+    if let Some(_task) = unsafe { weak.upgrade() } {
+        let ex = unsafe { &*weak.inner().ex };
         ex.borrow_mut().local_task_queue.push_back(weak);
     }
 }
 
 unsafe fn task_local_wake_by_ref(p: *const ()) {
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
-    if let Some(_task) = weak.upgrade() {
-        let ex = &*weak.inner().ex;
+    if let Some(_task) = unsafe { weak.upgrade() } {
+        let ex = unsafe { &*weak.inner().ex };
         ex.borrow_mut().local_task_queue.push_back((*weak).clone());
     }
 }
@@ -455,7 +455,9 @@ struct BufGroup {
 
 impl BufGroup {
     unsafe fn release(&mut self) {
-        io_uring_free_buf_ring(self.ring, self.buf_ring, self.num_bufs, self.bgid.into());
+        unsafe {
+            io_uring_free_buf_ring(self.ring, self.buf_ring, self.num_bufs, self.bgid.into())
+        };
 
         let bufs = &mut self.bufs;
 
@@ -463,7 +465,7 @@ impl BufGroup {
             if ptr.is_null() {
                 continue;
             }
-            drop(Vec::<u8>::from_raw_parts(*ptr, self.buf_len, self.buf_len));
+            drop(unsafe { Vec::<u8>::from_raw_parts(*ptr, self.buf_len, self.buf_len) });
         }
 
         bufs.shrink_to_fit();
@@ -496,38 +498,38 @@ struct RefCount {
 }
 
 unsafe fn add_obj_ref(rc: *mut RefCount) {
-    (*rc).obj_count += 1;
+    unsafe { (*rc).obj_count += 1 };
     // println!("add_obj_ref: {:?}", *rc);
 }
 
 unsafe fn add_op_ref(rc: *mut RefCount) {
-    (*rc).op_count += 1;
+    unsafe { (*rc).op_count += 1 };
     // println!("add_op_ref: {:?}", *rc);
 }
 
 unsafe fn release_impl<T>(p: *mut u8) {
     let layout = std::alloc::Layout::new::<T>();
-    std::ptr::drop_in_place(p.cast::<T>());
-    std::alloc::dealloc(p, layout);
+    unsafe { std::ptr::drop_in_place(p.cast::<T>()) };
+    unsafe { std::alloc::dealloc(p, layout) };
 }
 
 unsafe fn release_obj(rc: *mut RefCount) {
-    (*rc).obj_count -= 1;
+    unsafe { (*rc).obj_count -= 1 };
     // println!("release_obj: {:?}", *rc);
-    if (*rc).obj_count == 0 && (*rc).op_count == 0 {
-        let fp = (*rc).release_impl;
-        let p = (*rc).obj;
-        (fp)(p);
+    if unsafe { (*rc).obj_count == 0 && (*rc).op_count == 0 } {
+        let fp = unsafe { (*rc).release_impl };
+        let p = unsafe { (*rc).obj };
+        unsafe { (fp)(p) };
     }
 }
 
 unsafe fn release_op(rc: *mut RefCount) {
-    (*rc).op_count -= 1;
+    unsafe { (*rc).op_count -= 1 };
     // println!("release_op: {:?}", *rc);
-    if (*rc).obj_count == 0 && (*rc).op_count == 0 {
-        let fp = (*rc).release_impl;
-        let p = (*rc).obj;
-        (fp)(p);
+    if unsafe { (*rc).obj_count == 0 && (*rc).op_count == 0 } {
+        let fp = unsafe { (*rc).release_impl };
+        let p = unsafe { (*rc).obj };
+        unsafe { (fp)(p) };
     }
 }
 
@@ -621,13 +623,13 @@ impl Default for IoContextParams {
 //-----------------------------------------------------------------------------
 
 unsafe fn submit_ring(ring: *mut io_uring) {
-    let _r = io_uring_submit_and_get_events(ring);
+    let _r = unsafe { io_uring_submit_and_get_events(ring) };
 }
 
 unsafe fn reserve_sqes(ring: *mut io_uring, n: u32) {
-    let r = io_uring_sq_space_left(ring);
+    let r = unsafe { io_uring_sq_space_left(ring) };
     if r < n {
-        submit_ring(ring);
+        unsafe { submit_ring(ring) };
     }
 }
 
@@ -965,8 +967,10 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
         // * we need to release the borrowed direct descriptor back to the pool
         // * if the connect() succeeded, we need to close() it
 
-        unsafe { release_op(op.ref_count) };
-        drop(unsafe { Box::from_raw(op) });
+        if op.done {
+            unsafe { release_op(op.ref_count) };
+            drop(unsafe { Box::from_raw(op) });
+        }
         // continue;
         todo!();
     }
