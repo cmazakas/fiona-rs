@@ -9,56 +9,25 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const NR_FILES: u32 = 5000;
 const NUM_MSGS: u32 = 1000;
-const CQ_ENTRIES: u32 = 64 * 1024;
-
-const SERVER_BGID: u16 = 27;
-const CLIENT_BGID: u16 = 72;
-// const MSG_LEN: usize = 4096;
 
 static NUM_RUNS: AtomicU64 = AtomicU64::new(0);
 
-fn make_io_context() -> fiona::IoContext {
-    let params = &fiona::IoContextParams {
-        sq_entries: 256,
-        cq_entries: CQ_ENTRIES,
-        nr_files: 4 * NR_FILES,
-    };
+fn fiona_echo() -> Result<(), String> {
+    fn make_io_context() -> fiona::IoContext {
+        let params = &fiona::IoContextParams {
+            sq_entries: 256,
+            cq_entries: CQ_ENTRIES,
+            nr_files: 4 * NR_FILES,
+        };
 
-    fiona::IoContext::with_params(params)
-}
-
-fn client(port: u16) {
-    let mut ioc = make_io_context();
-    let ex = ioc.get_executor();
-    ex.register_buf_group(CLIENT_BGID, 16 * 1024, 1024).unwrap();
-
-    for _ in 0..NR_FILES {
-        let ex2 = ex.clone();
-        ex.clone().spawn(async move {
-            let client = fiona::tcp::Client::new(ex2);
-            client
-                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                .await
-                .unwrap();
-
-            client.set_buf_group(CLIENT_BGID);
-
-            for _ in 0..NUM_MSGS {
-                let message = String::from("hello, world!").into_bytes();
-                let message = client.send(message).await.unwrap();
-                assert!(message.is_empty());
-                let bufs = client.recv().await.unwrap();
-                assert_eq!(bufs[0], "hello, world!".as_bytes());
-            }
-
-            NUM_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        });
+        fiona::IoContext::with_params(params)
     }
 
-    let _n = ioc.run();
-}
+    const CQ_ENTRIES: u32 = 64 * 1024;
 
-fn fiona_echo() -> Result<(), String> {
+    const SERVER_BGID: u16 = 27;
+    const CLIENT_BGID: u16 = 72;
+
     let mut ioc = make_io_context();
     let ex = ioc.get_executor();
 
@@ -89,10 +58,44 @@ fn fiona_echo() -> Result<(), String> {
         }
     });
 
-    let t = std::thread::spawn(move || client(port));
+    let t = std::thread::spawn(move || {
+        let mut ioc = make_io_context();
+        let ex = ioc.get_executor();
+        ex.register_buf_group(CLIENT_BGID, 16 * 1024, 1024).unwrap();
+
+        for _ in 0..NR_FILES {
+            let ex2 = ex.clone();
+            ex.clone().spawn(async move {
+                let client = fiona::tcp::Client::new(ex2);
+                client
+                    .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                    .await
+                    .unwrap();
+
+                client.set_buf_group(CLIENT_BGID);
+
+                for _ in 0..NUM_MSGS {
+                    let message = String::from("hello, world!").into_bytes();
+                    let message = client.send(message).await.unwrap();
+                    assert!(message.is_empty());
+                    let bufs = client.recv().await.unwrap();
+                    assert_eq!(bufs[0], "hello, world!".as_bytes());
+                }
+
+                NUM_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+
+        let _n = ioc.run();
+    });
 
     let _n = ioc.run();
     t.join().unwrap();
+
+    assert_eq!(
+        NUM_RUNS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        (2 * NR_FILES).into()
+    );
 
     Ok(())
 }
@@ -181,6 +184,11 @@ fn tokio_echo() -> Result<(), String> {
     });
 
     t.join().unwrap();
+
+    assert_eq!(
+        NUM_RUNS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        (2 * NR_FILES).into()
+    );
 
     Ok(())
 }
