@@ -5,16 +5,25 @@
 [package]
 name = "fiona"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 nix = { version = "0.29.0", features = ["event", "socket", "net"] }
-axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "056da4c1c390d81377b97bf9095b0691439690c1" }
-rand = "0.8.5"
+axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "25783591e93c010c177b716e87abccab210ec6f5" }
 
 [dev-dependencies]
 futures = "0.3.30"
+rand = "0.8.5"
+tokio = { version = "1.43.0", features = ["full"] }
 
 [profile.release-with-debug]
 inherits = "release"
 debug = "full"
+
+[[bench]]
+name = "echo"
+harness = false
+
+[[bench]]
+name = "timer"
+harness = false

@@ -1,9 +1,11 @@
+mod utils;
+
 use std::{
     sync::{
-        atomic::{AtomicI32, Ordering::Relaxed},
         Arc,
+        atomic::{AtomicI32, Ordering::Relaxed},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 async fn timer_op(ex: fiona::Executor, anums: Arc<AtomicI32>) {
@@ -14,9 +16,7 @@ async fn timer_op(ex: fiona::Executor, anums: Arc<AtomicI32>) {
     }
 }
 
-fn main() {
-    let prev = Instant::now();
-
+fn fiona_timer() -> Result<(), String> {
     let params = fiona::IoContextParams {
         sq_entries: 16 * 1024,
         cq_entries: 16 * 1024,
@@ -34,6 +34,9 @@ fn main() {
     ioc.run();
     assert_eq!(anums.load(Relaxed), 10_000 * 10_000);
 
-    let dur = Instant::now().duration_since(prev);
-    println!("duration: {dur:?}");
+    Ok(())
+}
+
+fn main() {
+    utils::run_once("fiona_timer", fiona_timer).unwrap();
 }
