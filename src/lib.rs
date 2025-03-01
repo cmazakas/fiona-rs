@@ -967,12 +967,49 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
         // * we need to release the borrowed direct descriptor back to the pool
         // * if the connect() succeeded, we need to close() it
 
-        if op.done {
-            unsafe { release_op(op.ref_count) };
-            drop(unsafe { Box::from_raw(op) });
+        let OpType::TcpConnect {
+            ref mut needs_socket,
+            ref mut got_socket,
+            fd,
+            ..
+        } = op.op_type
+        else {
+            unreachable!()
+        };
+
+        let is_last_cqe = cqe.res < 0 || *got_socket || !*needs_socket;
+
+        if *needs_socket && !*got_socket && cqe.res >= 0 {
+            *got_socket = true;
         }
-        // continue;
-        todo!();
+
+        if !is_last_cqe {
+            return;
+        }
+
+        // if our connect() op is borrowing an FD from the runtime,
+        // we need to close it and return it
+        if *needs_socket {
+            // this means our socket() call completed with a success
+            if *got_socket {
+                let ring = ex.ring();
+
+                unsafe { reserve_sqes(ring, 1) };
+
+                let sqe = unsafe { io_uring_get_sqe(ring) };
+
+                unsafe { io_uring_prep_close_direct(sqe, fd.try_into().unwrap()) };
+                unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+            }
+
+            ex.reclaim_fd(fd.try_into().unwrap());
+        }
+
+        unsafe { release_op(op.ref_count) };
+        drop(unsafe { Box::from_raw(op) });
+
+        return;
     }
 
     let OpType::TcpConnect {
@@ -984,7 +1021,10 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
         unreachable!()
     };
 
-    if cqe.res < 0 || *got_socket {
+    // if we hit an error, this is our last CQE
+    // if we don't need a socket, this is our last CQE
+    // if we've already gotten a socket, this is our last CQE
+    if cqe.res < 0 || !*needs_socket || *got_socket {
         unsafe { release_op(op.ref_count) };
 
         op.res = cqe.res;
@@ -995,6 +1035,8 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
         return;
     }
 
+    // we expect one more CQE after this, the result of the actual
+    // connect() call
     if *needs_socket {
         *got_socket = true;
     }

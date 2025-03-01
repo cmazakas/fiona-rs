@@ -1,7 +1,13 @@
 use core::str;
-use std::{future::Future, net::Ipv4Addr, task::Poll, time::Duration};
+use std::{
+    future::Future,
+    net::Ipv4Addr,
+    panic::{AssertUnwindSafe, catch_unwind},
+    task::Poll,
+    time::Duration,
+};
 
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use nix::{errno::Errno, libc::EISCONN};
 use rand::SeedableRng;
 
@@ -30,9 +36,11 @@ fn tcp_acceptor_eager_drop() {
             let mut f = acceptor.accept();
 
             let w = WakerFuture.await;
-            assert!(std::pin::pin!(&mut f)
-                .poll(&mut std::task::Context::from_waker(&w))
-                .is_pending());
+            assert!(
+                std::pin::pin!(&mut f)
+                    .poll(&mut std::task::Context::from_waker(&w))
+                    .is_pending()
+            );
 
             drop(f);
         }
@@ -875,6 +883,7 @@ fn tcp_double_connect() {
     let port = acceptor.port();
 
     ex.clone().spawn(async move {
+        // let _stream = acceptor.accept().await.unwrap();
         let stream = acceptor.accept().await.unwrap();
 
         let timer = fiona::time::Timer::new(stream.get_executor());
@@ -882,20 +891,70 @@ fn tcp_double_connect() {
     });
 
     // sequential double-connect
-    ex.clone().spawn(async move {
-        let client = fiona::tcp::Client::new(ex);
-        client
-            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
-            .await
-            .unwrap();
+    {
+        let ex = ex.clone();
+        ex.clone().spawn(async move {
+            let client = fiona::tcp::Client::new(ex);
+            client
+                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                .await
+                .unwrap();
 
-        let err = client
-            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
-            .await
-            .unwrap_err();
+            let err = client
+                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                .await
+                .unwrap_err();
 
-        assert_eq!(err, Errno::from_raw(EISCONN));
-    });
+            assert_eq!(err, Errno::from_raw(EISCONN));
+        });
+    }
+
+    // concurrent double-connect
+    {
+        let ex = ex.clone();
+        ex.clone().spawn(async move {
+            let client = fiona::tcp::Client::new(ex);
+            let mut f1 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
+
+            assert!(futures::poll!(&mut f1).is_pending());
+
+            {
+                // let client = client.clone();
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| {
+                        let _f2 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
+                    }))
+                    .is_err()
+                );
+            }
+        });
+    }
+
+    // concurrent double-connect when already connected
+    {
+        let ex = ex.clone();
+        ex.clone().spawn(async move {
+            let client = fiona::tcp::Client::new(ex);
+            client
+                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            let mut f1 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
+
+            assert!(futures::poll!(&mut f1).is_pending());
+
+            {
+                // let client = client.clone();
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| {
+                        let _f2 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
+                    }))
+                    .is_err()
+                );
+            }
+        });
+    }
 
     ioc.run();
 }
