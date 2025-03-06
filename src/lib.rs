@@ -52,14 +52,13 @@ use liburing_rs::{
     IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IORING_SETUP_CQSIZE, IORING_SETUP_DEFER_TASKRUN,
     IORING_SETUP_SINGLE_ISSUER, IORING_TIMEOUT_MULTISHOT, IOSQE_CQE_SKIP_SUCCESS, io_uring,
     io_uring_buf_ring, io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask,
-    io_uring_cq_advance, io_uring_cq_ready, io_uring_cqe, io_uring_cqe_seen,
+    io_uring_cq_advance, io_uring_cqe, io_uring_cqe_seen, io_uring_for_each_cqe,
     io_uring_free_buf_ring, io_uring_get_events, io_uring_get_sqe, io_uring_params,
-    io_uring_peek_batch_cqe, io_uring_peek_cqe, io_uring_prep_cancel_fd,
-    io_uring_prep_close_direct, io_uring_prep_read, io_uring_prep_timeout, io_uring_queue_exit,
-    io_uring_queue_init_params, io_uring_register_files_sparse, io_uring_register_ring_fd,
-    io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe_set_data,
-    io_uring_sqe_set_data64, io_uring_sqe_set_flags, io_uring_submit_and_get_events,
-    io_uring_submit_and_wait,
+    io_uring_peek_cqe, io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_read,
+    io_uring_prep_timeout, io_uring_queue_exit, io_uring_queue_init_params,
+    io_uring_register_files_sparse, io_uring_register_ring_fd, io_uring_setup_buf_ring,
+    io_uring_sq_space_left, io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    io_uring_submit_and_get_events, io_uring_submit_and_wait,
 };
 
 pub mod tcp;
@@ -476,7 +475,7 @@ impl BufGroup {
 
 struct IoContextFrame {
     ioring: io_uring,
-    params: io_uring_params,
+    _params: io_uring_params,
     available_fds: VecDeque<u32>,
     tasks: HashSet<Task>,
     receiver: Receiver<Weak>,
@@ -755,7 +754,7 @@ impl IoContext {
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 
         let p = Rc::new(RefCell::new(IoContextFrame {
-            params,
+            _params: params,
             tasks: HashSet::new(),
             available_fds: VecDeque::new(),
             receiver: rx,
@@ -829,8 +828,8 @@ impl IoContext {
         let ex = self.get_executor();
         let ring = ex.ring();
 
-        let cq_entries = ex.p.borrow().params.cq_entries;
-        let mut cqes = Vec::<*mut io_uring_cqe>::with_capacity(cq_entries as usize);
+        // let cq_entries = ex.p.borrow().params.cq_entries;
+        // let mut cqes = Vec::<*mut io_uring_cqe>::with_capacity(cq_entries as usize);
 
         let mut need_eventfd_read = true;
 
@@ -867,24 +866,20 @@ impl IoContext {
             let ret = unsafe { io_uring_submit_and_wait(ring, 1) };
             debug_assert!(ret >= 0);
 
-            let num_ready = unsafe { io_uring_cq_ready(ring) };
-            let num_cqes = unsafe { io_uring_peek_batch_cqe(ring, cqes.as_mut_ptr(), num_ready) };
-            unsafe { cqes.set_len(num_cqes as usize) };
-
             let mut guard = CQEAdvanceGuard { ring, n: 0 };
 
-            for cqe in &mut cqes {
+            let on_cqe = |cqe: &mut io_uring_cqe| {
                 let _g = IncrGuard { n: &mut guard.n };
 
-                let cqe = unsafe { &mut **cqe };
+                let cqe = &mut *cqe;
 
                 if cqe.user_data == 0 {
-                    continue;
+                    return;
                 }
 
                 if cqe.user_data == 1 {
                     need_eventfd_read = true;
-                    continue;
+                    return;
                 }
 
                 let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
@@ -894,10 +889,14 @@ impl IoContext {
                     OpType::TcpAccept { .. } => on_tcp_accept(op, cqe, ring, &ex),
                     OpType::TcpConnect { .. } => on_tcp_connect(op, cqe, ring, &ex),
                     OpType::TcpSend { .. } => on_tcp_send(op, cqe, ring, &ex),
-                    OpType::MultishotTcpRecv { .. } => on_multishot_tcp_recv(op, cqe, ring, &ex),
+                    OpType::MultishotTcpRecv { .. } => {
+                        on_multishot_tcp_recv(op, cqe, ring, &ex);
+                    }
                     OpType::MultishotTimeout { .. } => on_multishot_timeout(op, cqe, ring),
                 }
-            }
+            };
+
+            unsafe { io_uring_for_each_cqe(ring, on_cqe) };
         }
 
         num_completed
