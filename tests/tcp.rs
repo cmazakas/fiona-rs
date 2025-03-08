@@ -428,9 +428,9 @@ fn tcp_recv_buffer_replenishing() {
     static mut NUM_RUNS: u64 = 0;
 
     let message_len = 1337;
-    let mut rng = rand::rngs::StdRng::from_entropy();
+    let mut rng = rand::rngs::StdRng::from_os_rng();
     let mut message = vec![0; message_len];
-    <[u8] as rand::Fill>::try_fill(message.as_mut_slice(), &mut rng).unwrap();
+    rand::RngCore::fill_bytes(&mut rng, &mut message);
 
     let message = message;
     let chunk_size = 90;
@@ -687,9 +687,8 @@ fn tcp_connection_stress_test_no_cq_overflow() {
                         ex.clone().spawn(async move {
                             let mut message = vec![0; MSG_LEN];
                             {
-                                let mut rng = rand::rngs::StdRng::from_entropy();
-                                <[u8] as rand::Fill>::try_fill(message.as_mut_slice(), &mut rng)
-                                    .unwrap();
+                                let mut rng = rand::rngs::StdRng::from_os_rng();
+                                rand::RngCore::fill_bytes(&mut rng, &mut message);
                             }
 
                             let timer = fiona::time::Timer::new(ex2.clone());
@@ -798,9 +797,8 @@ fn tcp_connection_stress_test_cq_overflow() {
                         ex.clone().spawn(async move {
                             let mut message = vec![0; MSG_LEN];
                             {
-                                let mut rng = rand::rngs::StdRng::from_entropy();
-                                <[u8] as rand::Fill>::try_fill(message.as_mut_slice(), &mut rng)
-                                    .unwrap();
+                                let mut rng = rand::rngs::StdRng::from_os_rng();
+                                rand::RngCore::fill_bytes(&mut rng, &mut message);
                             }
 
                             let timer = fiona::time::Timer::new(ex2.clone());
@@ -919,7 +917,7 @@ fn tcp_double_connect() {
             assert!(futures::poll!(&mut f1).is_pending());
 
             {
-                // let client = client.clone();
+                let client = client.clone();
                 assert!(
                     catch_unwind(AssertUnwindSafe(|| {
                         let _f2 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
@@ -945,7 +943,7 @@ fn tcp_double_connect() {
             assert!(futures::poll!(&mut f1).is_pending());
 
             {
-                // let client = client.clone();
+                let client = client.clone();
                 assert!(
                     catch_unwind(AssertUnwindSafe(|| {
                         let _f2 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
@@ -956,5 +954,19 @@ fn tcp_double_connect() {
         });
     }
 
-    ioc.run();
+    let n = ioc.run();
+    assert!(n > 0);
+}
+
+#[test]
+fn connect_select_ready_always() {
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    let n = ioc.run();
+    assert!(n > 0);
 }

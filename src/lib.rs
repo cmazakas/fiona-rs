@@ -868,10 +868,10 @@ impl IoContext {
 
             let mut guard = CQEAdvanceGuard { ring, n: 0 };
 
-            let on_cqe = |cqe: &mut io_uring_cqe| {
+            let on_cqe = |cqe: *mut io_uring_cqe| {
                 let _g = IncrGuard { n: &mut guard.n };
 
-                let cqe = &mut *cqe;
+                let cqe = unsafe { &mut *cqe };
 
                 if cqe.user_data == 0 {
                     return;

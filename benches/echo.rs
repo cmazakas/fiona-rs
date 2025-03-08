@@ -31,25 +31,26 @@ fn fiona_echo() -> Result<(), String> {
     let mut ioc = make_io_context();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor =
+        fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::new(192, 168, 1, 79), 0).unwrap();
     let port = acceptor.port();
 
-    ex.clone().spawn(async move {
-        ex.register_buf_group(SERVER_BGID, 16 * 1024, 1024).unwrap();
+    ex.register_buf_group(SERVER_BGID, 16 * 1024, 1024).unwrap();
 
+    ex.clone().spawn(async move {
         for _ in 0..NR_FILES {
             let stream = acceptor.accept().await.unwrap();
             ex.clone().spawn(async move {
                 stream.set_buf_group(SERVER_BGID);
 
+                let mut message = Vec::with_capacity(13);
+
                 for _ in 0..NUM_MSGS {
                     let bufs = stream.recv().await.unwrap();
                     assert_eq!(bufs[0], "hello, world!".as_bytes());
 
-                    let message = String::from("hello, world!").into_bytes();
-
-                    let message = stream.send(message).await.unwrap();
-
+                    message.extend_from_slice(bufs[0].as_slice());
+                    message = stream.send(message).await.unwrap();
                     assert!(message.is_empty());
                 }
 
@@ -68,16 +69,18 @@ fn fiona_echo() -> Result<(), String> {
             ex.clone().spawn(async move {
                 let client = fiona::tcp::Client::new(ex2);
                 client
-                    .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                    .connect_ipv4(Ipv4Addr::new(192, 168, 1, 79), port)
                     .await
                     .unwrap();
 
                 client.set_buf_group(CLIENT_BGID);
+                let mut message = Vec::with_capacity(13);
 
                 for _ in 0..NUM_MSGS {
-                    let message = String::from("hello, world!").into_bytes();
-                    let message = client.send(message).await.unwrap();
+                    message.extend_from_slice("hello, world!".as_bytes());
+                    message = client.send(message).await.unwrap();
                     assert!(message.is_empty());
+
                     let bufs = client.recv().await.unwrap();
                     assert_eq!(bufs[0], "hello, world!".as_bytes());
                 }
@@ -116,13 +119,13 @@ fn tokio_echo() -> Result<(), String> {
             let mut join_set = tokio::task::JoinSet::new();
             for _ in 0..NR_FILES {
                 join_set.spawn(async {
-                    let addr = "127.0.0.1:8080".parse().unwrap();
+                    let addr = "192.168.1.79:8080".parse().unwrap();
 
                     let socket = tokio::net::TcpSocket::new_v4().unwrap();
                     let mut client = socket.connect(addr).await.unwrap();
 
+                    let message = String::from("hello, world!").into_bytes();
                     for _ in 0..NUM_MSGS {
-                        let message = String::from("hello, world!").into_bytes();
                         let n =
                             tokio::time::timeout(Duration::from_secs(3), client.write(&message))
                                 .await
@@ -148,7 +151,7 @@ fn tokio_echo() -> Result<(), String> {
     });
 
     rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
+        let listener = tokio::net::TcpListener::bind("192.168.1.79:8080")
             .await
             .unwrap();
 
@@ -195,5 +198,5 @@ fn tokio_echo() -> Result<(), String> {
 
 fn main() {
     utils::run_once("fiona_echo", fiona_echo).unwrap();
-    utils::run_once("tokio_echo", tokio_echo).unwrap();
+    // utils::run_once("tokio_echo", tokio_echo).unwrap();
 }
