@@ -2,7 +2,6 @@
 
 extern crate rand;
 
-use core::hash;
 use std::{
     collections::VecDeque,
     hash::{DefaultHasher, Hasher},
@@ -23,17 +22,17 @@ use liburing_rs::{
     io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_cq_advance, io_uring_cqe,
     io_uring_cqe_get_data64, io_uring_for_each_cqe, io_uring_get_sqe, io_uring_params,
     io_uring_prep_accept_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
-    io_uring_prep_recv_multishot, io_uring_prep_send, io_uring_prep_send_zc,
-    io_uring_prep_socket_direct, io_uring_queue_exit, io_uring_queue_init_params,
-    io_uring_register_files_sparse, io_uring_register_files_update, io_uring_register_ring_fd,
-    io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_buf_group,
-    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags, io_uring_submit,
-    io_uring_submit_and_wait, io_uring_unregister_buf_ring, io_uring_unregister_files,
+    io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_socket_direct,
+    io_uring_queue_exit, io_uring_queue_init_params, io_uring_register_files_sparse,
+    io_uring_register_files_update, io_uring_register_ring_fd, io_uring_setup_buf_ring,
+    io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_buf_group, io_uring_sqe_set_data,
+    io_uring_sqe_set_data64, io_uring_sqe_set_flags, io_uring_submit, io_uring_submit_and_wait,
+    io_uring_unregister_buf_ring, io_uring_unregister_files,
 };
 
 use nix::{
     errno::Errno,
-    libc::{AF_INET, IPPROTO_TCP, MSG_WAITALL, SOCK_STREAM},
+    libc::{AF_INET, IPPROTO_TCP, SOCK_STREAM},
     sys::socket::{
         AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrStorage,
         bind, listen, setsockopt, socket, sockopt,
@@ -192,7 +191,7 @@ unsafe fn prep_send_zc(ring: *mut io_uring, sockfd: i32, send_buf: &[u8]) {
     unsafe { io_uring_sqe_set_data64(sqe, make_user_data(sockfd, OpType::TcpSend)) };
 }
 
-static start_flag: AtomicBool = AtomicBool::new(false);
+static START_FLAG: AtomicBool = AtomicBool::new(false);
 
 fn client() {
     let mut ring = unsafe { mem::zeroed::<io_uring>() };
@@ -204,6 +203,13 @@ fn client() {
     {
         for _ in 0..nr_files {
             io_object_pool.push(IoObject::new());
+        }
+    }
+
+    let mut hashers = Vec::<DefaultHasher>::with_capacity(nr_files.try_into().unwrap());
+    {
+        for _ in 0..nr_files {
+            hashers.push(DefaultHasher::new());
         }
     }
 
@@ -234,12 +240,47 @@ fn client() {
         assert_eq!(ret, 1);
     }
 
+    let bgid = 23;
+    let buf_ring;
+    let num_bufs = NUM_BUFS.next_power_of_two();
+    let mut bufs = vec![ptr::null_mut::<u8>(); num_bufs as usize];
+    {
+        let mut ret = 0;
+
+        buf_ring = unsafe { io_uring_setup_buf_ring(ring, num_bufs, bgid, 0, &mut ret) };
+        if buf_ring.is_null() {
+            panic!("{:?} aka {ret}", Errno::from_raw(-ret));
+        }
+
+        for bid in 0..num_bufs {
+            let mask = unsafe { io_uring_buf_ring_mask(num_bufs) };
+            let buf = vec![0_u8; BUF_SIZE as usize];
+            assert_eq!(buf.len(), buf.capacity());
+            let (addr, len, _) = buf.into_raw_parts();
+
+            unsafe {
+                io_uring_buf_ring_add(
+                    buf_ring,
+                    addr.cast(),
+                    len.try_into().unwrap(),
+                    bid as _,
+                    mask,
+                    bid as _,
+                )
+            };
+
+            bufs[bid as usize] = addr;
+        }
+
+        unsafe { io_uring_buf_ring_advance(buf_ring, num_bufs.try_into().unwrap()) };
+    }
+
     let mut ts = __kernel_timespec {
         tv_sec: 3,
         tv_nsec: 0,
     };
 
-    while !start_flag.load(std::sync::atomic::Ordering::Relaxed) {
+    while !START_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
         std::hint::spin_loop();
     }
 
@@ -289,6 +330,8 @@ fn client() {
         }
     }
 
+    // let bytes = make_bytes();
+
     let mut num_tasks = TOTAL_CONNS;
     while num_tasks > 0 {
         unsafe { io_uring_submit_and_wait(ring, 1) };
@@ -331,16 +374,69 @@ fn client() {
 
                         if cqe_is_notif(cqe) {
                             if io_obj.sent as usize == io_obj.send_buf.len() {
-                                num_tasks -= 1;
+                                prep_recv(ring, fd, bgid);
                                 return;
                             }
 
-                            prep_send_zc(
-                                ring,
-                                fd,
-                                &io_obj.send_buf
-                                    [io_obj.sent as usize..(io_obj.sent + 16 * 1024) as usize],
+                            let begin = io_obj.sent as usize;
+                            let end = begin + 16 * 1024;
+
+                            // assert_eq!(bytes[begin..end], io_obj.send_buf[begin..end]);
+
+                            prep_send_zc(ring, fd, &io_obj.send_buf[begin..end]);
+                        }
+                    }
+                    OpType::TcpRecv => {
+                        // println!("{:?}", *cqe);
+                        assert!((*cqe).res >= 0);
+
+                        let fd = cqe_to_fd(user_data);
+
+                        let h = &mut hashers[fd as usize];
+
+                        let io_obj = &mut io_object_pool[fd as usize];
+                        io_obj.received += (*cqe).res as u64;
+
+                        // println!("received: {}", io_obj.received);
+
+                        let bid = cqe_to_bid(cqe);
+                        let mask = io_uring_buf_ring_mask(num_bufs);
+
+                        let buf_len = BUF_SIZE as usize;
+
+                        let mut num_bytes = (*cqe).res as usize;
+                        let num_bufs = (num_bytes / buf_len) + usize::from(num_bytes % buf_len > 0);
+
+                        let mut i = bid;
+                        for off in 0..num_bufs {
+                            let addr = bufs[i as usize];
+
+                            {
+                                let mut n = buf_len;
+                                if n > num_bytes {
+                                    n = num_bytes;
+                                }
+                                h.write(std::slice::from_raw_parts(addr, n));
+                                num_bytes -= n;
+                            }
+
+                            io_uring_buf_ring_add(
+                                buf_ring,
+                                addr as _,
+                                buf_len as _,
+                                i as _,
+                                mask,
+                                off as _,
                             );
+
+                            i = (i + 1) & mask as u32;
+                        }
+
+                        io_uring_buf_ring_advance(buf_ring, num_bufs as _);
+
+                        if io_obj.received == 256 * 1024 {
+                            assert_eq!(h.finish(), 5326650159322985034);
+                            num_tasks -= 1;
                         }
                     }
                     _ => {
@@ -478,7 +574,7 @@ fn server() {
         acceptor.fd = off;
     }
 
-    start_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    START_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let start = Instant::now();
 
@@ -525,12 +621,6 @@ fn server() {
 
                         // println!("received: {}", io_obj.received);
 
-                        if io_obj.received == 256 * 1024 {
-                            num_tasks -= 1;
-                            assert_eq!(h.finish(), 5326650159322985034);
-                            return;
-                        }
-
                         let bid = cqe_to_bid(cqe);
                         let mask = io_uring_buf_ring_mask(num_bufs);
 
@@ -565,7 +655,49 @@ fn server() {
                         }
 
                         io_uring_buf_ring_advance(buf_ring, num_bufs as _);
+
+                        if io_obj.received == 256 * 1024 {
+                            assert_eq!(h.finish(), 5326650159322985034);
+
+                            let bytes = make_bytes();
+
+                            let fd = cqe_to_fd(user_data);
+
+                            let io_obj = &mut io_object_pool[fd as usize];
+                            io_obj.send_buf = bytes;
+
+                            prep_send_zc(ring, fd, &io_obj.send_buf[0..16 * 1024_usize]);
+                        }
                     }
+                    OpType::TcpSend => {
+                        // println!("{:?}", *cqe);
+                        assert!((*cqe).res >= 0);
+
+                        let fd = cqe_to_fd(user_data);
+
+                        let io_obj = &mut io_object_pool[fd as usize];
+
+                        if cqe_has_more(cqe) {
+                            let sent = (*cqe).res as u64;
+                            assert_eq!(sent, 16 * 1024);
+                            io_obj.sent += sent;
+                        }
+
+                        if cqe_is_notif(cqe) {
+                            if io_obj.sent as usize == io_obj.send_buf.len() {
+                                num_tasks -= 1;
+                                return;
+                            }
+
+                            let begin = io_obj.sent as usize;
+                            let end = begin + 16 * 1024;
+
+                            // assert_eq!(bytes[begin..end], io_obj.send_buf[begin..end]);
+
+                            prep_send_zc(ring, fd, &io_obj.send_buf[begin..end]);
+                        }
+                    }
+
                     _ => {
                         unreachable!()
                     }
@@ -594,6 +726,16 @@ fn server() {
 
 #[test]
 fn second_try() {
+    {
+        let bytes = make_bytes();
+
+        let mut h = DefaultHasher::new();
+        h.write(&bytes);
+        let digest = h.finish();
+
+        assert_eq!(digest, 5326650159322985034);
+    }
+
     let t = spawn(client);
     server();
     t.join().unwrap();
