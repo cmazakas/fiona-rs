@@ -728,6 +728,12 @@ fn server() {
     unsafe { io_uring_queue_exit(ring) };
 }
 
+fn fiona_echo() {
+    let t = spawn(client);
+    server();
+    t.join().unwrap();
+}
+
 #[test]
 fn second_try() {
     {
@@ -740,7 +746,5 @@ fn second_try() {
         assert_eq!(digest, 5326650159322985034);
     }
 
-    let t = spawn(client);
-    server();
-    t.join().unwrap();
+    fiona_echo();
 }
