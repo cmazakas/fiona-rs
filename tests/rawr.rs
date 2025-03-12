@@ -21,13 +21,13 @@ use liburing_rs::{
     IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring, io_uring_buf_ring_add,
     io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_cq_advance, io_uring_cqe,
     io_uring_cqe_get_data64, io_uring_for_each_cqe, io_uring_get_sqe, io_uring_params,
-    io_uring_prep_accept_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
-    io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_socket_direct,
-    io_uring_queue_exit, io_uring_queue_init_params, io_uring_register_files_sparse,
-    io_uring_register_files_update, io_uring_register_ring_fd, io_uring_setup_buf_ring,
-    io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_buf_group, io_uring_sqe_set_data,
-    io_uring_sqe_set_data64, io_uring_sqe_set_flags, io_uring_submit, io_uring_submit_and_wait,
-    io_uring_unregister_buf_ring, io_uring_unregister_files,
+    io_uring_prep_accept_direct, io_uring_prep_close_direct, io_uring_prep_connect,
+    io_uring_prep_link_timeout, io_uring_prep_recv_multishot, io_uring_prep_send_zc,
+    io_uring_prep_socket_direct, io_uring_queue_exit, io_uring_queue_init_params,
+    io_uring_register_files_sparse, io_uring_register_files_update, io_uring_register_ring_fd,
+    io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_buf_group,
+    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags, io_uring_submit,
+    io_uring_submit_and_wait, io_uring_unregister_buf_ring,
 };
 
 use nix::{
@@ -77,6 +77,7 @@ enum OpType {
     TcpConnect = 0x0003,
     Socket = 0x0004,
     TcpSend = 0x0005,
+    Close = 0x0006,
     Unknown = 0xffff,
 }
 
@@ -118,6 +119,7 @@ fn cqe_to_op_type(user_data: u64) -> OpType {
         0x0003 => OpType::TcpConnect,
         0x0004 => OpType::Socket,
         0x0005 => OpType::TcpSend,
+        0x0006 => OpType::Close,
         _ => OpType::Unknown,
     }
 }
@@ -189,6 +191,12 @@ unsafe fn prep_send_zc(ring: *mut io_uring, sockfd: i32, send_buf: &[u8]) {
     unsafe { io_uring_prep_send_zc(sqe, sockfd, buf, len, 0, 0) };
     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) }
     unsafe { io_uring_sqe_set_data64(sqe, make_user_data(sockfd, OpType::TcpSend)) };
+}
+
+unsafe fn prep_close(ring: *mut io_uring, fd: i32) {
+    let sqe = unsafe { get_sqe(ring) };
+    unsafe { io_uring_prep_close_direct(sqe, fd as _) };
+    unsafe { io_uring_sqe_set_data64(sqe, make_user_data(fd, OpType::Close)) };
 }
 
 static START_FLAG: AtomicBool = AtomicBool::new(false);
@@ -356,7 +364,6 @@ fn client() {
                         io_obj.send_buf = bytes;
 
                         prep_send_zc(ring, fd, &io_obj.send_buf[0..16 * 1024_usize]);
-                        // num_tasks -= 1;
                     }
                     OpType::TcpSend => {
                         // println!("{:?}", *cqe);
@@ -436,8 +443,11 @@ fn client() {
 
                         if io_obj.received == 256 * 1024 {
                             assert_eq!(h.finish(), 5326650159322985034);
-                            num_tasks -= 1;
+                            prep_close(ring, fd);
                         }
+                    }
+                    OpType::Close => {
+                        num_tasks -= 1;
                     }
                     _ => {
                         unreachable!()
@@ -450,11 +460,6 @@ fn client() {
     }
 
     println!("client took: {:?}", start.elapsed());
-
-    std::thread::sleep(Duration::from_secs(3));
-
-    let ret = unsafe { io_uring_unregister_files(ring) };
-    assert_eq!(ret, 0);
 
     unsafe { io_uring_queue_exit(ring) };
 }
@@ -685,7 +690,7 @@ fn server() {
 
                         if cqe_is_notif(cqe) {
                             if io_obj.sent as usize == io_obj.send_buf.len() {
-                                num_tasks -= 1;
+                                prep_close(ring, fd);
                                 return;
                             }
 
@@ -697,7 +702,9 @@ fn server() {
                             prep_send_zc(ring, fd, &io_obj.send_buf[begin..end]);
                         }
                     }
-
+                    OpType::Close => {
+                        num_tasks -= 1;
+                    }
                     _ => {
                         unreachable!()
                     }
@@ -716,9 +723,6 @@ fn server() {
     }
 
     let ret = unsafe { io_uring_unregister_buf_ring(ring, bgid) };
-    assert_eq!(ret, 0);
-
-    let ret = unsafe { io_uring_unregister_files(ring) };
     assert_eq!(ret, 0);
 
     unsafe { io_uring_queue_exit(ring) };
