@@ -1,44 +1,59 @@
 #![feature(vec_into_raw_parts)]
 
+extern crate rand;
+
+use core::hash;
 use std::{
     collections::VecDeque,
+    hash::{DefaultHasher, Hasher},
     mem,
     net::{Ipv4Addr, SocketAddrV4},
     os::fd::AsRawFd,
     panic, ptr,
+    sync::atomic::AtomicBool,
     thread::spawn,
     time::{Duration, Instant},
 };
 
 use liburing_rs::{
-    __kernel_timespec, IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_SETUP_CQSIZE,
+    __kernel_timespec, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF,
+    IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_SETUP_CQSIZE,
     IORING_SETUP_DEFER_TASKRUN, IORING_SETUP_SINGLE_ISSUER, IOSQE_BUFFER_SELECT,
     IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring, io_uring_buf_ring_add,
-    io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_cq_advance,
+    io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_cq_advance, io_uring_cqe,
     io_uring_cqe_get_data64, io_uring_for_each_cqe, io_uring_get_sqe, io_uring_params,
     io_uring_prep_accept_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
-    io_uring_prep_recv_multishot, io_uring_prep_socket_direct, io_uring_queue_exit,
-    io_uring_queue_init_params, io_uring_register_files_sparse, io_uring_register_files_update,
-    io_uring_register_ring_fd, io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe,
-    io_uring_sqe_set_buf_group, io_uring_sqe_set_data, io_uring_sqe_set_data64,
-    io_uring_sqe_set_flags, io_uring_submit, io_uring_submit_and_wait, io_uring_unregister_files,
+    io_uring_prep_recv_multishot, io_uring_prep_send, io_uring_prep_send_zc,
+    io_uring_prep_socket_direct, io_uring_queue_exit, io_uring_queue_init_params,
+    io_uring_register_files_sparse, io_uring_register_files_update, io_uring_register_ring_fd,
+    io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_buf_group,
+    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags, io_uring_submit,
+    io_uring_submit_and_wait, io_uring_unregister_buf_ring, io_uring_unregister_files,
 };
 
 use nix::{
     errno::Errno,
-    libc::{AF_INET, IPPROTO_TCP, SOCK_STREAM},
+    libc::{AF_INET, IPPROTO_TCP, MSG_WAITALL, SOCK_STREAM},
     sys::socket::{
         AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrStorage,
         bind, listen, setsockopt, socket, sockopt,
     },
 };
+use rand::SeedableRng;
 
 const PORT: u16 = 8081;
 const SQ_ENTRIES: u32 = 256;
 const CQ_ENTRIES: u32 = 32 * 1024;
 const NUM_BUFS: u32 = 16 * 1024;
-const BUF_SIZE: u32 = 1024;
+const BUF_SIZE: u32 = 4 * 1024;
 const TOTAL_CONNS: u32 = 512;
+
+fn make_bytes() -> Vec<u8> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1234);
+    let mut bytes = vec![0_u8; 256 * 1024];
+    rand::RngCore::fill_bytes(&mut rng, &mut bytes);
+    bytes
+}
 
 unsafe fn get_sqe(ring: *mut io_uring) -> *mut io_uring_sqe {
     let mut sqe = unsafe { io_uring_get_sqe(ring) };
@@ -56,19 +71,31 @@ unsafe fn reserve_sqes(ring: *mut io_uring, n: u32) {
 }
 
 #[repr(u16)]
+#[derive(Clone, Copy)]
 enum OpType {
     TcpAccept = 0x0001,
     TcpRecv = 0x0002,
+    TcpConnect = 0x0003,
+    Socket = 0x0004,
+    TcpSend = 0x0005,
     Unknown = 0xffff,
 }
 
 struct IoObject {
     accept_fd: i32,
+    send_buf: Vec<u8>,
+    sent: u64,
+    received: u64,
 }
 
 impl IoObject {
     fn new() -> IoObject {
-        IoObject { accept_fd: -1 }
+        IoObject {
+            accept_fd: -1,
+            send_buf: Vec::new(),
+            sent: 0,
+            received: 0,
+        }
     }
 }
 
@@ -89,8 +116,23 @@ fn cqe_to_op_type(user_data: u64) -> OpType {
     match ud {
         0x0001 => OpType::TcpAccept,
         0x0002 => OpType::TcpRecv,
+        0x0003 => OpType::TcpConnect,
+        0x0004 => OpType::Socket,
+        0x0005 => OpType::TcpSend,
         _ => OpType::Unknown,
     }
+}
+
+fn cqe_to_bid(cqe: *mut io_uring_cqe) -> u32 {
+    unsafe { (*cqe).flags >> IORING_CQE_BUFFER_SHIFT }
+}
+
+unsafe fn cqe_has_more(cqe: *mut io_uring_cqe) -> bool {
+    unsafe { (*cqe).flags & IORING_CQE_F_MORE > 0 }
+}
+
+unsafe fn cqe_is_notif(cqe: *mut io_uring_cqe) -> bool {
+    unsafe { (*cqe).flags & IORING_CQE_F_NOTIF > 0 }
 }
 
 #[derive(Clone, Copy)]
@@ -128,7 +170,6 @@ unsafe fn prep_accept(
 
 unsafe fn prep_recv(ring: *mut io_uring, sockfd: i32, bgid: i32) {
     let sqe = unsafe { get_sqe(ring) };
-    let bgid = -1;
 
     unsafe { io_uring_prep_recv_multishot(sqe, sockfd, ptr::null_mut(), 0, 0) };
     unsafe { io_uring_sqe_set_buf_group(sqe, bgid) };
@@ -141,18 +182,35 @@ unsafe fn prep_recv(ring: *mut io_uring, sockfd: i32, bgid: i32) {
     unsafe { (*sqe).ioprio |= ioprio };
 }
 
-fn client() {
-    let start = Instant::now();
+unsafe fn prep_send_zc(ring: *mut io_uring, sockfd: i32, send_buf: &[u8]) {
+    let buf = send_buf.as_ptr().cast();
+    let len = send_buf.len();
 
+    let sqe = unsafe { get_sqe(ring) };
+    unsafe { io_uring_prep_send_zc(sqe, sockfd, buf, len, 0, 0) };
+    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) }
+    unsafe { io_uring_sqe_set_data64(sqe, make_user_data(sockfd, OpType::TcpSend)) };
+}
+
+static start_flag: AtomicBool = AtomicBool::new(false);
+
+fn client() {
     let mut ring = unsafe { mem::zeroed::<io_uring>() };
     let ring = &raw mut ring;
 
     let nr_files = TOTAL_CONNS + 1;
 
-    let mut fd_pool = VecDeque::with_capacity(nr_files.try_into().unwrap());
+    let mut io_object_pool = Vec::<IoObject>::with_capacity(nr_files.try_into().unwrap());
+    {
+        for _ in 0..nr_files {
+            io_object_pool.push(IoObject::new());
+        }
+    }
+
+    let mut fd_pool = VecDeque::<i32>::with_capacity(nr_files.try_into().unwrap());
     {
         for i in 0..nr_files {
-            fd_pool.push_back(i);
+            fd_pool.push_back(i as _);
         }
     }
 
@@ -181,6 +239,12 @@ fn client() {
         tv_nsec: 0,
     };
 
+    while !start_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        std::hint::spin_loop();
+    }
+
+    let start = Instant::now();
+
     let ipv4_addr = Ipv4Addr::LOCALHOST;
     let port = PORT;
     let addr = SocketAddrV4::new(ipv4_addr, port);
@@ -193,9 +257,11 @@ fn client() {
 
         {
             let sqe = unsafe { get_sqe(ring) };
-            unsafe { io_uring_prep_socket_direct(sqe, AF_INET, SOCK_STREAM, IPPROTO_TCP, fd, 0) };
+            unsafe {
+                io_uring_prep_socket_direct(sqe, AF_INET, SOCK_STREAM, IPPROTO_TCP, fd as _, 0)
+            };
             unsafe { io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK) }
-            unsafe { io_uring_sqe_set_data64(sqe, 0x02) };
+            unsafe { io_uring_sqe_set_data64(sqe, make_user_data(fd, OpType::Socket)) };
         }
 
         {
@@ -205,13 +271,13 @@ fn client() {
             unsafe {
                 io_uring_prep_connect(
                     sqe,
-                    fd.try_into().unwrap(),
+                    fd,
                     std::ptr::from_ref(&addr).cast(),
                     addrlen.try_into().unwrap(),
                 );
             }
             unsafe { io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK | IOSQE_FIXED_FILE) };
-            unsafe { io_uring_sqe_set_data64(sqe, 0x0102) };
+            unsafe { io_uring_sqe_set_data64(sqe, make_user_data(fd, OpType::TcpConnect)) };
         }
 
         {
@@ -234,13 +300,52 @@ fn client() {
                 i += 1;
 
                 let user_data = io_uring_cqe_get_data64(cqe);
-                if user_data == 0x0102 {
-                    // println!("completed tcp connect() call ({num_tasks})");
-                    num_tasks -= 1;
-                }
 
-                if user_data == 0x02 {
-                    // println!("created tcp socket");
+                let op_type = cqe_to_op_type(user_data);
+                match op_type {
+                    OpType::Socket => {}
+                    OpType::TcpConnect => {
+                        let bytes = make_bytes();
+
+                        let fd = cqe_to_fd(user_data);
+
+                        let io_obj = &mut io_object_pool[fd as usize];
+                        io_obj.send_buf = bytes;
+
+                        prep_send_zc(ring, fd, &io_obj.send_buf[0..16 * 1024_usize]);
+                        // num_tasks -= 1;
+                    }
+                    OpType::TcpSend => {
+                        // println!("{:?}", *cqe);
+                        assert!((*cqe).res >= 0);
+
+                        let fd = cqe_to_fd(user_data);
+
+                        let io_obj = &mut io_object_pool[fd as usize];
+
+                        if cqe_has_more(cqe) {
+                            let sent = (*cqe).res as u64;
+                            assert_eq!(sent, 16 * 1024);
+                            io_obj.sent += sent;
+                        }
+
+                        if cqe_is_notif(cqe) {
+                            if io_obj.sent as usize == io_obj.send_buf.len() {
+                                num_tasks -= 1;
+                                return;
+                            }
+
+                            prep_send_zc(
+                                ring,
+                                fd,
+                                &io_obj.send_buf
+                                    [io_obj.sent as usize..(io_obj.sent + 16 * 1024) as usize],
+                            );
+                        }
+                    }
+                    _ => {
+                        unreachable!()
+                    }
                 }
             })
         };
@@ -278,6 +383,13 @@ fn server() {
         }
     }
 
+    let mut hashers = Vec::<DefaultHasher>::with_capacity(nr_files.try_into().unwrap());
+    {
+        for _ in 0..nr_files {
+            hashers.push(DefaultHasher::new());
+        }
+    }
+
     {
         let cq_entries = CQ_ENTRIES;
         let sq_entries = SQ_ENTRIES;
@@ -300,9 +412,10 @@ fn server() {
 
     let bgid = 23;
     let buf_ring;
+    let num_bufs = NUM_BUFS.next_power_of_two();
+    let mut bufs = vec![ptr::null_mut::<u8>(); num_bufs as usize];
     {
         let mut ret = 0;
-        let num_bufs = NUM_BUFS.next_power_of_two();
 
         buf_ring = unsafe { io_uring_setup_buf_ring(ring, num_bufs, bgid, 0, &mut ret) };
         if buf_ring.is_null() {
@@ -312,6 +425,7 @@ fn server() {
         for bid in 0..num_bufs {
             let mask = unsafe { io_uring_buf_ring_mask(num_bufs) };
             let buf = vec![0_u8; BUF_SIZE as usize];
+            assert_eq!(buf.len(), buf.capacity());
             let (addr, len, _) = buf.into_raw_parts();
 
             unsafe {
@@ -324,6 +438,8 @@ fn server() {
                     bid as _,
                 )
             };
+
+            bufs[bid as usize] = addr;
         }
 
         unsafe { io_uring_buf_ring_advance(buf_ring, num_bufs.try_into().unwrap()) };
@@ -362,6 +478,8 @@ fn server() {
         acceptor.fd = off;
     }
 
+    start_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+
     let start = Instant::now();
 
     unsafe { prep_accept(ring, acceptor, &mut fd_pool, &mut io_object_pool) };
@@ -383,17 +501,12 @@ fn server() {
 
                 match op_type {
                     OpType::TcpAccept => {
-                        num_tasks -= 1;
-
                         assert_eq!((*cqe).res, 0);
 
                         num_accepted += 1;
+
                         let io_obj = &mut io_object_pool[fd as usize];
                         let sockfd = io_obj.accept_fd;
-
-                        // println!("accepted tcp connection ({num_accepted})");
-                        // println!("{:?}", *cqe);
-                        // println!("accepted new connection on: {}", io_obj.accept_fd);
 
                         if num_accepted < TOTAL_CONNS {
                             prep_accept(ring, acceptor, &mut fd_pool, &mut io_object_pool);
@@ -402,9 +515,58 @@ fn server() {
                         prep_recv(ring, sockfd, bgid);
                     }
                     OpType::TcpRecv => {
-                        unimplemented!("must implement tcp recv handling")
+                        // println!("{:?}", *cqe);
+                        assert!((*cqe).res >= 0);
+
+                        let h = &mut hashers[fd as usize];
+
+                        let io_obj = &mut io_object_pool[fd as usize];
+                        io_obj.received += (*cqe).res as u64;
+
+                        // println!("received: {}", io_obj.received);
+
+                        if io_obj.received == 256 * 1024 {
+                            num_tasks -= 1;
+                            assert_eq!(h.finish(), 5326650159322985034);
+                            return;
+                        }
+
+                        let bid = cqe_to_bid(cqe);
+                        let mask = io_uring_buf_ring_mask(num_bufs);
+
+                        let buf_len = BUF_SIZE as usize;
+
+                        let mut num_bytes = (*cqe).res as usize;
+                        let num_bufs = (num_bytes / buf_len) + usize::from(num_bytes % buf_len > 0);
+
+                        let mut i = bid;
+                        for off in 0..num_bufs {
+                            let addr = bufs[i as usize];
+
+                            {
+                                let mut n = buf_len;
+                                if n > num_bytes {
+                                    n = num_bytes;
+                                }
+                                h.write(std::slice::from_raw_parts(addr, n));
+                                num_bytes -= n;
+                            }
+
+                            io_uring_buf_ring_add(
+                                buf_ring,
+                                addr as _,
+                                buf_len as _,
+                                i as _,
+                                mask,
+                                off as _,
+                            );
+
+                            i = (i + 1) & mask as u32;
+                        }
+
+                        io_uring_buf_ring_advance(buf_ring, num_bufs as _);
                     }
-                    OpType::Unknown => {
+                    _ => {
                         unreachable!()
                     }
                 }
@@ -415,6 +577,14 @@ fn server() {
     }
 
     println!("server took: {:?}", start.elapsed());
+
+    for buf in bufs {
+        let buf_size = BUF_SIZE as usize;
+        drop(unsafe { Vec::from_raw_parts(buf, buf_size, buf_size) });
+    }
+
+    let ret = unsafe { io_uring_unregister_buf_ring(ring, bgid) };
+    assert_eq!(ret, 0);
 
     let ret = unsafe { io_uring_unregister_files(ring) };
     assert_eq!(ret, 0);
