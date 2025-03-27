@@ -966,6 +966,7 @@ fn connect_select_ready_always() {
 
     let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
+    let _ = port;
 
     let n = ioc.run();
     assert!(n > 0);

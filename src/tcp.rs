@@ -23,7 +23,7 @@ use nix::{
     sys::{
         socket::{
             AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrStorage,
-            bind, getsockname, listen, socket,
+            bind, getsockname, listen, setsockopt, socket, sockopt::ReuseAddr,
         },
         time::TimeSpec,
     },
@@ -124,6 +124,8 @@ impl Acceptor {
             SockFlag::empty(),
             SockProtocol::Tcp,
         )?;
+
+        setsockopt(&socket, ReuseAddr, &true).unwrap();
 
         let addr = SocketAddrV4::new(ipv4_addr, port);
         let addr: SockaddrIn = addr.into();
