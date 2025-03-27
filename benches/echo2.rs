@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(static_mut_refs)]
 
 extern crate clap;
 extern crate rand;
@@ -17,7 +18,7 @@ use clap::Parser;
 use rand::SeedableRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const NR_FILES: u32 = 10_000;
+const NR_FILES: u32 = 12_500;
 const BUF_SIZE: usize = 256 * 1024;
 const RECV_BUF_SIZE: usize = 2 * 4096;
 
@@ -31,6 +32,8 @@ fn make_bytes() -> Vec<u8> {
 }
 
 fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
+    static mut TIMINGS: Vec<Duration> = Vec::new();
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -91,12 +94,25 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
                 assert_eq!(digest, 5326650159322985034);
 
                 unsafe { DURATION += start.elapsed() };
+                unsafe {
+                    TIMINGS.push(start.elapsed());
+                }
             });
         }
         join_set.join_all().await;
         let avg_dur = unsafe { DURATION / NR_FILES };
         println!("average client duration: {avg_dur:?}");
         println!("tokio client loop took: {:?}", start.elapsed());
+
+        let mut outliers = 0;
+        unsafe {
+            for timing in &TIMINGS {
+                if *timing >= 2 * avg_dur {
+                    outliers += 1;
+                }
+            }
+        }
+        println!("total outliers: {outliers}");
     });
 
     Ok(())
@@ -189,6 +205,8 @@ fn make_io_context() -> fiona::IoContext {
 
 fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
     unsafe { DURATION = Duration::new(0, 0) };
+    static mut TIMINGS: Vec<Duration> = Vec::new();
+
     let start = Instant::now();
 
     let mut ioc = make_io_context();
@@ -235,6 +253,9 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
             assert_eq!(digest, 5326650159322985034);
 
             unsafe { DURATION += start.elapsed() };
+            unsafe {
+                TIMINGS.push(start.elapsed());
+            }
         });
     }
 
@@ -242,6 +263,16 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
     let avg_dur = unsafe { DURATION / NR_FILES };
     println!("average client duration: {avg_dur:?}");
     println!("fiona client loop took: {:?}", start.elapsed());
+
+    let mut outliers = 0;
+    unsafe {
+        for timing in &TIMINGS {
+            if *timing >= 2 * avg_dur {
+                outliers += 1;
+            }
+        }
+    }
+    println!("total outliers: {outliers}");
 
     Ok(())
 }
