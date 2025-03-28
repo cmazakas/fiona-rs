@@ -204,13 +204,11 @@ impl Drop for Task {
 
             let offset = align_up(size_of::<TaskInnerHeader>(), align);
 
-            let layout = Layout::from_size_align(
+            Layout::from_size_align(
                 align_up(offset + self.inner().future_vtable.size_of(), align),
                 align,
             )
-            .unwrap();
-
-            layout
+            .unwrap()
         };
 
         unsafe {
@@ -317,13 +315,11 @@ impl Drop for Weak {
 
             let offset = align_up(size_of::<TaskInnerHeader>(), align);
 
-            let layout = Layout::from_size_align(
+            Layout::from_size_align(
                 align_up(offset + self.inner().future_vtable.size_of(), align),
                 align,
             )
-            .unwrap();
-
-            layout
+            .unwrap()
         };
 
         unsafe {

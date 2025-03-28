@@ -15,10 +15,10 @@ use std::{
 };
 
 use clap::Parser;
+use nix::{errno::Errno, libc::ENOBUFS};
 use rand::SeedableRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const NR_FILES: u32 = 12_500;
 const BUF_SIZE: usize = 256 * 1024;
 const RECV_BUF_SIZE: usize = 2 * 4096;
 
@@ -31,7 +31,7 @@ fn make_bytes() -> Vec<u8> {
     bytes
 }
 
-fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
+fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String> {
     static mut TIMINGS: Vec<Duration> = Vec::new();
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -45,7 +45,7 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
         let start = Instant::now();
         let mut join_set = tokio::task::JoinSet::new();
 
-        for _ in 0..NR_FILES {
+        for _ in 0..nr_files {
             join_set.spawn(async move {
                 let start = Instant::now();
 
@@ -100,9 +100,12 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
             });
         }
         join_set.join_all().await;
-        let avg_dur = unsafe { DURATION / NR_FILES };
-        println!("average client duration: {avg_dur:?}");
-        println!("tokio client loop took: {:?}", start.elapsed());
+        let avg_dur = unsafe { DURATION / nr_files };
+        println!("tokio average client duration: {avg_dur:?}");
+        println!(
+            "tokio client loop took: {:?} for {nr_files} connections",
+            start.elapsed()
+        );
 
         let mut outliers = 0;
         unsafe {
@@ -118,7 +121,7 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
     Ok(())
 }
 
-fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
+fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -138,7 +141,7 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
 
         let mut join_set = tokio::task::JoinSet::new();
 
-        for _ in 0..NR_FILES {
+        for _ in 0..nr_files {
             let mut stream = listener.accept().await.unwrap().0;
 
             join_set.spawn(async move {
@@ -187,9 +190,12 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
         }
         join_set.join_all().await;
 
-        let avg_dur = unsafe { DURATION / NR_FILES };
+        let avg_dur = unsafe { DURATION / nr_files };
         println!("average server duration: {avg_dur:?}");
-        println!("tokio accept loop took: {:?}", start.elapsed());
+        println!(
+            "tokio accept loop took: {:?} for {nr_files} connections",
+            start.elapsed()
+        );
     });
 
     Ok(())
@@ -197,23 +203,23 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
 
 const CQ_ENTRIES: u32 = 64 * 1024;
 
-fn make_io_context() -> fiona::IoContext {
+fn make_io_context(nr_files: u32) -> fiona::IoContext {
     let params = &fiona::IoContextParams {
         sq_entries: 256,
         cq_entries: CQ_ENTRIES,
-        nr_files: 2 * NR_FILES,
+        nr_files: 2 * nr_files,
     };
 
     fiona::IoContext::with_params(params)
 }
 
-fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
+fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String> {
     unsafe { DURATION = Duration::new(0, 0) };
     static mut TIMINGS: Vec<Duration> = Vec::new();
 
     let start = Instant::now();
 
-    let mut ioc = make_io_context();
+    let mut ioc = make_io_context(nr_files);
     let ex = ioc.get_executor();
 
     const CLIENT_BGID: u16 = 72;
@@ -221,7 +227,7 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
     ex.register_buf_group(CLIENT_BGID, 32 * 1024, RECV_BUF_SIZE)
         .unwrap();
 
-    for _ in 0..NR_FILES {
+    for _ in 0..nr_files {
         let ex2 = ex.clone();
         ex.clone().spawn(async move {
             let start = Instant::now();
@@ -246,11 +252,22 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
             }
 
             while total_received < BUF_SIZE {
-                let bufs = client.recv().await.unwrap();
-
-                for buf in &bufs {
-                    h.write(buf);
-                    total_received += buf.len();
+                let mbufs = client.recv().await;
+                match mbufs {
+                    Ok(bufs) => {
+                        for buf in &bufs {
+                            if buf.is_empty() {
+                                assert_eq!(total_received, BUF_SIZE);
+                            } else {
+                                h.write(buf);
+                                total_received += buf.len();
+                            }
+                        }
+                    }
+                    Err(x) if x == Errno::from_raw(ENOBUFS) => {
+                        continue;
+                    }
+                    Err(err) => panic!("{err:?}"),
                 }
             }
 
@@ -265,9 +282,12 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
     }
 
     let _n = ioc.run();
-    let avg_dur = unsafe { DURATION / NR_FILES };
-    println!("average client duration: {avg_dur:?}");
-    println!("fiona client loop took: {:?}", start.elapsed());
+    let avg_dur = unsafe { DURATION / nr_files };
+    println!("fiona average client duration: {avg_dur:?}");
+    println!(
+        "fiona client loop took: {:?} for {nr_files} connections",
+        start.elapsed()
+    );
 
     let mut outliers = 0;
     unsafe {
@@ -282,13 +302,13 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
     Ok(())
 }
 
-fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
+fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String> {
     unsafe { DURATION = Duration::new(0, 0) };
     let start = Instant::now();
 
     const SERVER_BGID: u16 = 27;
 
-    let mut ioc = make_io_context();
+    let mut ioc = make_io_context(nr_files);
     let ex = ioc.get_executor();
 
     let acceptor = fiona::tcp::Acceptor::new(ex.clone(), ipv4_addr, port).unwrap();
@@ -297,7 +317,7 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
         .unwrap();
 
     ex.clone().spawn(async move {
-        for _ in 0..NR_FILES {
+        for _ in 0..nr_files {
             let stream = acceptor.accept().await.unwrap();
             ex.clone().spawn(async move {
                 let start = Instant::now();
@@ -312,11 +332,21 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
                 let mut h = DefaultHasher::new();
 
                 while total_received < BUF_SIZE {
-                    let bufs = stream.recv().await.unwrap();
-
-                    for buf in &bufs {
-                        h.write(buf);
-                        total_received += buf.len();
+                    match stream.recv().await {
+                        Ok(bufs) => {
+                            for buf in &bufs {
+                                if buf.is_empty() {
+                                    assert_eq!(total_received, BUF_SIZE);
+                                } else {
+                                    h.write(buf);
+                                    total_received += buf.len();
+                                }
+                            }
+                        }
+                        Err(x) if x == Errno::from_raw(ENOBUFS) => {
+                            continue;
+                        }
+                        Err(err) => panic!("{err:?}"),
                     }
                 }
 
@@ -337,9 +367,12 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
 
     let _n = ioc.run();
 
-    let avg_dur = unsafe { DURATION / NR_FILES };
-    println!("average server duration: {avg_dur:?}");
-    println!("fiona accept loop took: {:?}", start.elapsed());
+    let avg_dur = unsafe { DURATION / nr_files };
+    println!("fiona average server duration: {avg_dur:?}");
+    println!(
+        "fiona accept loop took: {:?} for {nr_files} connections",
+        start.elapsed()
+    );
 
     Ok(())
 }
@@ -370,6 +403,9 @@ struct CliArgs {
 
     #[arg(long, conflicts_with = "server")]
     client: bool,
+
+    #[arg(long, default_value_t = 5000)]
+    nr_files: u32,
 }
 
 fn main() {
@@ -389,26 +425,26 @@ fn main() {
     if args.tokio {
         if args.server {
             utils::run_once("tokio echo2 server", || {
-                black_box(tokio_echo_server(args.ipv4_addr, args.port))
+                black_box(tokio_echo_server(args.ipv4_addr, args.port, args.nr_files))
             })
             .unwrap();
         } else {
             assert!(args.client);
             utils::run_once("tokio echo2 client", || {
-                black_box(tokio_echo_client(args.ipv4_addr, args.port))
+                black_box(tokio_echo_client(args.ipv4_addr, args.port, args.nr_files))
             })
             .unwrap();
         }
     } else if args.fiona {
         if args.server {
             utils::run_once("fiona echo2 server", || {
-                black_box(fiona_echo_server(args.ipv4_addr, args.port))
+                black_box(fiona_echo_server(args.ipv4_addr, args.port, args.nr_files))
             })
             .unwrap();
         } else {
             assert!(args.client);
             utils::run_once("fiona echo2 client", || {
-                black_box(fiona_echo_client(args.ipv4_addr, args.port))
+                black_box(fiona_echo_client(args.ipv4_addr, args.port, args.nr_files))
             })
             .unwrap();
         }
