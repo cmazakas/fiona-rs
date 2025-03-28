@@ -32,11 +32,3 @@ harness = false
 [[bench]]
 name = "echo2"
 harness = false
-
-[[bench]]
-name = "echo2_server"
-harness = false
-
-[[bench]]
-name = "echo2_client"
-harness = false

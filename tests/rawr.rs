@@ -32,7 +32,7 @@ use liburing_rs::{
 
 use nix::{
     errno::Errno,
-    libc::{AF_INET, IPPROTO_TCP, SOCK_STREAM},
+    libc::{AF_INET, ENOBUFS, IPPROTO_TCP, SOCK_STREAM},
     sys::socket::{
         AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrStorage,
         bind, listen, setsockopt, socket, sockopt,
@@ -395,9 +395,13 @@ fn client() {
                     }
                     OpType::TcpRecv => {
                         // println!("{:?}", *cqe);
-                        assert!((*cqe).res >= 0);
-
                         let fd = cqe_to_fd(user_data);
+
+                        if (*cqe).res == -ENOBUFS {
+                            prep_recv(ring, fd, bgid);
+                            return;
+                        }
+                        assert!((*cqe).res >= 0);
 
                         let h = &mut hashers[fd as usize];
 
@@ -460,6 +464,13 @@ fn client() {
     }
 
     println!("client took: {:?}", start.elapsed());
+
+    std::thread::sleep(Duration::from_secs(3));
+
+    for buf in bufs {
+        let buf_size = BUF_SIZE as usize;
+        drop(unsafe { Vec::from_raw_parts(buf, buf_size, buf_size) });
+    }
 
     unsafe { io_uring_queue_exit(ring) };
 }
@@ -617,7 +628,14 @@ fn server() {
                     }
                     OpType::TcpRecv => {
                         // println!("{:?}", *cqe);
-                        assert!((*cqe).res >= 0);
+                        if (*cqe).res == -ENOBUFS {
+                            prep_recv(ring, fd, bgid);
+                            return;
+                        }
+
+                        if (*cqe).res < 0 {
+                            panic!("recv failed with: {}", Errno::from_raw(-(*cqe).res));
+                        }
 
                         let h = &mut hashers[fd as usize];
 

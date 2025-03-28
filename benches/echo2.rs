@@ -69,7 +69,7 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
                     send_buf.extend_from_slice(chunk);
                     while !send_buf.is_empty() {
                         let n =
-                            tokio::time::timeout(Duration::from_secs(3), client.write(&send_buf))
+                            tokio::time::timeout(Duration::from_secs(120), client.write(&send_buf))
                                 .await
                                 .unwrap()
                                 .unwrap();
@@ -81,7 +81,7 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
                 }
 
                 while total_received < BUF_SIZE {
-                    let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
+                    let n = tokio::time::timeout(Duration::from_secs(120), client.read(&mut buf))
                         .await
                         .unwrap()
                         .unwrap();
@@ -128,9 +128,13 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
         unsafe { DURATION = Duration::new(0, 0) };
         let start = Instant::now();
 
-        let listener = tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(ipv4_addr), port))
-            .await
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.reuseaddr().unwrap();
+        socket
+            .bind(SocketAddr::new(IpAddr::V4(ipv4_addr), port))
             .unwrap();
+
+        let listener = socket.listen(2048).unwrap();
 
         let mut join_set = tokio::task::JoinSet::new();
 
@@ -151,7 +155,7 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
                 let mut send_buf = Vec::<u8>::with_capacity(16 * 1024);
 
                 while total_received < BUF_SIZE {
-                    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+                    let n = tokio::time::timeout(Duration::from_secs(120), stream.read(&mut buf))
                         .await
                         .unwrap()
                         .unwrap();
@@ -167,7 +171,7 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
                     send_buf.extend_from_slice(chunk);
                     while !send_buf.is_empty() {
                         let n =
-                            tokio::time::timeout(Duration::from_secs(3), stream.write(&send_buf))
+                            tokio::time::timeout(Duration::from_secs(120), stream.write(&send_buf))
                                 .await
                                 .unwrap()
                                 .unwrap();
@@ -229,6 +233,7 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
             let mut h = DefaultHasher::new();
 
             let client = fiona::tcp::Client::new(ex2);
+            client.set_timeout(Duration::from_secs(120));
             client.connect_ipv4(ipv4_addr, port).await.unwrap();
 
             client.set_buf_group(CLIENT_BGID);
@@ -297,6 +302,7 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16) -> Result<(), String> {
             ex.clone().spawn(async move {
                 let start = Instant::now();
 
+                stream.set_timeout(Duration::from_secs(120));
                 stream.set_buf_group(SERVER_BGID);
 
                 let bytes = make_bytes();

@@ -131,7 +131,7 @@ impl Acceptor {
         let addr: SockaddrIn = addr.into();
 
         bind(socket.as_raw_fd(), &addr)?;
-        listen(&socket, Backlog::new(1024).unwrap())?;
+        listen(&socket, Backlog::new(2048).unwrap())?;
 
         let ring = ex.ring();
         let fd = socket.as_raw_fd();

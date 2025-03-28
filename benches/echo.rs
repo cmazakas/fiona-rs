@@ -198,5 +198,5 @@ fn tokio_echo() -> Result<(), String> {
 
 fn main() {
     utils::run_once("fiona_echo", fiona_echo).unwrap();
-    // utils::run_once("tokio_echo", tokio_echo).unwrap();
+    utils::run_once("tokio_echo", tokio_echo).unwrap();
 }
