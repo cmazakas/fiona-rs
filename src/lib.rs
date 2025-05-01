@@ -1368,7 +1368,7 @@ impl Executor {
 
         let mut bufs = Vec::<*mut u8>::with_capacity(num_bufs.try_into().unwrap());
 
-        let mask = unsafe { io_uring_buf_ring_mask(num_bufs) };
+        let mask = io_uring_buf_ring_mask(num_bufs);
         for bid in 0..num_bufs {
             let buf = Vec::<u8>::with_capacity(buf_len);
 
@@ -1514,35 +1514,35 @@ mod test {
             let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
 
             {
-                io_uring_wait_cqe(ring, &mut cqe);
+                io_uring_wait_cqe(ring, &raw mut cqe);
                 assert_eq!((*cqe).user_data, 2);
                 assert_eq!((*cqe).res, 0);
                 io_uring_cqe_seen(ring, cqe);
             }
 
             {
-                io_uring_wait_cqe(ring, &mut cqe);
+                io_uring_wait_cqe(ring, &raw mut cqe);
                 assert_eq!((*cqe).user_data, 3);
                 assert_eq!((*cqe).res, 0);
                 io_uring_cqe_seen(ring, cqe);
             }
 
             {
-                io_uring_wait_cqe(ring, &mut cqe);
+                io_uring_wait_cqe(ring, &raw mut cqe);
                 assert_eq!((*cqe).user_data, 1);
                 assert_eq!(-(*cqe).res, ECANCELED);
                 io_uring_cqe_seen(ring, cqe);
             }
 
             {
-                io_uring_wait_cqe(ring, &mut cqe);
+                io_uring_wait_cqe(ring, &raw mut cqe);
                 assert_eq!((*cqe).user_data, 1);
                 assert_eq!(-(*cqe).res, ECANCELED);
                 io_uring_cqe_seen(ring, cqe);
             }
 
             {
-                io_uring_wait_cqe(ring, &mut cqe);
+                io_uring_wait_cqe(ring, &raw mut cqe);
                 assert_eq!((*cqe).user_data, 1);
                 assert_eq!(-(*cqe).res, ETIME);
                 io_uring_cqe_seen(ring, cqe);
