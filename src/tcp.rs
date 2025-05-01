@@ -1167,6 +1167,10 @@ impl Future for RecvFuture<'_> {
                     let count = buf_seq.len().try_into().unwrap();
                     unsafe { io_uring_buf_ring_advance(br, count) };
 
+                    if op.done {
+                        stream_impl.recv_op = None;
+                    }
+
                     return Poll::Ready(Ok(buf_seq));
                 }
 
