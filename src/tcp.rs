@@ -33,12 +33,13 @@ use liburing_rs::{
     IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED, IORING_RECVSEND_BUNDLE,
     IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT, IOSQE_BUFFER_SELECT,
     IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring_buf_ring_add,
-    io_uring_buf_ring_advance, io_uring_get_sqe, io_uring_prep_accept_direct, io_uring_prep_cancel,
-    io_uring_prep_cancel_fd, io_uring_prep_cancel64, io_uring_prep_close_direct,
-    io_uring_prep_connect, io_uring_prep_link_timeout, io_uring_prep_recv_multishot,
-    io_uring_prep_send_zc, io_uring_prep_socket_direct, io_uring_prep_timeout,
-    io_uring_prep_timeout_remove, io_uring_register_files_update, io_uring_sqe_set_buf_group,
-    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_get_sqe,
+    io_uring_prep_accept_direct, io_uring_prep_cancel, io_uring_prep_cancel_fd,
+    io_uring_prep_cancel64, io_uring_prep_close_direct, io_uring_prep_connect,
+    io_uring_prep_link_timeout, io_uring_prep_recv_multishot, io_uring_prep_send_zc,
+    io_uring_prep_socket_direct, io_uring_prep_timeout, io_uring_prep_timeout_remove,
+    io_uring_register_files_update, io_uring_sqe_set_buf_group, io_uring_sqe_set_data,
+    io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
 
 use crate::{
@@ -1143,7 +1144,8 @@ impl Future for RecvFuture<'_> {
                     let buf_seq = mem::take(bufs);
 
                     let buf_group = unsafe { &mut *buf_group };
-                    let mask = buf_group.num_bufs - 1;
+                    let mask = io_uring_buf_ring_mask(buf_group.num_bufs);
+
                     let br = buf_group.buf_ring;
 
                     for buf_offset in 0..buf_seq.len() {
@@ -1157,9 +1159,7 @@ impl Future for RecvFuture<'_> {
                         let addr = addr.cast();
                         let buf_offset = buf_offset.try_into().unwrap();
 
-                        buf_group.tail = (buf_group.tail + 1) & mask;
-
-                        let mask = mask.try_into().unwrap();
+                        buf_group.tail = (buf_group.tail + 1) & u32::try_from(mask).unwrap();
 
                         unsafe { io_uring_buf_ring_add(br, addr, len, bid, mask, buf_offset) };
                     }
