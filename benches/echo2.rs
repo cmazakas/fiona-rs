@@ -21,6 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BUF_SIZE: usize = 256 * 1024;
 const RECV_BUF_SIZE: usize = 2 * 4096;
+const NUM_BUFS: u32 = 32 * 1024;
 
 static mut DURATION: Duration = Duration::new(0, 0);
 
@@ -224,10 +225,10 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 
     const CLIENT_BGID: u16 = 72;
 
-    ex.register_buf_group(CLIENT_BGID, 32 * 1024, RECV_BUF_SIZE)
+    ex.register_buf_group(CLIENT_BGID, NUM_BUFS, RECV_BUF_SIZE)
         .unwrap();
 
-    for _ in 0..nr_files {
+    for _idx in 0..nr_files {
         let ex2 = ex.clone();
         ex.clone().spawn(async move {
             let start = Instant::now();
@@ -313,11 +314,11 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 
     let acceptor = fiona::tcp::Acceptor::new(ex.clone(), ipv4_addr, port).unwrap();
 
-    ex.register_buf_group(SERVER_BGID, 32 * 1024, RECV_BUF_SIZE)
+    ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)
         .unwrap();
 
     ex.clone().spawn(async move {
-        for _ in 0..nr_files {
+        for _idx in 0..nr_files {
             let stream = acceptor.accept().await.unwrap();
             ex.clone().spawn(async move {
                 let start = Instant::now();
