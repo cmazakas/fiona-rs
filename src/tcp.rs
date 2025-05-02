@@ -140,7 +140,7 @@ impl Acceptor {
         // we need to do this for when `port == 0` (the wildcard port)
         let addr = getsockname::<SockaddrIn>(socket.as_raw_fd())?;
 
-        let offset = ex.get_available_fd();
+        let offset = unsafe { ex.get_available_fd() };
         if offset.is_none() {
             return Err(Errno::from_raw(ENFILE));
         }
@@ -231,7 +231,7 @@ impl Drop for AcceptorImpl {
             unsafe { io_uring_sqe_set_data64(sqe, 0) };
             unsafe { submit_ring(ring) };
 
-            self.ex.reclaim_fd(fd);
+            unsafe { self.ex.reclaim_fd(fd) };
         }
     }
 }
@@ -278,7 +278,8 @@ impl Future for AcceptFuture<'_> {
             (false, false) => {
                 let ring = acceptor_impl.ex.ring();
 
-                let Some(file_index) = acceptor_impl.ex.get_available_fd() else {
+                let mfile_index = unsafe { acceptor_impl.ex.get_available_fd() };
+                let Some(file_index) = mfile_index else {
                     self.completed = true;
                     self.op = Some(op);
                     return Poll::Ready(Err(Errno::from_raw(ENFILE)));
@@ -377,7 +378,7 @@ impl Drop for AcceptFuture<'_> {
             }
 
             // unsafe { submit_ring(ring) };
-            acceptor_impl.ex.reclaim_fd(fd);
+            unsafe { acceptor_impl.ex.reclaim_fd(fd) };
         }
     }
 }
@@ -398,7 +399,7 @@ impl Drop for StreamImpl {
             unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
 
             // unsafe { submit_ring(ring) };
-            self.ex.reclaim_fd(fd);
+            unsafe { self.ex.reclaim_fd(fd) };
         }
     }
 }
@@ -824,7 +825,8 @@ impl Future for ConnectFuture<'_> {
                 *needs_socket = client_impl.stream.fd < 0;
 
                 if *needs_socket {
-                    let Some(file_idx) = client_impl.stream.ex.get_available_fd() else {
+                    let mfile_index = unsafe { client_impl.stream.ex.get_available_fd() };
+                    let Some(file_idx) = mfile_index else {
                         self.op = Some(op);
                         return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                     };
@@ -1080,13 +1082,11 @@ impl Future for RecvFuture<'_> {
 
                 let ref_count = &raw mut stream_impl.ref_count;
 
-                let buf_group = match stream_impl
-                    .ex
-                    .p
-                    .borrow_mut()
-                    .buf_groups
-                    .get(&stream_impl.buf_group)
-                {
+                let buf_group = match unsafe {
+                    (*stream_impl.ex.p.get())
+                        .buf_groups
+                        .get(&stream_impl.buf_group)
+                } {
                     None => {
                         self.completed = true;
                         return Poll::Ready(Err(Errno::ENOENT));

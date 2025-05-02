@@ -19,7 +19,7 @@ extern crate nix;
 
 use std::{
     alloc::Layout,
-    cell::RefCell,
+    cell::UnsafeCell,
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     hash::Hash,
@@ -88,7 +88,7 @@ struct TaskInnerHeader {
     future_vtable: DynMetadata<dyn Future<Output = ()> + 'static>,
     sender: Option<Sender<Weak>>,
     event_fd: i32,
-    ex: *const RefCell<IoContextFrame>,
+    ex: *const UnsafeCell<IoContextFrame>,
 }
 
 //-----------------------------------------------------------------------------
@@ -407,7 +407,7 @@ unsafe fn task_local_wake(p: *const ()) {
     let weak = unsafe { Weak::from_raw(p) };
     if let Some(_task) = unsafe { weak.upgrade() } {
         let ex = unsafe { &*weak.inner().ex };
-        ex.borrow_mut().local_task_queue.push_back(weak);
+        unsafe { (*ex.get()).local_task_queue.push_back(weak) };
     }
 }
 
@@ -415,7 +415,7 @@ unsafe fn task_local_wake_by_ref(p: *const ()) {
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
     if let Some(_task) = unsafe { weak.upgrade() } {
         let ex = unsafe { &*weak.inner().ex };
-        ex.borrow_mut().local_task_queue.push_back((*weak).clone());
+        unsafe { (*ex.get()).local_task_queue.push_back((*weak).clone()) };
     }
 }
 
@@ -587,7 +587,7 @@ fn make_io_uring_op(ref_count: *mut RefCount, op_type: OpType) -> IoUringOp {
 //-----------------------------------------------------------------------------
 
 pub struct IoContext {
-    p: Rc<RefCell<IoContextFrame>>,
+    p: Rc<UnsafeCell<IoContextFrame>>,
 }
 
 //-----------------------------------------------------------------------------
@@ -631,7 +631,7 @@ unsafe fn reserve_sqes(ring: *mut io_uring, n: u32) {
 //-----------------------------------------------------------------------------
 
 struct RunGuard {
-    p: Rc<RefCell<IoContextFrame>>,
+    p: Rc<UnsafeCell<IoContextFrame>>,
 }
 
 struct CQESeenGuard<'a> {
@@ -670,20 +670,16 @@ impl Drop for IncrGuard<'_> {
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        let ring;
-        let mut tasks;
+        let ring = unsafe { &raw mut (*self.p.get()).ioring };
         {
-            let frame = &mut *self.p.borrow_mut();
-            ring = &raw mut frame.ioring;
-
-            tasks = std::mem::take(&mut frame.tasks);
+            let tasks = unsafe { &mut (*self.p.get()).tasks };
+            tasks.clear();
         }
-        tasks.clear();
 
         unsafe { submit_ring(ring) };
         unsafe { io_uring_get_events(ring) };
 
-        let mut blacklist = std::mem::take(&mut self.p.borrow_mut().runguard_blacklist);
+        let blacklist = unsafe { &mut (*self.p.get()).runguard_blacklist };
 
         let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
         while unsafe { io_uring_peek_cqe(ring, &raw mut cqe) } == 0 {
@@ -710,8 +706,6 @@ impl Drop for RunGuard {
             // unsafe { submit_ring(ring) };
             unsafe { io_uring_get_events(ring) };
         }
-
-        self.p.borrow_mut().runguard_blacklist = blacklist;
     }
 }
 
@@ -744,12 +738,13 @@ impl IoContext {
         let mut params = unsafe { std::mem::zeroed::<io_uring_params>() };
         params.cq_entries = cq_entries;
         params.flags |= IORING_SETUP_CQSIZE;
+
         params.flags |= IORING_SETUP_SINGLE_ISSUER;
         params.flags |= IORING_SETUP_DEFER_TASKRUN;
 
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 
-        let p = Rc::new(RefCell::new(IoContextFrame {
+        let p = Rc::new(UnsafeCell::new(IoContextFrame {
             _params: params,
             tasks: HashSet::new(),
             available_fds: VecDeque::new(),
@@ -762,24 +757,20 @@ impl IoContext {
             local_task_queue: VecDeque::new(),
         }));
 
-        {
-            let ring = &raw mut p.borrow_mut().ioring;
-            let ret = unsafe { io_uring_queue_init_params(sq_entries, ring, &raw mut params) };
-            assert_eq!(ret, 0);
+        let ring = unsafe { &raw mut (*p.get()).ioring };
+        let ret = unsafe { io_uring_queue_init_params(sq_entries, ring, &raw mut params) };
+        assert_eq!(ret, 0);
 
-            let ret = unsafe { io_uring_register_ring_fd(ring) };
-            assert_eq!(ret, 1);
+        let ret = unsafe { io_uring_register_ring_fd(ring) };
+        assert_eq!(ret, 1);
 
-            let ret = unsafe { io_uring_register_files_sparse(ring, nr_files) };
-            assert_eq!(ret, 0);
-        }
+        let ret = unsafe { io_uring_register_files_sparse(ring, nr_files) };
+        assert_eq!(ret, 0);
 
-        {
-            let available_fds = &mut p.borrow_mut().available_fds;
-            available_fds.reserve(nr_files as usize);
-            for i in 0..nr_files {
-                available_fds.push_back(i);
-            }
+        let available_fds = unsafe { &mut (*p.get()).available_fds };
+        available_fds.reserve(nr_files as usize);
+        for i in 0..nr_files {
+            available_fds.push_back(i);
         }
 
         Self { p }
@@ -791,7 +782,7 @@ impl IoContext {
     }
 
     fn ring(&self) -> *mut io_uring {
-        unsafe { &raw mut (*self.p.as_ptr()).ioring }
+        unsafe { &raw mut (*self.p.get()).ioring }
     }
 
     pub fn run(&mut self) -> u64 {
@@ -805,7 +796,7 @@ impl IoContext {
                     let mut cx = ContextBuilder::from_waker(&w).local_waker(&lw).build();
 
                     if let Poll::Ready(()) = task.poll(&mut cx) {
-                        ex.p.borrow_mut().tasks.remove(&task);
+                        unsafe { (*ex.p.get()).tasks.remove(&task) };
                         1
                     } else {
                         0
@@ -818,7 +809,7 @@ impl IoContext {
 
         let mut num_completed = 0;
 
-        let event_fd = self.p.borrow().event_fd.as_raw_fd();
+        let event_fd = unsafe { (*self.p.get()).event_fd.as_raw_fd() };
         let mut event_count = 0_u64;
 
         let ex = self.get_executor();
@@ -830,21 +821,19 @@ impl IoContext {
         let mut need_eventfd_read = true;
 
         loop {
-            if self.p.borrow().tasks.is_empty() {
+            if unsafe { (*self.p.get()).tasks.is_empty() } {
                 break;
             }
 
-            let try_local_recv = || self.p.borrow_mut().local_task_queue.pop_front();
-            while let Some(weak) = try_local_recv() {
+            while let Some(weak) = unsafe { (*self.p.get()).local_task_queue.pop_front() } {
                 num_completed += on_work_item(weak, &ex);
             }
 
-            let try_recv = || self.p.borrow().receiver.try_recv();
-            while let Ok(weak) = try_recv() {
+            while let Ok(weak) = unsafe { (*self.p.get()).receiver.try_recv() } {
                 num_completed += on_work_item(weak, &ex);
             }
 
-            if self.p.borrow().tasks.is_empty() {
+            if unsafe { (*self.p.get()).tasks.is_empty() } {
                 break;
             }
 
@@ -941,7 +930,7 @@ fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring
             // unsafe { submit_ring(ring) };
 
             drop(unsafe { Box::from_raw(op) });
-            ex.reclaim_fd(fd);
+            unsafe { ex.reclaim_fd(fd) };
         }
 
         return;
@@ -998,7 +987,7 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
             }
 
-            ex.reclaim_fd(fd.try_into().unwrap());
+            unsafe { ex.reclaim_fd(fd.try_into().unwrap()) };
         }
 
         unsafe { release_op(op.ref_count) };
@@ -1250,14 +1239,12 @@ impl Drop for IoContext {
     fn drop(&mut self) {
         drop(RunGuard { p: self.p.clone() });
 
-        {
-            let buf_groups = &mut self.p.borrow_mut().buf_groups;
-            for (_, buf_group) in buf_groups.iter() {
-                unsafe { (**buf_group).release() };
-                drop(unsafe { Box::from_raw(*buf_group) });
-            }
-            buf_groups.clear();
+        let buf_groups = unsafe { &mut (*self.p.get()).buf_groups };
+        for (_, buf_group) in buf_groups.iter() {
+            unsafe { (**buf_group).release() };
+            drop(unsafe { Box::from_raw(*buf_group) });
         }
+        buf_groups.clear();
 
         unsafe { io_uring_queue_exit(self.ring()) };
     }
@@ -1280,7 +1267,7 @@ struct SpawnValue<T> {
 
 struct WrapperFuture<T, F: Future<Output = T>> {
     f: F,
-    value: Rc<RefCell<SpawnValue<T>>>,
+    value: Rc<UnsafeCell<SpawnValue<T>>>,
 }
 
 impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F> {
@@ -1293,7 +1280,7 @@ impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F> {
         match r {
             Poll::Pending => Poll::Pending,
             Poll::Ready(t) => {
-                let state = &mut *(*this.value).borrow_mut();
+                let state = unsafe { &mut *(*this.value).get() };
                 state.t = Some(t);
                 if let Some(ref w) = state.waker {
                     w.wake_by_ref();
@@ -1308,7 +1295,7 @@ impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F> {
 
 pub struct SpawnFuture<T> {
     done: bool,
-    value: Rc<RefCell<SpawnValue<T>>>,
+    value: Rc<UnsafeCell<SpawnValue<T>>>,
 }
 
 impl<T> Future for SpawnFuture<T> {
@@ -1316,11 +1303,13 @@ impl<T> Future for SpawnFuture<T> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         assert!(!self.done);
 
-        let result = self.value.borrow_mut().t.take();
+        let result = unsafe { (*self.value.get()).t.take() };
 
         match result {
             None => {
-                self.value.borrow_mut().waker = Some(cx.waker().clone());
+                unsafe { (*self.value.get()).waker = Some(cx.waker().clone()) };
+                // TODO: do we need to assign the LocalWaker here as well?
+
                 Poll::Pending
             }
             Some(t) => {
@@ -1335,21 +1324,21 @@ impl<T> Future for SpawnFuture<T> {
 
 #[derive(Clone)]
 pub struct Executor {
-    p: Rc<RefCell<IoContextFrame>>,
+    p: Rc<UnsafeCell<IoContextFrame>>,
 }
 
 impl Executor {
     fn ring(&self) -> *mut io_uring {
-        unsafe { &raw mut (*self.p.as_ptr()).ioring }
+        unsafe { &raw mut (*self.p.get()).ioring }
     }
 
-    fn get_available_fd(&self) -> Option<u32> {
-        let fds = &mut self.p.borrow_mut().available_fds;
+    unsafe fn get_available_fd(&self) -> Option<u32> {
+        let fds = unsafe { &mut (*self.p.get()).available_fds };
         fds.pop_front()
     }
 
-    fn reclaim_fd(&self, fd: u32) {
-        let fds = &mut self.p.borrow_mut().available_fds;
+    unsafe fn reclaim_fd(&self, fd: u32) {
+        let fds = unsafe { &mut (*self.p.get()).available_fds };
         fds.push_back(fd);
     }
 
@@ -1390,30 +1379,32 @@ impl Executor {
 
         unsafe { io_uring_buf_ring_advance(buf_ring, num_bufs.try_into().unwrap()) };
 
-        self.p.borrow_mut().buf_groups.insert(
-            bgid,
-            Box::into_raw(Box::new(BufGroup {
-                buf_ring,
-                num_bufs,
-                buf_len,
+        unsafe {
+            (*self.p.get()).buf_groups.insert(
                 bgid,
-                bufs,
-                ring,
-                tail: 0,
-            })),
-        );
+                Box::into_raw(Box::new(BufGroup {
+                    buf_ring,
+                    num_bufs,
+                    buf_len,
+                    bgid,
+                    bufs,
+                    ring,
+                    tail: 0,
+                })),
+            );
+        }
 
         Ok(())
     }
 
     pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T> {
-        let value = Rc::new(RefCell::new(SpawnValue {
+        let value = Rc::new(UnsafeCell::new(SpawnValue {
             t: None,
             waker: None,
         }));
 
-        let sender = self.p.borrow().sender.clone();
-        let event_fd = self.p.borrow().event_fd.as_raw_fd();
+        let sender = unsafe { (*self.p.get()).sender.clone() };
+        let event_fd = unsafe { (*self.p.get()).event_fd.as_raw_fd() };
 
         let wrapped = WrapperFuture {
             f,
@@ -1423,7 +1414,7 @@ impl Executor {
         let task = Task::new(wrapped, sender.clone(), event_fd, self.clone());
 
         sender.send(Task::downgrade(&task)).unwrap();
-        (*self.p).borrow_mut().tasks.insert(task);
+        unsafe { (*(*self.p).get()).tasks.insert(task) };
 
         SpawnFuture { value, done: false }
     }
