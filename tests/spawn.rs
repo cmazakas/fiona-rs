@@ -6,7 +6,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    future::{poll_fn, Future},
+    future::{Future, poll_fn},
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -17,19 +17,20 @@ use std::{
 
 use futures::StreamExt;
 
-struct YieldFuture<T: Unpin> {
+struct YieldFuture<T: Unpin>
+{
     yielded: bool,
     done: bool,
     t: Option<T>,
 }
 
-impl<T: Unpin> Future for YieldFuture<T> {
+impl<T: Unpin> Future for YieldFuture<T>
+{
     type Output = T;
 
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
+            -> std::task::Poll<Self::Output>
+    {
         assert!(!self.done);
         match self.yielded {
             false => {
@@ -45,17 +46,18 @@ impl<T: Unpin> Future for YieldFuture<T> {
     }
 }
 
-impl<T: Unpin> YieldFuture<T> {
-    fn new(t: T) -> Self {
-        Self {
-            yielded: false,
-            done: false,
-            t: Some(t),
-        }
+impl<T: Unpin> YieldFuture<T>
+{
+    fn new(t: T) -> Self
+    {
+        Self { yielded: false,
+               done: false,
+               t: Some(t) }
     }
 }
 
-fn yield_now<T: Unpin>(t: T) -> YieldFuture<T> {
+fn yield_now<T: Unpin>(t: T) -> YieldFuture<T>
+{
     YieldFuture::new(t)
 }
 
@@ -63,10 +65,12 @@ fn yield_now<T: Unpin>(t: T) -> YieldFuture<T> {
 
 struct WakerFuture;
 
-impl Future for WakerFuture {
+impl Future for WakerFuture
+{
     type Output = std::task::Waker;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
+    {
         Poll::Ready(cx.waker().clone())
     }
 }
@@ -75,46 +79,51 @@ impl Future for WakerFuture {
 
 struct LocalWakerFuture;
 
-impl Future for LocalWakerFuture {
+impl Future for LocalWakerFuture
+{
     type Output = LocalWaker;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
+    {
         Poll::Ready(cx.local_waker().clone())
     }
 }
 
 //-----------------------------------------------------------------------------
 
-struct TimerFuture<T> {
+struct TimerFuture<T>
+{
     dur: Duration,
     t: Option<JoinHandle<()>>,
     done: bool,
     value: Option<T>,
 }
 
-impl<T> TimerFuture<T> {
-    fn new(dur: Duration, val: T) -> Self {
-        Self {
-            dur,
-            t: None,
-            done: false,
-            value: Some(val),
-        }
+impl<T> TimerFuture<T>
+{
+    fn new(dur: Duration, val: T) -> Self
+    {
+        Self { dur,
+               t: None,
+               done: false,
+               value: Some(val) }
     }
 }
 
-impl<T: Unpin> Future for TimerFuture<T> {
+impl<T: Unpin> Future for TimerFuture<T>
+{
     type Output = T;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
+    {
         assert!(!self.done);
         match self.t.take() {
             None => {
                 let dur = self.dur;
                 let waker = cx.waker().clone();
                 self.t = Some(std::thread::spawn(move || {
-                    std::thread::sleep(dur);
-                    waker.wake();
-                }));
+                                  std::thread::sleep(dur);
+                                  waker.wake();
+                              }));
                 Poll::Pending
             }
             Some(join_handle) => {
@@ -126,14 +135,16 @@ impl<T: Unpin> Future for TimerFuture<T> {
     }
 }
 
-fn wait_for<T>(dur: Duration, t: T) -> TimerFuture<T> {
+fn wait_for<T>(dur: Duration, t: T) -> TimerFuture<T>
+{
     TimerFuture::new(dur, t)
 }
 
 //-----------------------------------------------------------------------------
 
 #[test]
-fn await_simple() {
+fn await_simple()
+{
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
@@ -141,16 +152,18 @@ fn await_simple() {
     {
         let c2 = c.clone();
         ex.spawn(async move {
-            *c2.borrow_mut() = 1234;
-        });
+              *c2.borrow_mut() = 1234;
+          });
     }
     assert_eq!(ioc.run(), 1);
     assert_eq!(*c.borrow(), 1234);
 }
 
 #[test]
-fn await_value() {
-    async fn make_vec() -> Vec<i32> {
+fn await_value()
+{
+    async fn make_vec() -> Vec<i32>
+    {
         yield_now(()).await;
         vec![1, 2, 3, 4]
     }
@@ -163,17 +176,19 @@ fn await_value() {
         let c2 = c.clone();
         let ex2 = ex.clone();
         ex.spawn(async move {
-            let v = ex2.spawn(make_vec()).await;
-            *c2.borrow_mut() = v.len();
-        });
+              let v = ex2.spawn(make_vec()).await;
+              *c2.borrow_mut() = v.len();
+          });
     }
     assert_eq!(ioc.run(), 2);
     assert_eq!(*c.borrow(), 4);
 }
 
 #[test]
-fn await_forgotten() {
-    async fn make_vec() -> Vec<i32> {
+fn await_forgotten()
+{
+    async fn make_vec() -> Vec<i32>
+    {
         vec![1, 2, 3, 4]
     }
 
@@ -187,12 +202,12 @@ fn await_forgotten() {
         let c2 = c.clone();
         let ex2 = ex.clone();
         ex.spawn(async move {
-            let h = ex2.spawn(make_vec());
-            *c2.borrow_mut() = 4321;
-            unsafe {
-                P_FUTURE = Box::leak(Box::new(h));
-            }
-        });
+              let h = ex2.spawn(make_vec());
+              *c2.borrow_mut() = 4321;
+              unsafe {
+                  P_FUTURE = Box::leak(Box::new(h));
+              }
+          });
     }
     assert_eq!(ioc.run(), 2);
     unsafe {
@@ -202,12 +217,15 @@ fn await_forgotten() {
 }
 
 #[test]
-fn await_sequential() {
-    async fn identity(x: i32) -> i32 {
+fn await_sequential()
+{
+    async fn identity(x: i32) -> i32
+    {
         yield_now(x).await
     }
 
-    async fn sequential(ex: fiona::Executor) {
+    async fn sequential(ex: fiona::Executor)
+    {
         let mut futures = Vec::<fiona::SpawnFuture<i32>>::new();
         for i in 0..10 {
             futures.push(ex.spawn(identity(i + 1)));
@@ -230,12 +248,15 @@ fn await_sequential() {
 }
 
 #[test]
-fn await_sequential_rev() {
-    async fn identity(x: i32) -> i32 {
+fn await_sequential_rev()
+{
+    async fn identity(x: i32) -> i32
+    {
         x
     }
 
-    async fn sequential(ex: fiona::Executor) {
+    async fn sequential(ex: fiona::Executor)
+    {
         let mut futures = Vec::<fiona::SpawnFuture<i32>>::new();
         for i in 0..10 {
             futures.push(ex.spawn(identity(i + 1)));
@@ -258,23 +279,26 @@ fn await_sequential_rev() {
 }
 
 #[test]
-fn await_non_send() {
-    struct ThreadLocal {
+fn await_non_send()
+{
+    struct ThreadLocal
+    {
         x: Rc<Cell<i32>>,
     }
 
-    async fn make_int() -> i32 {
+    async fn make_int() -> i32
+    {
         1234
     }
 
-    async fn child(ex: fiona::Executor) -> ThreadLocal {
+    async fn child(ex: fiona::Executor) -> ThreadLocal
+    {
         let x = ex.spawn(make_int()).await;
-        ThreadLocal {
-            x: Rc::new(Cell::new(x)),
-        }
+        ThreadLocal { x: Rc::new(Cell::new(x)) }
     }
 
-    async fn parent(ex: fiona::Executor) {
+    async fn parent(ex: fiona::Executor)
+    {
         let f1 = ex.spawn(child(ex.clone()));
         let f2 = ex.spawn(child(ex.clone()));
 
@@ -293,18 +317,22 @@ fn await_non_send() {
 }
 
 #[test]
-fn await_future_relocated() {
-    async fn task() -> i32 {
+fn await_future_relocated()
+{
+    async fn task() -> i32
+    {
         1234
     }
 
-    async fn child(f: fiona::SpawnFuture<i32>) {
+    async fn child(f: fiona::SpawnFuture<i32>)
+    {
         let x = f.await;
         yield_now(()).await;
         assert_eq!(x, 1234);
     }
 
-    async fn parent(ex: fiona::Executor) {
+    async fn parent(ex: fiona::Executor)
+    {
         let f = ex.spawn(task());
         ex.spawn(child(f)).await;
     }
@@ -319,8 +347,10 @@ fn await_future_relocated() {
 
 #[test]
 #[should_panic]
-fn await_future_panics() {
-    async fn task(x: i32) {
+fn await_future_panics()
+{
+    async fn task(x: i32)
+    {
         let p = Box::new(x);
         yield_now(()).await;
         assert!(*p < 5);
@@ -336,13 +366,16 @@ fn await_future_panics() {
 }
 
 #[test]
-fn await_from_main() {
+fn await_from_main()
+{
     // TODO: kind of an abstraction leak that this is possible
     // but I don't see a good solution here
 
     struct PanicWaker;
-    impl std::task::Wake for PanicWaker {
-        fn wake(self: std::sync::Arc<Self>) {
+    impl std::task::Wake for PanicWaker
+    {
+        fn wake(self: std::sync::Arc<Self>)
+        {
             panic!();
         }
     }
@@ -360,8 +393,10 @@ fn await_from_main() {
 }
 
 #[test]
-fn await_stress_test() {
-    async fn task(x: i32) {
+fn await_stress_test()
+{
+    async fn task(x: i32)
+    {
         let x2 = yield_now(x).await;
         assert_eq!(x2, x);
     }
@@ -377,16 +412,20 @@ fn await_stress_test() {
 }
 
 #[test]
-fn await_cycle() {
-    struct RecursiveFuture {
+fn await_cycle()
+{
+    struct RecursiveFuture
+    {
         this: Rc<RefCell<Option<fiona::SpawnFuture<()>>>>,
         recursions: i32,
         done: bool,
     }
 
-    impl Future for RecursiveFuture {
+    impl Future for RecursiveFuture
+    {
         type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
+        {
             assert!(!self.done);
 
             let r;
@@ -412,13 +451,12 @@ fn await_cycle() {
         }
     }
 
-    async fn start(ex: fiona::Executor) {
+    async fn start(ex: fiona::Executor)
+    {
         let p = Rc::new(RefCell::new(None));
-        let f = ex.spawn(RecursiveFuture {
-            this: p.clone(),
-            recursions: 0,
-            done: false,
-        });
+        let f = ex.spawn(RecursiveFuture { this: p.clone(),
+                                           recursions: 0,
+                                           done: false });
         *p.borrow_mut() = Some(f);
     }
 
@@ -431,23 +469,26 @@ fn await_cycle() {
 }
 
 #[test]
-fn await_timer() {
+fn await_timer()
+{
     let dur = Duration::from_millis(250);
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
     ex.spawn(async move {
-        let v = wait_for(dur, vec![1, 2, 3, 4]).await;
-        assert_eq!(v, vec![1, 2, 3, 4]);
-    });
+          let v = wait_for(dur, vec![1, 2, 3, 4]).await;
+          assert_eq!(v, vec![1, 2, 3, 4]);
+      });
 
     let n = ioc.run();
     assert_eq!(n, 1);
 }
 
 #[test]
-fn await_manually_polled() {
-    async fn f1(ex: fiona::Executor) {
+fn await_manually_polled()
+{
+    async fn f1(ex: fiona::Executor)
+    {
         let w = WakerFuture.await;
 
         // test the case where we manually poll a sibling task, attaching ourselves as
@@ -460,11 +501,13 @@ fn await_manually_polled() {
         assert!(r.is_pending());
     }
 
-    async fn f2() -> Box<i32> {
+    async fn f2() -> Box<i32>
+    {
         yield_now(Box::new(1234)).await
     }
 
-    async fn f3() {
+    async fn f3()
+    {
         let x = yield_now(4321).await;
         let p = yield_now(Box::new(x)).await;
         assert_eq!(*p, 4321);
@@ -481,13 +524,15 @@ fn await_manually_polled() {
 }
 
 #[test]
-fn await_manually_polled_early_drop() {
+fn await_manually_polled_early_drop()
+{
     // want to attempt to test the property that the main task we're waiting on goes
     // out of scope when an external thread completes and tries to use the Waker
 
     static mut NUM_RUNS: u64 = 0;
 
-    async fn f1() {
+    async fn f1()
+    {
         let w = WakerFuture.await;
         let mut cx = std::task::Context::from_waker(&w);
 
@@ -510,7 +555,8 @@ fn await_manually_polled_early_drop() {
 }
 
 #[test]
-fn await_manual_timeslice() {
+fn await_manual_timeslice()
+{
     // want to test that a user can appropriately use our Waker to time-slice
     // long-standing operations, letting other things in the run queue process
 
@@ -520,7 +566,8 @@ fn await_manual_timeslice() {
 
     let flag = Rc::new(RefCell::new(false));
 
-    async fn f1(flag: Rc<RefCell<bool>>, vec: Rc<RefCell<Vec<i32>>>) {
+    async fn f1(flag: Rc<RefCell<bool>>, vec: Rc<RefCell<Vec<i32>>>)
+    {
         let mut v1 = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
         poll_fn(|cx| {
@@ -534,13 +581,13 @@ fn await_manual_timeslice() {
 
             cx.waker().wake_by_ref();
             Poll::Pending
-        })
-        .await;
+        }).await;
 
         unsafe { NUM_RUNS += 1 };
     }
 
-    async fn f2(flag: Rc<RefCell<bool>>, vec: Rc<RefCell<Vec<i32>>>) {
+    async fn f2(flag: Rc<RefCell<bool>>, vec: Rc<RefCell<Vec<i32>>>)
+    {
         let mut v2 = vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
 
         poll_fn(|cx| {
@@ -554,8 +601,7 @@ fn await_manual_timeslice() {
 
             cx.waker().wake_by_ref();
             Poll::Pending
-        })
-        .await;
+        }).await;
 
         unsafe { NUM_RUNS += 1 };
     }
@@ -571,23 +617,23 @@ fn await_manual_timeslice() {
     assert_eq!(n, 2);
     assert_eq!(unsafe { NUM_RUNS }, n);
 
-    assert_eq!(
-        *vec.borrow(),
-        vec![1, 2, 10, 9, 3, 4, 8, 7, 5, 6, 6, 5, 7, 8, 4, 3, 9, 10, 2, 1]
-    );
+    assert_eq!(*vec.borrow(), vec![1, 2, 10, 9, 3, 4, 8, 7, 5, 6, 6, 5, 7, 8, 4, 3, 9, 10, 2, 1]);
 }
 
 //-----------------------------------------------------------------------------
 
 #[test]
-fn await_futures_ordered() {
-    async fn identity(x: i32) -> i32 {
+fn await_futures_ordered()
+{
+    async fn identity(x: i32) -> i32
+    {
         let mut v = vec![x];
         v = yield_now(v).await;
         v[0]
     }
 
-    async fn sequential(ex: fiona::Executor) {
+    async fn sequential(ex: fiona::Executor)
+    {
         let mut futures = Vec::<fiona::SpawnFuture<i32>>::new();
         for i in 0..10 {
             futures.push(ex.spawn(identity(i + 1)));
@@ -612,8 +658,10 @@ fn await_futures_ordered() {
 }
 
 #[test]
-fn await_futures_unordered() {
-    async fn launch_timers(ex: fiona::Executor) {
+fn await_futures_unordered()
+{
+    async fn launch_timers(ex: fiona::Executor)
+    {
         let f1 = ex.spawn(wait_for(Duration::from_millis(300), 3));
         let f2 = ex.spawn(wait_for(Duration::from_millis(400), 4));
         let f3 = ex.spawn(wait_for(Duration::from_millis(100), 1));
@@ -640,7 +688,8 @@ fn await_futures_unordered() {
 }
 
 #[test]
-fn await_local_waker_outlives() {
+fn await_local_waker_outlives()
+{
     let p = Rc::<RefCell<Option<LocalWaker>>>::new(RefCell::new(None));
     {
         let mut ioc = fiona::IoContext::new();
@@ -649,9 +698,9 @@ fn await_local_waker_outlives() {
         {
             let p = p.clone();
             ex.spawn(async move {
-                let local_waker = LocalWakerFuture.await;
-                *(*p).borrow_mut() = Some(local_waker);
-            });
+                  let local_waker = LocalWakerFuture.await;
+                  *(*p).borrow_mut() = Some(local_waker);
+              });
         }
 
         ioc.run();

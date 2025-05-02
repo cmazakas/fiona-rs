@@ -4,15 +4,13 @@
 
 #![feature(ptr_metadata, box_as_ptr, vec_into_raw_parts, local_waker)]
 #![warn(clippy::pedantic)]
-#![allow(
-    clippy::mutable_key_type,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::cast_ptr_alignment,
-    clippy::too_many_lines,
-    clippy::similar_names,
-    clippy::cast_possible_wrap
-)]
+#![allow(clippy::mutable_key_type,
+         clippy::missing_panics_doc,
+         clippy::missing_errors_doc,
+         clippy::cast_ptr_alignment,
+         clippy::too_many_lines,
+         clippy::similar_names,
+         clippy::cast_possible_wrap)]
 
 extern crate liburing_rs;
 extern crate nix;
@@ -73,16 +71,19 @@ pub type Result<T> = std::result::Result<T, nix::Error>;
 #[repr(C, align(64))]
 struct AlignedAtomicU64(AtomicU64);
 
-impl Deref for AlignedAtomicU64 {
+impl Deref for AlignedAtomicU64
+{
     type Target = AtomicU64;
-    fn deref(&self) -> &Self::Target {
+    fn deref(&self) -> &Self::Target
+    {
         &self.0
     }
 }
 
 //-----------------------------------------------------------------------------
 
-struct TaskInnerHeader {
+struct TaskInnerHeader
+{
     strong: AlignedAtomicU64,
     weak: AlignedAtomicU64,
     future_vtable: DynMetadata<dyn Future<Output = ()> + 'static>,
@@ -93,73 +94,73 @@ struct TaskInnerHeader {
 
 //-----------------------------------------------------------------------------
 
-struct Task {
+struct Task
+{
     p: NonNull<u8>,
     phantom: PhantomData<dyn Future<Output = ()> + 'static>,
 }
 
-fn align_up(n: usize, align: usize) -> usize {
+fn align_up(n: usize, align: usize) -> usize
+{
     (n + (align - 1)) & !(align - 1)
 }
 
-impl Task {
+impl Task
+{
     #[must_use]
-    pub fn new<F: Future<Output = ()> + 'static>(
-        f: F,
-        sender: Sender<Weak>,
-        event_fd: i32,
-        ex: Executor,
-    ) -> Task {
-        let layout = Layout::new::<TaskInnerHeader>()
-            .extend(Layout::for_value(&f))
-            .unwrap()
-            .0
-            .pad_to_align();
+    pub fn new<F: Future<Output = ()> + 'static>(f: F, sender: Sender<Weak>, event_fd: i32,
+                                                 ex: Executor)
+                                                 -> Task
+    {
+        let layout = Layout::new::<TaskInnerHeader>().extend(Layout::for_value(&f))
+                                                     .unwrap()
+                                                     .0
+                                                     .pad_to_align();
 
         let p = unsafe { std::alloc::alloc(layout) };
         let p = NonNull::new(p).unwrap();
 
-        let header = TaskInnerHeader {
-            strong: AlignedAtomicU64(AtomicU64::new(1)),
-            weak: AlignedAtomicU64(AtomicU64::new(1)),
-            future_vtable: metadata(std::ptr::from_ref(&f as &dyn Future<Output = ()>)),
-            sender: Some(sender),
-            event_fd,
-            ex: Rc::into_raw(ex.p),
-        };
+        let header = TaskInnerHeader { strong: AlignedAtomicU64(AtomicU64::new(1)),
+                                       weak: AlignedAtomicU64(AtomicU64::new(1)),
+                                       future_vtable:
+                                           metadata(std::ptr::from_ref(&f
+                                                                       as &dyn Future<Output = ()>)),
+                                       sender: Some(sender),
+                                       event_fd,
+                                       ex: Rc::into_raw(ex.p) };
 
         unsafe { std::ptr::write(p.as_ptr().cast::<TaskInnerHeader>(), header) };
 
         let offset = align_up(size_of::<TaskInnerHeader>(), layout.align());
         unsafe { std::ptr::write(p.as_ptr().add(offset).cast::<F>(), f) };
 
-        Task {
-            p,
-            phantom: PhantomData,
-        }
+        Task { p,
+               phantom: PhantomData }
     }
 
-    fn inner(&self) -> &TaskInnerHeader {
+    fn inner(&self) -> &TaskInnerHeader
+    {
         unsafe { &*self.p.as_ptr().cast::<TaskInnerHeader>() }
     }
 
-    fn as_ptr(&self) -> *mut (dyn Future<Output = ()> + 'static) {
-        let align = std::cmp::max(
-            align_of::<TaskInnerHeader>(),
-            self.inner().future_vtable.align_of(),
-        );
+    fn as_ptr(&self) -> *mut (dyn Future<Output = ()> + 'static)
+    {
+        let align =
+            std::cmp::max(align_of::<TaskInnerHeader>(), self.inner().future_vtable.align_of());
 
         let offset = align_up(size_of::<TaskInnerHeader>(), align);
 
         unsafe {
-            std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(
-                self.p.as_ptr().add(offset),
-                self.inner().future_vtable,
-            )
+            std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(self.p
+                                                                                  .as_ptr()
+                                                                                  .add(offset),
+                                                                              self.inner()
+                                                                                  .future_vtable)
         }
     }
 
-    fn poll(&mut self, cx: &mut Context) -> Poll<()> {
+    fn poll(&mut self, cx: &mut Context) -> Poll<()>
+    {
         let future = unsafe { &mut *self.as_ptr() };
         let future = unsafe { Pin::new_unchecked(future) };
 
@@ -167,18 +168,19 @@ impl Task {
     }
 
     #[must_use]
-    fn downgrade(this: &Task) -> Weak {
+    fn downgrade(this: &Task) -> Weak
+    {
         this.inner().weak.fetch_add(1, Relaxed);
 
-        Weak {
-            p: this.p,
-            phantom: PhantomData,
-        }
+        Weak { p: this.p,
+               phantom: PhantomData }
     }
 }
 
-impl Drop for Task {
-    fn drop(&mut self) {
+impl Drop for Task
+{
+    fn drop(&mut self)
+    {
         if self.inner().strong.fetch_sub(1, Release) > 1 {
             return;
         }
@@ -197,18 +199,13 @@ impl Drop for Task {
         };
 
         let layout = {
-            let align = std::cmp::max(
-                align_of::<TaskInnerHeader>(),
-                self.inner().future_vtable.align_of(),
-            );
+            let align =
+                std::cmp::max(align_of::<TaskInnerHeader>(), self.inner().future_vtable.align_of());
 
             let offset = align_up(size_of::<TaskInnerHeader>(), align);
 
-            Layout::from_size_align(
-                align_up(offset + self.inner().future_vtable.size_of(), align),
-                align,
-            )
-            .unwrap()
+            Layout::from_size_align(align_up(offset + self.inner().future_vtable.size_of(), align),
+                                    align).unwrap()
         };
 
         unsafe {
@@ -217,58 +214,66 @@ impl Drop for Task {
     }
 }
 
-impl Clone for Task {
-    fn clone(&self) -> Task {
+impl Clone for Task
+{
+    fn clone(&self) -> Task
+    {
         self.inner().strong.fetch_add(1, Relaxed);
-        Self {
-            p: self.p,
-            phantom: PhantomData,
-        }
+        Self { p: self.p,
+               phantom: PhantomData }
     }
 }
 
-impl PartialEq for Task {
-    fn eq(&self, other: &Self) -> bool {
+impl PartialEq for Task
+{
+    fn eq(&self, other: &Self) -> bool
+    {
         std::ptr::addr_eq(self.p.as_ptr(), other.p.as_ptr())
     }
 }
 
 impl Eq for Task {}
 
-impl Hash for Task {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl Hash for Task
+{
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H)
+    {
         self.p.hash(state);
     }
 }
 
 //-----------------------------------------------------------------------------
 
-struct Weak {
+struct Weak
+{
     p: NonNull<u8>,
     phantom: PhantomData<dyn Future<Output = ()> + 'static>,
 }
 
-impl Weak {
-    fn into_raw(self) -> *const () {
+impl Weak
+{
+    fn into_raw(self) -> *const ()
+    {
         let p = self.p.as_ptr().cast();
         std::mem::forget(self);
         p
     }
 
-    unsafe fn from_raw(p: *const ()) -> Weak {
-        Weak {
-            p: NonNull::new(p.cast_mut().cast::<u8>()).unwrap(),
-            phantom: PhantomData,
-        }
+    unsafe fn from_raw(p: *const ()) -> Weak
+    {
+        Weak { p: NonNull::new(p.cast_mut().cast::<u8>()).unwrap(),
+               phantom: PhantomData }
     }
 
-    fn inner(&self) -> &TaskInnerHeader {
+    fn inner(&self) -> &TaskInnerHeader
+    {
         unsafe { &*self.p.as_ptr().cast::<TaskInnerHeader>() }
     }
 
     // cannot be safely upgraded across thread boundaries
     // must only be upgraded on the main thread running the ring
-    unsafe fn upgrade(&self) -> Option<Task> {
+    unsafe fn upgrade(&self) -> Option<Task>
+    {
         let mut c = self.inner().strong.load(Relaxed);
 
         loop {
@@ -276,17 +281,14 @@ impl Weak {
                 return None;
             }
 
-            let r = self
-                .inner()
-                .strong
-                .compare_exchange_weak(c, c + 1, Relaxed, Relaxed);
+            let r = self.inner()
+                        .strong
+                        .compare_exchange_weak(c, c + 1, Relaxed, Relaxed);
 
             match r {
                 Ok(_) => {
-                    return Some(Task {
-                        p: self.p,
-                        phantom: PhantomData,
-                    });
+                    return Some(Task { p: self.p,
+                                       phantom: PhantomData });
                 }
                 Err(c2) => {
                     c = c2;
@@ -296,8 +298,10 @@ impl Weak {
     }
 }
 
-impl Drop for Weak {
-    fn drop(&mut self) {
+impl Drop for Weak
+{
+    fn drop(&mut self)
+    {
         if self.inner().weak.fetch_sub(1, Release) > 1 {
             return;
         }
@@ -308,18 +312,13 @@ impl Drop for Weak {
         };
 
         let layout = {
-            let align = std::cmp::max(
-                align_of::<TaskInnerHeader>(),
-                self.inner().future_vtable.align_of(),
-            );
+            let align =
+                std::cmp::max(align_of::<TaskInnerHeader>(), self.inner().future_vtable.align_of());
 
             let offset = align_up(size_of::<TaskInnerHeader>(), align);
 
-            Layout::from_size_align(
-                align_up(offset + self.inner().future_vtable.size_of(), align),
-                align,
-            )
-            .unwrap()
+            Layout::from_size_align(align_up(offset + self.inner().future_vtable.size_of(), align),
+                                    align).unwrap()
         };
 
         unsafe {
@@ -328,14 +327,14 @@ impl Drop for Weak {
     }
 }
 
-impl Clone for Weak {
-    fn clone(&self) -> Self {
+impl Clone for Weak
+{
+    fn clone(&self) -> Self
+    {
         self.inner().weak.fetch_add(1, Relaxed);
 
-        Self {
-            p: self.p,
-            phantom: PhantomData,
-        }
+        Self { p: self.p,
+               phantom: PhantomData }
     }
 }
 
@@ -344,44 +343,40 @@ unsafe impl Send for Weak {}
 
 //-----------------------------------------------------------------------------
 
-unsafe fn task_waker_clone(p: *const ()) -> RawWaker {
+unsafe fn task_waker_clone(p: *const ()) -> RawWaker
+{
     let weak = unsafe { Weak::from_raw(p) };
     std::mem::forget(weak.clone());
     std::mem::forget(weak);
     RawWaker::new(p, &TASK_WAKER_VTABLE)
 }
 
-unsafe fn task_wake(p: *const ()) {
+unsafe fn task_wake(p: *const ())
+{
     let weak = unsafe { Weak::from_raw(p) };
     if let Some(sender) = weak.inner().sender.as_ref() {
         sender.send(weak.clone()).unwrap();
         let buf = &0x01_u64.to_ne_bytes();
         unsafe {
-            nix::libc::write(
-                weak.inner().event_fd,
-                buf.as_ptr().cast::<c_void>(),
-                buf.len(),
-            );
+            nix::libc::write(weak.inner().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
         }
     }
 }
 
-unsafe fn task_wake_by_ref(p: *const ()) {
+unsafe fn task_wake_by_ref(p: *const ())
+{
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
     if let Some(sender) = weak.inner().sender.as_ref() {
         sender.send(ManuallyDrop::into_inner(weak.clone())).unwrap();
         let buf = &0x01_u64.to_ne_bytes();
         unsafe {
-            nix::libc::write(
-                weak.inner().event_fd,
-                buf.as_ptr().cast::<c_void>(),
-                buf.len(),
-            );
+            nix::libc::write(weak.inner().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
         }
     }
 }
 
-unsafe fn task_drop(p: *const ()) {
+unsafe fn task_drop(p: *const ())
+{
     let weak = unsafe { Weak::from_raw(p) };
     drop(weak);
 }
@@ -389,21 +384,24 @@ unsafe fn task_drop(p: *const ()) {
 static TASK_WAKER_VTABLE: RawWakerVTable =
     RawWakerVTable::new(task_waker_clone, task_wake, task_wake_by_ref, task_drop);
 
-fn make_waker(weak: Weak) -> Waker {
+fn make_waker(weak: Weak) -> Waker
+{
     let raw_waker = RawWaker::new(weak.into_raw(), &TASK_WAKER_VTABLE);
     unsafe { Waker::from_raw(raw_waker) }
 }
 
 //-----------------------------------------------------------------------------
 
-unsafe fn task_local_waker_clone(p: *const ()) -> RawWaker {
+unsafe fn task_local_waker_clone(p: *const ()) -> RawWaker
+{
     let weak = unsafe { Weak::from_raw(p) };
     std::mem::forget(weak.clone());
     std::mem::forget(weak);
     RawWaker::new(p, &TASK_LOCAL_WAKER_VTABLE)
 }
 
-unsafe fn task_local_wake(p: *const ()) {
+unsafe fn task_local_wake(p: *const ())
+{
     let weak = unsafe { Weak::from_raw(p) };
     if let Some(_task) = unsafe { weak.upgrade() } {
         let ex = unsafe { &*weak.inner().ex };
@@ -411,7 +409,8 @@ unsafe fn task_local_wake(p: *const ()) {
     }
 }
 
-unsafe fn task_local_wake_by_ref(p: *const ()) {
+unsafe fn task_local_wake_by_ref(p: *const ())
+{
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
     if let Some(_task) = unsafe { weak.upgrade() } {
         let ex = unsafe { &*weak.inner().ex };
@@ -419,26 +418,27 @@ unsafe fn task_local_wake_by_ref(p: *const ()) {
     }
 }
 
-unsafe fn task_local_drop(p: *const ()) {
+unsafe fn task_local_drop(p: *const ())
+{
     let weak = unsafe { Weak::from_raw(p) };
     drop(weak);
 }
 
-static TASK_LOCAL_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    task_local_waker_clone,
-    task_local_wake,
-    task_local_wake_by_ref,
-    task_local_drop,
-);
+static TASK_LOCAL_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(task_local_waker_clone,
+                                                                     task_local_wake,
+                                                                     task_local_wake_by_ref,
+                                                                     task_local_drop);
 
-fn make_local_waker(weak: Weak) -> LocalWaker {
+fn make_local_waker(weak: Weak) -> LocalWaker
+{
     let raw_waker = RawWaker::new(weak.into_raw(), &TASK_LOCAL_WAKER_VTABLE);
     unsafe { LocalWaker::from_raw(raw_waker) }
 }
 
 //-----------------------------------------------------------------------------
 
-struct BufGroup {
+struct BufGroup
+{
     buf_ring: *mut io_uring_buf_ring,
     num_bufs: u32,
     buf_len: usize,
@@ -448,8 +448,10 @@ struct BufGroup {
     tail: u32,
 }
 
-impl BufGroup {
-    unsafe fn release(&mut self) {
+impl BufGroup
+{
+    unsafe fn release(&mut self)
+    {
         unsafe {
             io_uring_free_buf_ring(self.ring, self.buf_ring, self.num_bufs, self.bgid.into())
         };
@@ -469,7 +471,8 @@ impl BufGroup {
 
 //-----------------------------------------------------------------------------
 
-struct IoContextFrame {
+struct IoContextFrame
+{
     ioring: io_uring,
     _params: io_uring_params,
     available_fds: VecDeque<u32>,
@@ -485,30 +488,35 @@ struct IoContextFrame {
 //-----------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct RefCount {
+struct RefCount
+{
     obj_count: usize,
     op_count: usize,
     release_impl: unsafe fn(p: *mut u8),
     obj: *mut u8,
 }
 
-unsafe fn add_obj_ref(rc: *mut RefCount) {
+unsafe fn add_obj_ref(rc: *mut RefCount)
+{
     unsafe { (*rc).obj_count += 1 };
     // println!("add_obj_ref: {:?}", *rc);
 }
 
-unsafe fn add_op_ref(rc: *mut RefCount) {
+unsafe fn add_op_ref(rc: *mut RefCount)
+{
     unsafe { (*rc).op_count += 1 };
     // println!("add_op_ref: {:?}", *rc);
 }
 
-unsafe fn release_impl<T>(p: *mut u8) {
+unsafe fn release_impl<T>(p: *mut u8)
+{
     let layout = std::alloc::Layout::new::<T>();
     unsafe { std::ptr::drop_in_place(p.cast::<T>()) };
     unsafe { std::alloc::dealloc(p, layout) };
 }
 
-unsafe fn release_obj(rc: *mut RefCount) {
+unsafe fn release_obj(rc: *mut RefCount)
+{
     unsafe { (*rc).obj_count -= 1 };
     // println!("release_obj: {:?}", *rc);
     if unsafe { (*rc).obj_count == 0 && (*rc).op_count == 0 } {
@@ -518,7 +526,8 @@ unsafe fn release_obj(rc: *mut RefCount) {
     }
 }
 
-unsafe fn release_op(rc: *mut RefCount) {
+unsafe fn release_op(rc: *mut RefCount)
+{
     unsafe { (*rc).op_count -= 1 };
     // println!("release_op: {:?}", *rc);
     if unsafe { (*rc).obj_count == 0 && (*rc).op_count == 0 } {
@@ -530,20 +539,25 @@ unsafe fn release_op(rc: *mut RefCount) {
 
 //-----------------------------------------------------------------------------
 
-enum OpType {
-    Timeout {
-        dur: TimeSpec,
+enum OpType
+{
+    Timeout
+    {
+        dur: TimeSpec
     },
     #[allow(dead_code)]
     TimeoutCancel,
-    MultishotTimeout {
+    MultishotTimeout
+    {
         ts: TimeSpec,
         stream: *mut StreamImpl,
     },
-    TcpAccept {
-        fd: i32,
+    TcpAccept
+    {
+        fd: i32
     },
-    TcpConnect {
+    TcpConnect
+    {
         addr: SockaddrStorage,
         port: u16,
         ts: TimeSpec,
@@ -551,18 +565,21 @@ enum OpType {
         got_socket: bool,
         fd: i32,
     },
-    TcpSend {
+    TcpSend
+    {
         buf: Vec<u8>,
         last_send: *mut Instant,
     },
-    MultishotTcpRecv {
+    MultishotTcpRecv
+    {
         bufs: Vec<Vec<u8>>,
         buf_group: *mut BufGroup,
         last_recv: *mut Instant,
     },
 }
 
-struct IoUringOp {
+struct IoUringOp
+{
     ref_count: *mut RefCount,
     initiated: bool,
     done: bool,
@@ -572,56 +589,61 @@ struct IoUringOp {
     local_waker: Option<LocalWaker>,
 }
 
-fn make_io_uring_op(ref_count: *mut RefCount, op_type: OpType) -> IoUringOp {
-    IoUringOp {
-        ref_count,
-        initiated: false,
-        done: false,
-        eager_dropped: false,
-        res: -1,
-        local_waker: None,
-        op_type,
-    }
+fn make_io_uring_op(ref_count: *mut RefCount, op_type: OpType) -> IoUringOp
+{
+    IoUringOp { ref_count,
+                initiated: false,
+                done: false,
+                eager_dropped: false,
+                res: -1,
+                local_waker: None,
+                op_type }
 }
 
 //-----------------------------------------------------------------------------
 
-pub struct IoContext {
+pub struct IoContext
+{
     p: Rc<UnsafeCell<IoContextFrame>>,
 }
 
 //-----------------------------------------------------------------------------
 
-pub struct IoContextParams {
+pub struct IoContextParams
+{
     pub sq_entries: u32,
     pub cq_entries: u32,
     pub nr_files: u32,
 }
 
-impl IoContextParams {
+impl IoContextParams
+{
     #[must_use]
-    pub fn new() -> Self {
-        Self {
-            sq_entries: 256,
-            cq_entries: 1024,
-            nr_files: 1024,
-        }
+    pub fn new() -> Self
+    {
+        Self { sq_entries: 256,
+               cq_entries: 1024,
+               nr_files: 1024 }
     }
 }
 
-impl Default for IoContextParams {
-    fn default() -> Self {
+impl Default for IoContextParams
+{
+    fn default() -> Self
+    {
         Self::new()
     }
 }
 
 //-----------------------------------------------------------------------------
 
-unsafe fn submit_ring(ring: *mut io_uring) {
+unsafe fn submit_ring(ring: *mut io_uring)
+{
     let _r = unsafe { io_uring_submit_and_get_events(ring) };
 }
 
-unsafe fn reserve_sqes(ring: *mut io_uring, n: u32) {
+unsafe fn reserve_sqes(ring: *mut io_uring, n: u32)
+{
     let r = unsafe { io_uring_sq_space_left(ring) };
     if r < n {
         unsafe { submit_ring(ring) };
@@ -630,46 +652,58 @@ unsafe fn reserve_sqes(ring: *mut io_uring, n: u32) {
 
 //-----------------------------------------------------------------------------
 
-struct RunGuard {
+struct RunGuard
+{
     p: Rc<UnsafeCell<IoContextFrame>>,
 }
 
-struct CQESeenGuard<'a> {
+struct CQESeenGuard<'a>
+{
     ring: *mut io_uring,
     cqe: &'a mut io_uring_cqe,
 }
 
-impl Drop for CQESeenGuard<'_> {
-    fn drop(&mut self) {
+impl Drop for CQESeenGuard<'_>
+{
+    fn drop(&mut self)
+    {
         unsafe { io_uring_cqe_seen(self.ring, self.cqe) };
     }
 }
 
-struct CQEAdvanceGuard {
+struct CQEAdvanceGuard
+{
     ring: *mut io_uring,
     n: usize,
 }
 
-impl Drop for CQEAdvanceGuard {
-    fn drop(&mut self) {
+impl Drop for CQEAdvanceGuard
+{
+    fn drop(&mut self)
+    {
         if self.n > 0 {
             unsafe { io_uring_cq_advance(self.ring, self.n.try_into().unwrap()) };
         }
     }
 }
 
-struct IncrGuard<'a> {
+struct IncrGuard<'a>
+{
     n: &'a mut usize,
 }
 
-impl Drop for IncrGuard<'_> {
-    fn drop(&mut self) {
+impl Drop for IncrGuard<'_>
+{
+    fn drop(&mut self)
+    {
         *self.n += 1;
     }
 }
 
-impl Drop for RunGuard {
-    fn drop(&mut self) {
+impl Drop for RunGuard
+{
+    fn drop(&mut self)
+    {
         let ring = unsafe { &raw mut (*self.p.get()).ioring };
         {
             let tasks = unsafe { &mut (*self.p.get()).tasks };
@@ -709,31 +743,30 @@ impl Drop for RunGuard {
     }
 }
 
-impl IoContext {
+impl IoContext
+{
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new() -> Self
+    {
         let sq_entries = 256;
         let cq_entries = 4 * 1024;
         let nr_files = 1024; // matches the default for Linux processes
 
-        let params = IoContextParams {
-            sq_entries,
-            cq_entries,
-            nr_files,
-        };
+        let params = IoContextParams { sq_entries,
+                                       cq_entries,
+                                       nr_files };
 
         Self::with_params(&params)
     }
 
     #[must_use]
-    pub fn with_params(params: &IoContextParams) -> Self {
+    pub fn with_params(params: &IoContextParams) -> Self
+    {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let IoContextParams {
-            sq_entries,
-            cq_entries,
-            nr_files,
-        } = *params;
+        let IoContextParams { sq_entries,
+                              cq_entries,
+                              nr_files, } = *params;
 
         let mut params = unsafe { std::mem::zeroed::<io_uring_params>() };
         params.cq_entries = cq_entries;
@@ -744,18 +777,18 @@ impl IoContext {
 
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 
-        let p = Rc::new(UnsafeCell::new(IoContextFrame {
-            _params: params,
-            tasks: HashSet::new(),
-            available_fds: VecDeque::new(),
-            receiver: rx,
-            sender: tx,
-            ioring,
-            event_fd: nix::sys::eventfd::EventFd::new().unwrap(),
-            buf_groups: HashMap::new(),
-            runguard_blacklist: HashSet::new(),
-            local_task_queue: VecDeque::new(),
-        }));
+        let p =
+            Rc::new(UnsafeCell::new(IoContextFrame { _params: params,
+                                                     tasks: HashSet::new(),
+                                                     available_fds: VecDeque::new(),
+                                                     receiver: rx,
+                                                     sender: tx,
+                                                     ioring,
+                                                     event_fd:
+                                                         nix::sys::eventfd::EventFd::new().unwrap(),
+                                                     buf_groups: HashMap::new(),
+                                                     runguard_blacklist: HashSet::new(),
+                                                     local_task_queue: VecDeque::new() }));
 
         let ring = unsafe { &raw mut (*p.get()).ioring };
         let ret = unsafe { io_uring_queue_init_params(sq_entries, ring, &raw mut params) };
@@ -777,16 +810,20 @@ impl IoContext {
     }
 
     #[must_use]
-    pub fn get_executor(&self) -> Executor {
+    pub fn get_executor(&self) -> Executor
+    {
         Executor { p: self.p.clone() }
     }
 
-    fn ring(&self) -> *mut io_uring {
+    fn ring(&self) -> *mut io_uring
+    {
         unsafe { &raw mut (*self.p.get()).ioring }
     }
 
-    pub fn run(&mut self) -> u64 {
-        fn on_work_item(weak: Weak, ex: &Executor) -> u64 {
+    pub fn run(&mut self) -> u64
+    {
+        fn on_work_item(weak: Weak, ex: &Executor) -> u64
+        {
             match unsafe { weak.upgrade() } {
                 None => 0,
                 Some(mut task) => {
@@ -888,7 +925,8 @@ impl IoContext {
     }
 }
 
-fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor) {
+fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor)
+{
     let _ = ex;
     unsafe { release_op(op.ref_count) };
 
@@ -905,7 +943,8 @@ fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, 
     }
 }
 
-fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring, ex: &Executor) {
+fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring, ex: &Executor)
+{
     unsafe { release_op(op.ref_count) };
 
     let res = cqe.res;
@@ -943,7 +982,8 @@ fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring
     }
 }
 
-fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor) {
+fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor)
+{
     let _ = ex;
 
     if op.eager_dropped {
@@ -951,12 +991,10 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
         // * we need to release the borrowed direct descriptor back to the pool
         // * if the connect() succeeded, we need to close() it
 
-        let OpType::TcpConnect {
-            ref mut needs_socket,
-            ref mut got_socket,
-            fd,
-            ..
-        } = op.op_type
+        let OpType::TcpConnect { ref mut needs_socket,
+                                 ref mut got_socket,
+                                 fd,
+                                 .. } = op.op_type
         else {
             unreachable!()
         };
@@ -996,11 +1034,9 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
         return;
     }
 
-    let OpType::TcpConnect {
-        ref mut needs_socket,
-        ref mut got_socket,
-        ..
-    } = op.op_type
+    let OpType::TcpConnect { ref mut needs_socket,
+                             ref mut got_socket,
+                             .. } = op.op_type
     else {
         unreachable!()
     };
@@ -1026,7 +1062,8 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
     }
 }
 
-fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor) {
+fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor)
+{
     let _ = ex;
 
     let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
@@ -1039,10 +1076,8 @@ fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
         return;
     }
 
-    let OpType::TcpSend {
-        ref mut buf,
-        last_send,
-    } = op.op_type
+    let OpType::TcpSend { ref mut buf,
+                          last_send, } = op.op_type
     else {
         unreachable!()
     };
@@ -1067,20 +1102,15 @@ fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
     }
 }
 
-fn on_multishot_tcp_recv(
-    op: &mut IoUringOp,
-    cqe: &mut io_uring_cqe,
-    _ring: *mut io_uring,
-    ex: &Executor,
-) {
+fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
+                         ex: &Executor)
+{
     let _ = ex;
 
     let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
-    let OpType::MultishotTcpRecv {
-        ref mut bufs,
-        buf_group,
-        last_recv,
-    } = op.op_type
+    let OpType::MultishotTcpRecv { ref mut bufs,
+                                   buf_group,
+                                   last_recv, } = op.op_type
     else {
         unreachable!()
     };
@@ -1171,7 +1201,8 @@ fn on_multishot_tcp_recv(
     }
 }
 
-fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring) {
+fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring)
+{
     let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
 
     let io_object_dropped = op.eager_dropped;
@@ -1210,10 +1241,7 @@ fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut i
         unreachable!()
     };
 
-    let dur = Duration::new(
-        ts.tv_sec().try_into().unwrap(),
-        ts.tv_nsec().try_into().unwrap(),
-    );
+    let dur = Duration::new(ts.tv_sec().try_into().unwrap(), ts.tv_nsec().try_into().unwrap());
 
     let now = Instant::now();
     let stream_impl = unsafe { &mut *stream };
@@ -1235,8 +1263,10 @@ fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut i
     }
 }
 
-impl Drop for IoContext {
-    fn drop(&mut self) {
+impl Drop for IoContext
+{
+    fn drop(&mut self)
+    {
         drop(RunGuard { p: self.p.clone() });
 
         let buf_groups = unsafe { &mut (*self.p.get()).buf_groups };
@@ -1250,30 +1280,36 @@ impl Drop for IoContext {
     }
 }
 
-impl Default for IoContext {
-    fn default() -> Self {
+impl Default for IoContext
+{
+    fn default() -> Self
+    {
         Self::new()
     }
 }
 
 //-----------------------------------------------------------------------------
 
-struct SpawnValue<T> {
+struct SpawnValue<T>
+{
     t: Option<T>,
     waker: Option<Waker>,
 }
 
 //-----------------------------------------------------------------------------
 
-struct WrapperFuture<T, F: Future<Output = T>> {
+struct WrapperFuture<T, F: Future<Output = T>>
+{
     f: F,
     value: Rc<UnsafeCell<SpawnValue<T>>>,
 }
 
-impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F> {
+impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F>
+{
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
+    {
         let this = unsafe { self.get_unchecked_mut() };
 
         let r = unsafe { Pin::new_unchecked(&mut this.f).poll(cx) };
@@ -1293,14 +1329,17 @@ impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F> {
 
 //-----------------------------------------------------------------------------
 
-pub struct SpawnFuture<T> {
+pub struct SpawnFuture<T>
+{
     done: bool,
     value: Rc<UnsafeCell<SpawnValue<T>>>,
 }
 
-impl<T> Future for SpawnFuture<T> {
+impl<T> Future for SpawnFuture<T>
+{
     type Output = T;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
+    {
         assert!(!self.done);
 
         let result = unsafe { (*self.value.get()).t.take() };
@@ -1323,26 +1362,32 @@ impl<T> Future for SpawnFuture<T> {
 //-----------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct Executor {
+pub struct Executor
+{
     p: Rc<UnsafeCell<IoContextFrame>>,
 }
 
-impl Executor {
-    fn ring(&self) -> *mut io_uring {
+impl Executor
+{
+    fn ring(&self) -> *mut io_uring
+    {
         unsafe { &raw mut (*self.p.get()).ioring }
     }
 
-    unsafe fn get_available_fd(&self) -> Option<u32> {
+    unsafe fn get_available_fd(&self) -> Option<u32>
+    {
         let fds = unsafe { &mut (*self.p.get()).available_fds };
         fds.pop_front()
     }
 
-    unsafe fn reclaim_fd(&self, fd: u32) {
+    unsafe fn reclaim_fd(&self, fd: u32)
+    {
         let fds = unsafe { &mut (*self.p.get()).available_fds };
         fds.push_back(fd);
     }
 
-    pub fn register_buf_group(&self, bgid: u16, num_bufs: u32, buf_len: usize) -> Result<()> {
+    pub fn register_buf_group(&self, bgid: u16, num_bufs: u32, buf_len: usize) -> Result<()>
+    {
         let mut ret = 0_i32;
 
         let ring = self.ring();
@@ -1366,50 +1411,41 @@ impl Executor {
             bufs.push(addr);
 
             unsafe {
-                io_uring_buf_ring_add(
-                    buf_ring,
-                    addr.cast(),
-                    cap.try_into().unwrap(),
-                    bid.try_into().unwrap(),
-                    mask,
-                    bid.try_into().unwrap(),
-                );
+                io_uring_buf_ring_add(buf_ring,
+                                      addr.cast(),
+                                      cap.try_into().unwrap(),
+                                      bid.try_into().unwrap(),
+                                      mask,
+                                      bid.try_into().unwrap());
             }
         }
 
         unsafe { io_uring_buf_ring_advance(buf_ring, num_bufs.try_into().unwrap()) };
 
         unsafe {
-            (*self.p.get()).buf_groups.insert(
-                bgid,
-                Box::into_raw(Box::new(BufGroup {
-                    buf_ring,
-                    num_bufs,
-                    buf_len,
-                    bgid,
-                    bufs,
-                    ring,
-                    tail: 0,
-                })),
-            );
+            (*self.p.get()).buf_groups.insert(bgid,
+                                              Box::into_raw(Box::new(BufGroup { buf_ring,
+                                                                                num_bufs,
+                                                                                buf_len,
+                                                                                bgid,
+                                                                                bufs,
+                                                                                ring,
+                                                                                tail: 0 })));
         }
 
         Ok(())
     }
 
-    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T> {
-        let value = Rc::new(UnsafeCell::new(SpawnValue {
-            t: None,
-            waker: None,
-        }));
+    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T>
+    {
+        let value = Rc::new(UnsafeCell::new(SpawnValue { t: None,
+                                                         waker: None }));
 
         let sender = unsafe { (*self.p.get()).sender.clone() };
         let event_fd = unsafe { (*self.p.get()).event_fd.as_raw_fd() };
 
-        let wrapped = WrapperFuture {
-            f,
-            value: value.clone(),
-        };
+        let wrapped = WrapperFuture { f,
+                                      value: value.clone() };
 
         let task = Task::new(wrapped, sender.clone(), event_fd, self.clone());
 
@@ -1423,7 +1459,8 @@ impl Executor {
 //-----------------------------------------------------------------------------
 
 #[cfg(test)]
-mod test {
+mod test
+{
     use std::mem::zeroed;
 
     use nix::libc::{ECANCELED, ETIME};
@@ -1435,7 +1472,8 @@ mod test {
     };
 
     #[test]
-    fn timeout_inline_submit_cancel() {
+    fn timeout_inline_submit_cancel()
+    {
         // want to prove that timeouts and their removals are
         // processed inline with ring submission.
         // io_uring processes the SQ from left-to-right and if
@@ -1446,12 +1484,15 @@ mod test {
         // any number of CQEs associated with our user_data, and we must
         // ignore these CQEs as well
 
-        struct DropGuard {
+        struct DropGuard
+        {
             ring: *mut io_uring,
         }
 
-        impl Drop for DropGuard {
-            fn drop(&mut self) {
+        impl Drop for DropGuard
+        {
+            fn drop(&mut self)
+            {
                 unsafe { io_uring_queue_exit(self.ring) };
             }
         }
@@ -1465,10 +1506,8 @@ mod test {
 
             let _guard = DropGuard { ring };
 
-            let mut ts = __kernel_timespec {
-                tv_sec: 1,
-                tv_nsec: 0,
-            };
+            let mut ts = __kernel_timespec { tv_sec: 1,
+                                             tv_nsec: 0 };
 
             {
                 let sqe = io_uring_get_sqe(ring);

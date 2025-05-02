@@ -8,7 +8,8 @@ use std::{
     time::Duration,
 };
 
-async fn timer_op(ex: fiona::Executor, anums: Arc<AtomicI32>) {
+async fn timer_op(ex: fiona::Executor, anums: Arc<AtomicI32>)
+{
     let timer = fiona::time::Timer::new(ex);
     for _ in 0..10_000 {
         assert!(timer.wait(Duration::from_millis(1)).await.is_ok());
@@ -16,12 +17,11 @@ async fn timer_op(ex: fiona::Executor, anums: Arc<AtomicI32>) {
     }
 }
 
-fn fiona_timer() -> Result<(), String> {
-    let params = fiona::IoContextParams {
-        sq_entries: 16 * 1024,
-        cq_entries: 16 * 1024,
-        ..Default::default()
-    };
+fn fiona_timer() -> Result<(), String>
+{
+    let params = fiona::IoContextParams { sq_entries: 16 * 1024,
+                                          cq_entries: 16 * 1024,
+                                          ..Default::default() };
 
     let mut ioc = fiona::IoContext::with_params(&params);
     let ex = ioc.get_executor();
@@ -37,6 +37,7 @@ fn fiona_timer() -> Result<(), String> {
     Ok(())
 }
 
-fn main() {
+fn main()
+{
     utils::run_once("fiona_timer", fiona_timer).unwrap();
 }
