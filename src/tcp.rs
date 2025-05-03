@@ -1,4 +1,4 @@
-// Copyright 2024 Christian Mazakas
+// Copyright 2024-2025 Christian Mazakas
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
@@ -43,8 +43,8 @@ use liburing_rs::{
 };
 
 use crate::{
-    Executor, IoUringOp, OpType, RefCount, Result, add_obj_ref, add_op_ref, make_io_uring_op,
-    release_impl, release_obj, reserve_sqes, submit_ring,
+    Executor, IoUringOp, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
+    make_io_uring_op, release_impl, release_obj, reserve_sqes, submit_ring,
 };
 
 struct AcceptorImpl
@@ -232,9 +232,7 @@ impl Drop for AcceptorImpl
             let ring = self.ex.ring();
             let fd = self.fd.try_into().unwrap();
 
-            unsafe { reserve_sqes(ring, 1) };
-
-            let sqe = unsafe { io_uring_get_sqe(ring) };
+            let sqe = crate::get_sqe(&self.ex);
             unsafe { io_uring_prep_close_direct(sqe, fd) };
             unsafe { io_uring_sqe_set_data64(sqe, 0) };
             unsafe { submit_ring(ring) };
@@ -301,8 +299,7 @@ impl Future for AcceptFuture<'_>
                     *fd = file_index.try_into().unwrap();
                 }
 
-                unsafe { reserve_sqes(ring, 1) };
-                let sqe = unsafe { io_uring_get_sqe(ring) };
+                let sqe = crate::get_sqe(&acceptor_impl.ex);
 
                 unsafe {
                     io_uring_prep_accept_direct(sqe,
@@ -340,8 +337,7 @@ impl Drop for AcceptFuture<'_>
             // But first, we attempt cancellation across the board for our file descriptor
 
             let ring = acceptor_impl.ex.ring();
-            unsafe { reserve_sqes(ring, 1) };
-            let sqe = unsafe { io_uring_get_sqe(ring) };
+            let sqe = crate::get_sqe(&acceptor_impl.ex);
 
             let user_data = Box::as_mut_ptr(op) as usize as u64;
             unsafe {
@@ -374,10 +370,8 @@ impl Drop for AcceptFuture<'_>
 
             let ring = acceptor_impl.ex.ring();
 
-            unsafe { reserve_sqes(ring, 1) };
-
+            let sqe = get_sqe(&acceptor_impl.ex);
             unsafe {
-                let sqe = io_uring_get_sqe(ring);
                 io_uring_prep_close_direct(sqe, fd);
                 io_uring_sqe_set_data64(sqe, 0);
                 io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
@@ -399,9 +393,7 @@ impl Drop for StreamImpl
             let ring = self.ex.ring();
             let fd = self.fd.try_into().unwrap();
 
-            unsafe { reserve_sqes(ring, 1) };
-
-            let sqe = unsafe { io_uring_get_sqe(ring) };
+            let sqe = get_sqe(&self.ex);
             unsafe { io_uring_prep_close_direct(sqe, fd) };
             unsafe { io_uring_sqe_set_data64(sqe, 0) };
             unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
@@ -463,9 +455,7 @@ impl Stream
 
         let ts = ptr::from_mut(ts).cast();
 
-        unsafe { reserve_sqes(ring, 1) };
-
-        let sqe = unsafe { io_uring_get_sqe(ring) };
+        let sqe = get_sqe(&stream_impl.ex);
         unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
         unsafe { io_uring_sqe_set_data(sqe, user_data) };
 
@@ -529,9 +519,7 @@ impl Stream
         if let Some(ref mut timeout_op) = stream_impl.timeout_op {
             let ring = stream_impl.ex.ring();
 
-            unsafe { reserve_sqes(ring, 1) };
-
-            let sqe = unsafe { io_uring_get_sqe(ring) };
+            let sqe = get_sqe(&stream_impl.ex);
             let user_data = Box::as_mut_ptr(timeout_op) as u64;
 
             let OpType::MultishotTimeout { ref mut ts, .. } = timeout_op.op_type else {
@@ -600,8 +588,7 @@ impl Client
 
         let ts = std::ptr::from_mut(ts).cast();
 
-        unsafe { reserve_sqes(ring, 1) };
-        let sqe = unsafe { io_uring_get_sqe(ring) };
+        let sqe = get_sqe(&stream_impl.ex);
 
         unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
         unsafe { io_uring_sqe_set_data(sqe, user_data) };
@@ -933,9 +920,7 @@ impl Drop for ConnectFuture<'_>
             let user_data = Box::as_mut_ptr(&mut op);
 
             let ring = client_impl.stream.ex.ring();
-            unsafe { reserve_sqes(ring, 1) };
-
-            let sqe = unsafe { io_uring_get_sqe(ring) };
+            let sqe = crate::get_sqe(&client_impl.stream.ex);
 
             unsafe { io_uring_prep_cancel(sqe, user_data.cast(), IORING_ASYNC_CANCEL_ALL as i32) };
             unsafe { io_uring_sqe_set_data64(sqe, 0) };
@@ -959,8 +944,7 @@ impl Drop for SendFuture<'_>
         let op = self.op.as_mut().unwrap();
         if op.initiated && !op.done {
             let ring = stream_impl.ex.ring();
-            unsafe { reserve_sqes(ring, 1) };
-            let sqe = unsafe { io_uring_get_sqe(ring) };
+            let sqe = crate::get_sqe(&stream_impl.ex);
 
             let user_data = Box::as_mut_ptr(op) as usize as u64;
             unsafe {
@@ -1008,10 +992,9 @@ impl Future for SendFuture<'_>
                 };
 
                 let ring = stream_impl.ex.ring();
-                unsafe { reserve_sqes(ring, 1) };
 
                 {
-                    let sqe = unsafe { io_uring_get_sqe(ring) };
+                    let sqe = crate::get_sqe(&stream_impl.ex);
                     unsafe {
                         io_uring_prep_send_zc(sqe,
                                               stream_impl.fd,
@@ -1106,9 +1089,7 @@ impl Future for RecvFuture<'_>
 
                 let user_data = Box::as_mut_ptr(&mut op).cast();
 
-                unsafe { reserve_sqes(ring, 1) };
-
-                let sqe = unsafe { io_uring_get_sqe(ring) };
+                let sqe = crate::get_sqe(&stream_impl.ex);
 
                 let sockfd = stream_impl.fd;
                 let flags = IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT;

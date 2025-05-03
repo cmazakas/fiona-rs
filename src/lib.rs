@@ -1,4 +1,4 @@
-// Copyright 2024 Christian Mazakas
+// Copyright 2024-2025 Christian Mazakas
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
@@ -55,8 +55,8 @@ use liburing_rs::{
     io_uring_peek_cqe, io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_read,
     io_uring_prep_timeout, io_uring_queue_exit, io_uring_queue_init_params,
     io_uring_register_files_sparse, io_uring_register_ring_fd, io_uring_setup_buf_ring,
-    io_uring_sq_space_left, io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
-    io_uring_submit_and_get_events, io_uring_submit_and_wait,
+    io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data, io_uring_sqe_set_data64,
+    io_uring_sqe_set_flags, io_uring_submit_and_get_events, io_uring_submit_and_wait,
 };
 
 pub mod tcp;
@@ -642,6 +642,19 @@ unsafe fn submit_ring(ring: *mut io_uring)
     let _r = unsafe { io_uring_submit_and_get_events(ring) };
 }
 
+fn get_sqe(ex: &Executor) -> *mut io_uring_sqe
+{
+    let ring = ex.ring();
+
+    let mut sqe = unsafe { io_uring_get_sqe(ring) };
+    while sqe.is_null() {
+        unsafe { submit_ring(ring) };
+        sqe = unsafe { io_uring_get_sqe(ring) };
+    }
+
+    sqe
+}
+
 unsafe fn reserve_sqes(ring: *mut io_uring, n: u32)
 {
     let r = unsafe { io_uring_sq_space_left(ring) };
@@ -875,9 +888,7 @@ impl IoContext
             }
 
             if need_eventfd_read {
-                unsafe { reserve_sqes(ring, 1) };
-
-                let eventfd_sqe = unsafe { io_uring_get_sqe(ring) };
+                let eventfd_sqe = get_sqe(&ex);
                 let sqe = unsafe { &mut *eventfd_sqe };
                 let p = std::ptr::from_mut(&mut event_count).cast::<c_void>();
                 unsafe { io_uring_prep_read(sqe, event_fd, p, 8, 0) };
@@ -914,7 +925,9 @@ impl IoContext
                     OpType::MultishotTcpRecv { .. } => {
                         on_multishot_tcp_recv(op, cqe, ring, &ex);
                     }
-                    OpType::MultishotTimeout { .. } => on_multishot_timeout(op, cqe, ring),
+                    OpType::MultishotTimeout { .. } => {
+                        on_multishot_timeout(op, cqe, ring, &ex);
+                    }
                 }
             };
 
@@ -943,7 +956,7 @@ fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, 
     }
 }
 
-fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring, ex: &Executor)
+fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor)
 {
     unsafe { release_op(op.ref_count) };
 
@@ -957,11 +970,9 @@ fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring
                 unreachable!()
             };
 
-            unsafe { reserve_sqes(ring, 1) };
-
             let fd = fd.try_into().unwrap();
 
-            let sqe = unsafe { io_uring_get_sqe(ring) };
+            let sqe = get_sqe(ex);
             unsafe { io_uring_prep_close_direct(sqe, fd) };
             unsafe { io_uring_sqe_set_data64(sqe, 0) };
             unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
@@ -1014,11 +1025,7 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
         if *needs_socket {
             // this means our socket() call completed with a success
             if *got_socket {
-                let ring = ex.ring();
-
-                unsafe { reserve_sqes(ring, 1) };
-
-                let sqe = unsafe { io_uring_get_sqe(ring) };
+                let sqe = get_sqe(ex);
 
                 unsafe { io_uring_prep_close_direct(sqe, fd.try_into().unwrap()) };
                 unsafe { io_uring_sqe_set_data64(sqe, 0) };
@@ -1201,7 +1208,8 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
     }
 }
 
-fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut io_uring)
+fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
+                        ex: &Executor)
 {
     let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
 
@@ -1226,9 +1234,7 @@ fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut i
 
         let ts = ptr::from_mut(ts).cast();
 
-        unsafe { reserve_sqes(ring, 1) };
-
-        let sqe = unsafe { io_uring_get_sqe(ring) };
+        let sqe = get_sqe(ex);
         unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
         unsafe { io_uring_sqe_set_data(sqe, user_data) };
     }
@@ -1252,9 +1258,7 @@ fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, ring: *mut i
     let send_expired = stream_impl.send_pending && now.duration_since(stream_impl.last_send) > dur;
 
     if recv_expired || send_expired {
-        unsafe { reserve_sqes(ring, 1) };
-
-        let sqe = unsafe { io_uring_get_sqe(ring) };
+        let sqe = get_sqe(ex);
         let fd = stream_impl.fd;
         let flags = IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED;
         unsafe { io_uring_prep_cancel_fd(sqe, fd, flags) };
