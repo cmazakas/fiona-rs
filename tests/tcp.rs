@@ -668,13 +668,21 @@ fn tcp_connection_stress_test_no_cq_overflow()
     const CLIENT_BGID: u16 = 72;
     const MSG_LEN: usize = 1024;
 
+    // this test _should_ fail at NUM_BUFS = 32 due to a kernel bug
+    // rescheduling the recv op in the face of an ENOBUFS causes a CQE to be dropped
+    // it will be fixed in kernel versions 6.12+ and beyond
+    // const NUM_BUFS: u32 = 32;
+
+    const NUM_BUFS: u32 = 128;
+    const BUF_LEN: usize = 64;
+
     const TOTAL_CONNS: u32 = 3 * NR_FILES;
 
     fn make_io_context() -> fiona::IoContext
     {
         let params = &fiona::IoContextParams { sq_entries: 256,
                                                cq_entries: CQ_ENTRIES,
-                                               nr_files: 2 * NR_FILES };
+                                               nr_files: 3 * NR_FILES };
 
         fiona::IoContext::with_params(params)
     }
@@ -683,7 +691,8 @@ fn tcp_connection_stress_test_no_cq_overflow()
     {
         let mut ioc = make_io_context();
         let ex = ioc.get_executor();
-        ex.register_buf_group(CLIENT_BGID, 4 * 1024, 1024).unwrap();
+        ex.register_buf_group(CLIENT_BGID, NUM_BUFS, BUF_LEN)
+          .unwrap();
 
         ex.clone().spawn(async move {
                       for _ in 0..(TOTAL_CONNS / NR_FILES) {
@@ -715,9 +724,23 @@ fn tcp_connection_stress_test_no_cq_overflow()
 
                             client.set_buf_group(CLIENT_BGID);
 
-                            let bufs = client.recv().await.unwrap();
-                            let buf = flatten_bufs(bufs);
+                            let mut n = 0;
+                            let mut buf = Vec::new();
 
+                            while n < MSG_LEN {
+                                let mut mbufs = client.recv().await;
+                                while let Err(Errno::ENOBUFS) = mbufs {
+                                    println!("hit an ENOBUFS, rescheduling the recv");
+                                    mbufs = client.recv().await
+                                }
+
+                                for b in &mbufs.unwrap() {
+                                    n += b.len();
+                                    buf.extend_from_slice(b);
+                                }
+                            }
+
+                            assert_eq!(buf.len(), msg_copy.len());
                             assert_eq!(buf, msg_copy);
                             idx
                         })
@@ -741,7 +764,8 @@ fn tcp_connection_stress_test_no_cq_overflow()
     let port = acceptor.port();
 
     ex.clone().spawn(async move {
-                  ex.register_buf_group(SERVER_BGID, 4 * 1024, 1024).unwrap();
+                  ex.register_buf_group(SERVER_BGID, NUM_BUFS, BUF_LEN)
+                    .unwrap();
 
                   let mut conns = 0;
                   while conns < TOTAL_CONNS {
@@ -749,8 +773,23 @@ fn tcp_connection_stress_test_no_cq_overflow()
                       ex.clone().spawn(async move {
                                     stream.set_buf_group(SERVER_BGID);
 
-                                    let bufs = stream.recv().await.unwrap();
-                                    let send_buf = flatten_bufs(bufs);
+                                    let mut n = 0;
+                                    let mut buf = Vec::new();
+
+                                    while n < MSG_LEN {
+                                        let mut mbufs = stream.recv().await;
+                                        while let Err(Errno::ENOBUFS) = mbufs {
+                                            println!("hit an ENOBUFS, rescheduling the recv");
+                                            mbufs = stream.recv().await
+                                        }
+
+                                        for b in &mbufs.unwrap() {
+                                            n += b.len();
+                                            buf.extend_from_slice(b);
+                                        }
+                                    }
+
+                                    let send_buf = buf;
                                     assert!(!send_buf.is_empty());
 
                                     let send_buf = stream.send(send_buf).await.unwrap();
