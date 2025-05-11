@@ -480,7 +480,7 @@ struct IoContextFrame
     receiver: Receiver<Weak>,
     sender: Sender<Weak>,
     event_fd: EventFd,
-    buf_groups: HashMap<u16, *mut BufGroup>,
+    buf_groups: HashMap<u16, Box<UnsafeCell<BufGroup>>>,
     runguard_blacklist: HashSet<u64>,
     local_task_queue: VecDeque<Weak>,
 }
@@ -1275,8 +1275,7 @@ impl Drop for IoContext
 
         let buf_groups = unsafe { &mut (*self.p.get()).buf_groups };
         for (_, buf_group) in buf_groups.iter() {
-            unsafe { (**buf_group).release() };
-            drop(unsafe { Box::from_raw(*buf_group) });
+            unsafe { (*buf_group.get()).release() };
         }
         buf_groups.clear();
 
@@ -1426,15 +1425,17 @@ impl Executor
 
         unsafe { io_uring_buf_ring_advance(buf_ring, num_bufs.try_into().unwrap()) };
 
+        let bg = BufGroup { buf_ring,
+                            num_bufs,
+                            buf_len,
+                            bgid,
+                            bufs,
+                            ring,
+                            tail: 0 };
+
         unsafe {
-            (*self.p.get()).buf_groups.insert(bgid,
-                                              Box::into_raw(Box::new(BufGroup { buf_ring,
-                                                                                num_bufs,
-                                                                                buf_len,
-                                                                                bgid,
-                                                                                bufs,
-                                                                                ring,
-                                                                                tail: 0 })));
+            (*self.p.get()).buf_groups
+                           .insert(bgid, Box::new(UnsafeCell::new(bg)));
         }
 
         Ok(())

@@ -1067,15 +1067,14 @@ impl Future for RecvFuture<'_>
 
                 let ref_count = &raw mut stream_impl.ref_count;
 
-                let buf_group = match unsafe {
-                          (*stream_impl.ex.p.get()).buf_groups
-                                                   .get(&stream_impl.buf_group)
-                      } {
+                let bgid = stream_impl.buf_group;
+
+                let buf_group = match unsafe { (*stream_impl.ex.p.get()).buf_groups.get(&bgid) } {
                     None => {
                         self.completed = true;
                         return Poll::Ready(Err(Errno::ENOENT));
                     }
-                    Some(buf_group) => *buf_group,
+                    Some(buf_group) => buf_group.get(),
                 };
 
                 stream_impl.last_recv = Instant::now();
