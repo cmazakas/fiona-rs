@@ -10,7 +10,9 @@
          clippy::cast_ptr_alignment,
          clippy::too_many_lines,
          clippy::similar_names,
-         clippy::cast_possible_wrap)]
+         clippy::cast_possible_wrap,
+         clippy::cast_sign_loss,
+         clippy::cast_possible_truncation)]
 
 extern crate liburing_rs;
 extern crate nix;
@@ -22,11 +24,11 @@ use std::{
     future::Future,
     hash::Hash,
     marker::PhantomData,
-    mem::ManuallyDrop,
+    mem::{self, ManuallyDrop},
     ops::Deref,
     os::fd::AsRawFd,
     pin::Pin,
-    ptr::{self, DynMetadata, NonNull, metadata, null_mut},
+    ptr::{self, DynMetadata, NonNull, metadata},
     rc::Rc,
     sync::{
         atomic::{
@@ -57,6 +59,7 @@ use liburing_rs::{
     io_uring_register_files_sparse, io_uring_register_ring_fd, io_uring_setup_buf_ring,
     io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data, io_uring_sqe_set_data64,
     io_uring_sqe_set_flags, io_uring_submit_and_get_events, io_uring_submit_and_wait,
+    io_uring_unregister_buf_ring,
 };
 
 pub mod tcp;
@@ -439,11 +442,11 @@ fn make_local_waker(weak: Weak) -> LocalWaker
 
 struct BufGroup
 {
-    buf_ring: *mut io_uring_buf_ring,
+    br: *mut io_uring_buf_ring,
     num_bufs: u32,
     buf_len: usize,
     bgid: u16,
-    bufs: Vec<*mut u8>,
+    bufs: Vec<Vec<u8>>,
     ring: *mut io_uring,
     tail: u32,
 }
@@ -452,20 +455,11 @@ impl BufGroup
 {
     unsafe fn release(&mut self)
     {
-        unsafe {
-            io_uring_free_buf_ring(self.ring, self.buf_ring, self.num_bufs, self.bgid.into())
-        };
+        let ring = self.ring;
+        let bgid = self.bgid.into();
 
-        let bufs = &mut self.bufs;
-
-        for ptr in bufs.iter() {
-            if ptr.is_null() {
-                continue;
-            }
-            drop(unsafe { Vec::<u8>::from_raw_parts(*ptr, self.buf_len, self.buf_len) });
-        }
-
-        bufs.shrink_to_fit();
+        unsafe { io_uring_unregister_buf_ring(ring, bgid) };
+        unsafe { io_uring_free_buf_ring(ring, self.br, self.num_bufs, bgid) };
     }
 }
 
@@ -1125,36 +1119,37 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
     if op.eager_dropped {
         if cqe.res > 0 {
             let buf_group = unsafe { &mut *buf_group };
-            let mask = buf_group.num_bufs - 1;
-            let br = buf_group.buf_ring;
+            let br = buf_group.br;
+            let buf_len = buf_group.buf_len;
+            let mask = io_uring_buf_ring_mask(buf_group.num_bufs) as u32;
 
-            let len = buf_group.buf_len;
+            let mut count = 0;
+            let mut num_bytes = usize::try_from(cqe.res).unwrap();
 
-            let num_bytes = usize::try_from(cqe.res).unwrap();
+            while num_bytes > 0 {
+                let mut n = buf_len;
+                if n > num_bytes {
+                    n = num_bytes;
+                }
 
-            let num_buffers = (num_bytes / len) + usize::from(num_bytes % len > 0);
-
-            for buf_offset in 0..num_buffers {
-                let bid = buf_group.tail.try_into().unwrap();
-
-                let buf = Vec::<u8>::with_capacity(buf_group.buf_len);
-                let (addr, _, _) = buf.into_raw_parts();
-                buf_group.bufs[usize::from(bid)] = addr;
-
-                let len = buf_group.buf_len.try_into().unwrap();
-                let addr = addr.cast();
-                let buf_offset = buf_offset.try_into().unwrap();
-
+                let bid = buf_group.tail as _;
                 buf_group.tail = (buf_group.tail + 1) & mask;
 
-                let mask = mask.try_into().unwrap();
+                let addr = unsafe { &raw mut *buf_group.bufs.as_mut_ptr().add(bid) };
 
                 unsafe {
-                    io_uring_buf_ring_add(br, addr, len, bid, mask, buf_offset);
+                    io_uring_buf_ring_add(br,
+                                          addr.cast(),
+                                          buf_len as _,
+                                          bid as _,
+                                          mask as _,
+                                          count);
                 }
+
+                count += 1;
+                num_bytes -= n;
             }
 
-            let count = num_buffers.try_into().unwrap();
             unsafe { io_uring_buf_ring_advance(br, count) };
         }
 
@@ -1178,28 +1173,30 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
 
     op.res = cqe.res;
     if op.res > 0 {
-        let mut bid = usize::try_from(cqe.flags >> IORING_CQE_BUFFER_SHIFT).unwrap();
+        let mut bid = cqe.flags >> IORING_CQE_BUFFER_SHIFT;
 
         let buf_group = unsafe { &mut *buf_group };
 
         let buf_len = buf_group.buf_len;
         let num_bufs = buf_group.num_bufs;
-        let num_bufs_mask = usize::try_from(num_bufs - 1).unwrap();
-        let ring_bufs = &mut buf_group.bufs;
+        let mask = io_uring_buf_ring_mask(num_bufs) as u32;
 
         let mut num_bytes = usize::try_from(cqe.res).unwrap();
         while num_bytes > 0 {
-            let to_read = std::cmp::min(num_bytes, buf_len);
+            let mut n = buf_len;
+            if n > num_bytes {
+                n = num_bytes;
+            }
 
-            let p = &mut ring_bufs[bid];
-            let ptr = *p;
-            *p = null_mut();
+            let mut buf = Vec::new();
 
-            let buf = unsafe { Vec::from_raw_parts(ptr, to_read, buf_len) };
+            mem::swap(&mut buf, &mut buf_group.bufs[bid as usize]);
+            unsafe { buf.set_len(n) };
+
             bufs.push(buf);
 
-            bid = (bid + 1) & num_bufs_mask;
-            num_bytes -= to_read;
+            bid = (bid + 1) & mask;
+            num_bytes -= n;
         }
     }
 
@@ -1403,29 +1400,28 @@ impl Executor
             return Err(Errno::from_raw(-ret));
         }
 
-        let mut bufs = Vec::<*mut u8>::with_capacity(num_bufs.try_into().unwrap());
+        let mut bufs = Vec::with_capacity(num_bufs as usize);
 
         let mask = io_uring_buf_ring_mask(num_bufs);
         for bid in 0..num_bufs {
-            let buf = Vec::<u8>::with_capacity(buf_len);
+            let mut buf = Vec::<u8>::with_capacity(buf_len);
+            let addr = buf.as_mut_ptr();
 
-            let (addr, _, cap) = buf.into_raw_parts();
-
-            bufs.push(addr);
+            bufs.push(buf);
 
             unsafe {
                 io_uring_buf_ring_add(buf_ring,
                                       addr.cast(),
-                                      cap.try_into().unwrap(),
-                                      bid.try_into().unwrap(),
+                                      buf_len as _,
+                                      bid as _,
                                       mask,
-                                      bid.try_into().unwrap());
+                                      bid as _);
             }
         }
 
         unsafe { io_uring_buf_ring_advance(buf_ring, num_bufs.try_into().unwrap()) };
 
-        let bg = BufGroup { buf_ring,
+        let bg = BufGroup { br: buf_ring,
                             num_bufs,
                             buf_len,
                             bgid,

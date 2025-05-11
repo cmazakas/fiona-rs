@@ -673,8 +673,8 @@ fn tcp_connection_stress_test_no_cq_overflow()
     // it will be fixed in kernel versions 6.12+ and beyond
     // const NUM_BUFS: u32 = 32;
 
-    const NUM_BUFS: u32 = 128;
-    const BUF_LEN: usize = 64;
+    const NUM_BUFS: u32 = 64;
+    const BUF_LEN: usize = 1024;
 
     const TOTAL_CONNS: u32 = 3 * NR_FILES;
 
@@ -682,7 +682,7 @@ fn tcp_connection_stress_test_no_cq_overflow()
     {
         let params = &fiona::IoContextParams { sq_entries: 256,
                                                cq_entries: CQ_ENTRIES,
-                                               nr_files: 3 * NR_FILES };
+                                               nr_files: 2 * NR_FILES };
 
         fiona::IoContext::with_params(params)
     }

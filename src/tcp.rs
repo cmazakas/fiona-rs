@@ -1120,24 +1120,29 @@ impl Future for RecvFuture<'_>
                     let buf_seq = mem::take(bufs);
 
                     let buf_group = unsafe { &mut *buf_group };
-                    let mask = io_uring_buf_ring_mask(buf_group.num_bufs);
-
-                    let br = buf_group.buf_ring;
+                    let br = buf_group.br;
+                    let buf_len = buf_group.buf_len;
+                    let mask = io_uring_buf_ring_mask(buf_group.num_bufs) as u32;
 
                     for buf_offset in 0..buf_seq.len() {
-                        let bid = buf_group.tail.try_into().unwrap();
+                        let bid = buf_group.tail as _;
 
-                        let buf = Vec::<u8>::with_capacity(buf_group.buf_len);
-                        let (addr, _, _) = buf.into_raw_parts();
-                        buf_group.bufs[usize::from(bid)] = addr;
+                        let mut buf = Vec::<u8>::with_capacity(buf_len);
+                        let addr = buf.as_mut_ptr().cast();
 
-                        let len = buf_group.buf_len.try_into().unwrap();
-                        let addr = addr.cast();
-                        let buf_offset = buf_offset.try_into().unwrap();
+                        buf_group.bufs[bid as usize] = buf;
 
-                        buf_group.tail = (buf_group.tail + 1) & u32::try_from(mask).unwrap();
+                        let buf_offset = buf_offset as _;
+                        buf_group.tail = (buf_group.tail + 1) & mask;
 
-                        unsafe { io_uring_buf_ring_add(br, addr, len, bid, mask, buf_offset) };
+                        unsafe {
+                            io_uring_buf_ring_add(br,
+                                                  addr,
+                                                  buf_len as _,
+                                                  bid,
+                                                  mask as _,
+                                                  buf_offset);
+                        }
                     }
 
                     let count = buf_seq.len().try_into().unwrap();
