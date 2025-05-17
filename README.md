@@ -1,5 +1,13 @@
 # fiona-rs
 
+Building this crate successfully may require the following in your `.cargo/config.toml`:
+
+```toml
+[env]
+CLANG_PATH = "/usr/bin/clang-20"
+LIBCLANG_PATH = "/usr/lib/llvm-20/lib"
+```
+
 Requires Linux kernel version 6.8 and up.
 
 A Rust port of some C++ I had written which was a port of some Rust code I originally worked on.
