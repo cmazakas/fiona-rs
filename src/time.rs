@@ -6,7 +6,7 @@ extern crate liburing_rs;
 
 use std::{future::Future, ptr::NonNull, task::Poll, time::Duration};
 
-use nix::{errno::Errno, libc::ETIME, sys::time::TimeSpec};
+use nix::{errno::Errno, libc::ETIME};
 
 use liburing_rs::{
     __kernel_timespec, IOSQE_CQE_SKIP_SUCCESS, io_uring_get_sqe, io_uring_prep_timeout,
@@ -74,19 +74,10 @@ impl Timer
 
         let ref_count = &raw mut timer_impl.ref_count;
 
-        TimerFuture {
-            timer: self,
-            completed: false,
-            op: Some(Box::new(make_io_uring_op(
-                ref_count,
-                OpType::Timeout {
-                    dur: TimeSpec::new(
-                        dur.as_secs().try_into().unwrap(),
-                        dur.subsec_nanos().into(),
-                    ),
-                },
-            ))),
-        }
+        TimerFuture { timer: self,
+                      completed: false,
+                      op: Some(Box::new(make_io_uring_op(ref_count,
+                                                         OpType::Timeout { dur: dur.into() }))) }
     }
 }
 

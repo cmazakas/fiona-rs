@@ -549,28 +549,32 @@ fn tcp_recv_timeout()
 
         ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
 
-        ex.clone().spawn(async move {
-                      let client = fiona::tcp::Client::new(ex.clone());
+        let ex2 = ex.clone();
+        let client_fn = async move {
+            let ex = ex2;
+            let client = fiona::tcp::Client::new(ex.clone());
 
-                      client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                            .await
-                            .unwrap();
+            client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                  .await
+                  .unwrap();
 
-                      client.set_buf_group(bgid);
+            client.set_buf_group(bgid);
 
-                      let msg = String::from("hello, world!");
-                      let mut msg = client.send(msg.into_bytes()).await.unwrap();
-                      assert!(msg.is_empty());
-                      msg.extend_from_slice("hello, world!".as_bytes());
+            let msg = String::from("hello, world!");
+            let mut msg = client.send(msg.into_bytes()).await.unwrap();
+            assert!(msg.is_empty());
+            msg.extend_from_slice("hello, world!".as_bytes());
 
-                      let timer = fiona::time::Timer::new(ex);
-                      timer.wait(Duration::from_millis(1000)).await.unwrap();
+            let timer = fiona::time::Timer::new(ex);
+            timer.wait(Duration::from_millis(1000)).await.unwrap();
 
-                      let msg = client.send(msg).await.unwrap();
-                      assert!(msg.is_empty());
+            let msg = client.send(msg).await.unwrap();
+            assert!(msg.is_empty());
 
-                      unsafe { NUM_RUNS += 1 };
-                  });
+            unsafe { NUM_RUNS += 1 };
+        };
+
+        ex.clone().spawn(client_fn);
 
         let stream = acceptor.accept().await.unwrap();
         stream.set_buf_group(bgid);
@@ -603,30 +607,34 @@ fn tcp_recv_timeout()
         ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
 
         let ex2 = ex.clone();
-        ex.clone().spawn(async move {
-                      let client = fiona::tcp::Client::new(ex2.clone());
+        let client_fn = async move {
+            let client = fiona::tcp::Client::new(ex2.clone());
 
-                      client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                            .await
-                            .unwrap();
+            client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                  .await
+                  .unwrap();
 
-                      client.set_buf_group(bgid);
-                      client.set_timeout(Duration::from_millis(500));
+            client.set_buf_group(bgid);
+            client.set_timeout(Duration::from_millis(500));
 
-                      let bufs = client.recv().await.unwrap();
-                      assert_eq!(bufs_to_string(bufs), "wonderful day");
+            let bufs = client.recv().await.unwrap();
+            assert_eq!(bufs_to_string(bufs), "wonderful day");
 
-                      let err = client.recv().await.unwrap_err();
-                      assert_eq!(err, Errno::ECANCELED);
+            let err = client.recv().await.unwrap_err();
+            assert_eq!(err, Errno::ECANCELED);
 
-                      let bufs = client.recv().await.unwrap();
-                      assert_eq!(bufs_to_string(bufs), "wonderful day");
+            let bufs = client.recv().await.unwrap();
+            assert_eq!(bufs_to_string(bufs), "wonderful day");
 
-                      let err = client.recv().await.unwrap_err();
-                      assert_eq!(err, Errno::ECANCELED);
+            println!("going to do the final wait now");
+            let err = client.recv().await.unwrap_err();
+            assert_eq!(err, Errno::ECANCELED);
 
-                      unsafe { NUM_RUNS += 1 };
-                  });
+            println!("okay, this is all done too!");
+            unsafe { NUM_RUNS += 1 };
+        };
+
+        ex.clone().spawn(client_fn);
 
         let stream = acceptor.accept().await.unwrap();
         stream.set_buf_group(bgid);
@@ -637,10 +645,12 @@ fn tcp_recv_timeout()
         msg.extend_from_slice("wonderful day".as_bytes());
 
         let timer = fiona::time::Timer::new(ex);
-        timer.wait(Duration::from_millis(1000)).await.unwrap();
+        timer.wait(Duration::from_millis(750)).await.unwrap();
 
         let msg = stream.send(msg).await.unwrap();
         assert!(msg.is_empty());
+
+        println!("server side is all done now");
 
         unsafe { NUM_RUNS += 1 };
     }
@@ -730,7 +740,6 @@ fn tcp_connection_stress_test_no_cq_overflow()
                             while n < MSG_LEN {
                                 let mut mbufs = client.recv().await;
                                 while let Err(Errno::ENOBUFS) = mbufs {
-                                    println!("hit an ENOBUFS, rescheduling the recv");
                                     mbufs = client.recv().await
                                 }
 
@@ -779,7 +788,6 @@ fn tcp_connection_stress_test_no_cq_overflow()
                                     while n < MSG_LEN {
                                         let mut mbufs = stream.recv().await;
                                         while let Err(Errno::ENOBUFS) = mbufs {
-                                            println!("hit an ENOBUFS, rescheduling the recv");
                                             mbufs = stream.recv().await
                                         }
 

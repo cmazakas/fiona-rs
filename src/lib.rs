@@ -44,22 +44,22 @@ use std::{
 use nix::{
     errno::Errno,
     libc::{ETIME, c_void},
-    sys::{eventfd::EventFd, socket::SockaddrStorage, time::TimeSpec},
+    sys::{eventfd::EventFd, socket::SockaddrStorage},
 };
 
 use liburing_rs::{
-    IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED, IORING_CQE_BUFFER_SHIFT,
-    IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IORING_SETUP_CQSIZE, IORING_SETUP_DEFER_TASKRUN,
-    IORING_SETUP_SINGLE_ISSUER, IORING_TIMEOUT_MULTISHOT, IOSQE_CQE_SKIP_SUCCESS, io_uring,
-    io_uring_buf_ring, io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask,
-    io_uring_cq_advance, io_uring_cqe, io_uring_cqe_seen, io_uring_for_each_cqe,
-    io_uring_free_buf_ring, io_uring_get_events, io_uring_get_sqe, io_uring_params,
-    io_uring_peek_cqe, io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_read,
-    io_uring_prep_timeout, io_uring_queue_exit, io_uring_queue_init_params,
-    io_uring_register_files_sparse, io_uring_register_ring_fd, io_uring_setup_buf_ring,
-    io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data, io_uring_sqe_set_data64,
-    io_uring_sqe_set_flags, io_uring_submit_and_get_events, io_uring_submit_and_wait,
-    io_uring_unregister_buf_ring,
+    __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
+    IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IORING_SETUP_CQSIZE,
+    IORING_SETUP_DEFER_TASKRUN, IORING_SETUP_SINGLE_ISSUER, IORING_TIMEOUT_MULTISHOT,
+    IOSQE_CQE_SKIP_SUCCESS, io_uring, io_uring_buf_ring, io_uring_buf_ring_add,
+    io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_cq_advance, io_uring_cqe,
+    io_uring_cqe_seen, io_uring_for_each_cqe, io_uring_free_buf_ring, io_uring_get_events,
+    io_uring_get_sqe, io_uring_params, io_uring_peek_cqe, io_uring_prep_cancel_fd,
+    io_uring_prep_close_direct, io_uring_prep_read, io_uring_prep_timeout, io_uring_queue_exit,
+    io_uring_queue_init_params, io_uring_register_files_sparse, io_uring_register_ring_fd,
+    io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data,
+    io_uring_sqe_set_data64, io_uring_sqe_set_flags, io_uring_submit_and_get_events,
+    io_uring_submit_and_wait, io_uring_unregister_buf_ring,
 };
 
 pub mod tcp;
@@ -537,13 +537,13 @@ enum OpType
 {
     Timeout
     {
-        dur: TimeSpec
+        dur: __kernel_timespec
     },
     #[allow(dead_code)]
     TimeoutCancel,
     MultishotTimeout
     {
-        ts: TimeSpec,
+        ts: __kernel_timespec,
         stream: *mut StreamImpl,
     },
     TcpAccept
@@ -554,7 +554,7 @@ enum OpType
     {
         addr: SockaddrStorage,
         port: u16,
-        ts: TimeSpec,
+        ts: __kernel_timespec,
         needs_socket: bool,
         got_socket: bool,
         fd: i32,
@@ -1244,7 +1244,7 @@ fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut 
         unreachable!()
     };
 
-    let dur = Duration::new(ts.tv_sec().try_into().unwrap(), ts.tv_nsec().try_into().unwrap());
+    let dur = Duration::new(ts.tv_sec.try_into().unwrap(), ts.tv_nsec.try_into().unwrap());
 
     let now = Instant::now();
     let stream_impl = unsafe { &mut *stream };

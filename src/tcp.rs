@@ -25,15 +25,14 @@ use nix::{
             AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrStorage,
             bind, getsockname, listen, setsockopt, socket, sockopt::ReuseAddr,
         },
-        time::TimeSpec,
     },
 };
 
 use liburing_rs::{
-    IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED, IORING_RECVSEND_BUNDLE,
-    IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT, IOSQE_BUFFER_SELECT,
-    IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring_buf_ring_add,
-    io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_get_sqe,
+    __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
+    IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT,
+    IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK,
+    io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_get_sqe,
     io_uring_prep_accept_direct, io_uring_prep_cancel, io_uring_prep_cancel_fd,
     io_uring_prep_cancel64, io_uring_prep_close_direct, io_uring_prep_connect,
     io_uring_prep_link_timeout, io_uring_prep_recv_multishot, io_uring_prep_send_zc,
@@ -65,7 +64,7 @@ pub(crate) struct StreamImpl
     pub(crate) last_recv: Instant,
     ref_count: RefCount,
     ex: Executor,
-    ts: TimeSpec,
+    ts: __kernel_timespec,
     buf_group: u16,
     recv_pending: bool,
     timeout_op: Option<Box<IoUringOp>>,
@@ -427,7 +426,7 @@ impl Stream
             let stream_impl = StreamImpl { ref_count,
                                            ex,
                                            fd,
-                                           ts: TimeSpec::from_duration(Duration::from_secs(3)),
+                                           ts: Duration::from_secs(3).into(),
                                            buf_group: u16::MAX,
                                            send_pending: false,
                                            recv_pending: false,
@@ -514,7 +513,7 @@ impl Stream
     {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
 
-        stream_impl.ts = TimeSpec::from_duration(dur);
+        stream_impl.ts = dur.into();
 
         if let Some(ref mut timeout_op) = stream_impl.timeout_op {
             let ring = stream_impl.ex.ring();
@@ -554,20 +553,20 @@ impl Client
                                    release_impl: release_impl::<ClientImpl>,
                                    obj: p.as_ptr() };
 
-        let client_impl =
-            ClientImpl { stream: StreamImpl { ref_count,
-                                              ex,
-                                              fd: -1,
-                                              ts:
-                                                  TimeSpec::from_duration(Duration::from_secs(3)),
-                                              buf_group: u16::MAX,
-                                              send_pending: false,
-                                              recv_pending: false,
-                                              last_send: Instant::now(),
-                                              last_recv: Instant::now(),
-                                              timeout_op: None,
-                                              recv_op: None },
-                         connect_pending: false };
+        let stream = StreamImpl { ref_count,
+                                  ex,
+                                  fd: -1,
+                                  ts: Duration::from_secs(3).into(),
+                                  buf_group: u16::MAX,
+                                  send_pending: false,
+                                  recv_pending: false,
+                                  last_send: Instant::now(),
+                                  last_recv: Instant::now(),
+                                  timeout_op: None,
+                                  recv_op: None };
+
+        let client_impl = ClientImpl { stream,
+                                       connect_pending: false };
 
         let p = p.cast::<ClientImpl>();
         unsafe { std::ptr::write(p.as_ptr(), client_impl) };
@@ -585,8 +584,6 @@ impl Client
         let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
             unreachable!()
         };
-
-        let ts = std::ptr::from_mut(ts).cast();
 
         let sqe = get_sqe(&stream_impl.ex);
 
