@@ -20,11 +20,9 @@ use std::{
 use nix::{
     errno::Errno,
     libc::{AF_INET, AF_INET6, ENFILE, IPPROTO_TCP, MSG_WAITALL, SOCK_STREAM},
-    sys::{
-        socket::{
-            AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrStorage,
-            bind, getsockname, listen, setsockopt, socket, sockopt::ReuseAddr,
-        },
+    sys::socket::{
+        AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrStorage,
+        bind, getsockname, listen, setsockopt, socket, sockopt::ReuseAddr,
     },
 };
 

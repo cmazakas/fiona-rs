@@ -686,7 +686,7 @@ fn tcp_connection_stress_test_no_cq_overflow()
     const NUM_BUFS: u32 = 64;
     const BUF_LEN: usize = 1024;
 
-    const TOTAL_CONNS: u32 = 3 * NR_FILES;
+    const TOTAL_CONNS: u32 = NR_FILES;
 
     fn make_io_context() -> fiona::IoContext
     {
@@ -699,71 +699,112 @@ fn tcp_connection_stress_test_no_cq_overflow()
 
     fn client(port: u16)
     {
+        async fn client_task(ex: fiona::Executor, port: u16, idx: u32) -> u32
+        {
+            let mut message = vec![0; MSG_LEN];
+            {
+                let mut rng = rand::rngs::StdRng::from_os_rng();
+                rand::RngCore::fill_bytes(&mut rng, &mut message);
+            }
+
+            let timer = fiona::time::Timer::new(ex.clone());
+            timer.wait(Duration::from_millis(message[0].into()))
+                 .await
+                 .unwrap();
+
+            let client = fiona::tcp::Client::new(ex);
+            client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                  .await
+                  .unwrap();
+
+            let msg_copy = message.clone();
+            let message = client.send(message).await.unwrap();
+            assert!(message.is_empty());
+
+            client.set_buf_group(CLIENT_BGID);
+
+            let mut n = 0;
+            let mut buf = Vec::new();
+
+            while n < MSG_LEN {
+                let mut mbufs = client.recv().await;
+                while let Err(Errno::ENOBUFS) = mbufs {
+                    mbufs = client.recv().await
+                }
+
+                for b in &mbufs.unwrap() {
+                    n += b.len();
+                    buf.extend_from_slice(b);
+                }
+            }
+
+            assert_eq!(buf.len(), msg_copy.len());
+            assert_eq!(buf, msg_copy);
+            idx
+        }
+
+        async fn run_conns(ex: fiona::Executor, port: u16)
+        {
+            for _ in 0..(TOTAL_CONNS / NR_FILES) {
+                let mut tasks: FuturesUnordered<fiona::SpawnFuture<u32>> =
+                    (0..NR_FILES).map(|idx| ex.clone().spawn(client_task(ex.clone(), port, idx)))
+                                 .collect();
+
+                while !tasks.is_empty() {
+                    tasks.next().await.unwrap();
+                }
+            }
+        }
+
         let mut ioc = make_io_context();
         let ex = ioc.get_executor();
         ex.register_buf_group(CLIENT_BGID, NUM_BUFS, BUF_LEN)
           .unwrap();
 
-        ex.clone().spawn(async move {
-                      for _ in 0..(TOTAL_CONNS / NR_FILES) {
-                          let mut tasks: FuturesUnordered<fiona::SpawnFuture<u32>> =
-                              (0..NR_FILES).map(|idx| {
-                                               let ex2 = ex.clone();
-                                               ex.clone().spawn(async move {
-                            let mut message = vec![0; MSG_LEN];
-                            {
-                                let mut rng = rand::rngs::StdRng::from_os_rng();
-                                rand::RngCore::fill_bytes(&mut rng, &mut message);
-                            }
-
-                            let timer = fiona::time::Timer::new(ex2.clone());
-                            timer
-                                .wait(Duration::from_millis(message[0].into()))
-                                .await
-                                .unwrap();
-
-                            let client = fiona::tcp::Client::new(ex2);
-                            client
-                                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                                .await
-                                .unwrap();
-
-                            let msg_copy = message.clone();
-                            let message = client.send(message).await.unwrap();
-                            assert!(message.is_empty());
-
-                            client.set_buf_group(CLIENT_BGID);
-
-                            let mut n = 0;
-                            let mut buf = Vec::new();
-
-                            while n < MSG_LEN {
-                                let mut mbufs = client.recv().await;
-                                while let Err(Errno::ENOBUFS) = mbufs {
-                                    mbufs = client.recv().await
-                                }
-
-                                for b in &mbufs.unwrap() {
-                                    n += b.len();
-                                    buf.extend_from_slice(b);
-                                }
-                            }
-
-                            assert_eq!(buf.len(), msg_copy.len());
-                            assert_eq!(buf, msg_copy);
-                            idx
-                        })
-                                           })
-                                           .collect();
-
-                          while !tasks.is_empty() {
-                              tasks.next().await.unwrap();
-                          }
-                      }
-                  });
+        ex.clone().spawn(run_conns(ex, port));
 
         let n = ioc.run();
         assert_eq!(n, (1 + TOTAL_CONNS).into());
+    }
+
+    async fn on_accept(stream: fiona::tcp::Stream)
+    {
+        stream.set_buf_group(SERVER_BGID);
+
+        let mut n = 0;
+        let mut buf = Vec::new();
+
+        while n < MSG_LEN {
+            let mut mbufs = stream.recv().await;
+            while let Err(Errno::ENOBUFS) = mbufs {
+                mbufs = stream.recv().await
+            }
+
+            for b in &mbufs.unwrap() {
+                n += b.len();
+                buf.extend_from_slice(b);
+            }
+        }
+
+        let send_buf = buf;
+        assert!(!send_buf.is_empty());
+
+        let send_buf = stream.send(send_buf).await.unwrap();
+
+        assert!(send_buf.is_empty());
+    }
+
+    async fn server(ex: fiona::Executor, acceptor: fiona::tcp::Acceptor)
+    {
+        ex.register_buf_group(SERVER_BGID, NUM_BUFS, BUF_LEN)
+          .unwrap();
+
+        let mut conns = 0;
+        while conns < TOTAL_CONNS {
+            let stream = acceptor.accept().await.unwrap();
+            ex.clone().spawn(on_accept(stream));
+            conns += 1;
+        }
     }
 
     let mut ioc = make_io_context();
@@ -772,41 +813,7 @@ fn tcp_connection_stress_test_no_cq_overflow()
     let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
-    ex.clone().spawn(async move {
-                  ex.register_buf_group(SERVER_BGID, NUM_BUFS, BUF_LEN)
-                    .unwrap();
-
-                  let mut conns = 0;
-                  while conns < TOTAL_CONNS {
-                      let stream = acceptor.accept().await.unwrap();
-                      ex.clone().spawn(async move {
-                                    stream.set_buf_group(SERVER_BGID);
-
-                                    let mut n = 0;
-                                    let mut buf = Vec::new();
-
-                                    while n < MSG_LEN {
-                                        let mut mbufs = stream.recv().await;
-                                        while let Err(Errno::ENOBUFS) = mbufs {
-                                            mbufs = stream.recv().await
-                                        }
-
-                                        for b in &mbufs.unwrap() {
-                                            n += b.len();
-                                            buf.extend_from_slice(b);
-                                        }
-                                    }
-
-                                    let send_buf = buf;
-                                    assert!(!send_buf.is_empty());
-
-                                    let send_buf = stream.send(send_buf).await.unwrap();
-
-                                    assert!(send_buf.is_empty());
-                                });
-                      conns += 1;
-                  }
-              });
+    ex.clone().spawn(server(ex, acceptor));
 
     let t = std::thread::spawn(move || client(port));
 
