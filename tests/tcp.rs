@@ -571,6 +571,8 @@ fn tcp_recv_timeout()
             let msg = client.send(msg).await.unwrap();
             assert!(msg.is_empty());
 
+            timer.wait(Duration::from_millis(750)).await.unwrap();
+
             unsafe { NUM_RUNS += 1 };
         };
 
@@ -626,11 +628,9 @@ fn tcp_recv_timeout()
             let bufs = client.recv().await.unwrap();
             assert_eq!(bufs_to_string(bufs), "wonderful day");
 
-            println!("going to do the final wait now");
             let err = client.recv().await.unwrap_err();
             assert_eq!(err, Errno::ECANCELED);
 
-            println!("okay, this is all done too!");
             unsafe { NUM_RUNS += 1 };
         };
 
@@ -650,7 +650,7 @@ fn tcp_recv_timeout()
         let msg = stream.send(msg).await.unwrap();
         assert!(msg.is_empty());
 
-        println!("server side is all done now");
+        timer.wait(Duration::from_millis(750)).await.unwrap();
 
         unsafe { NUM_RUNS += 1 };
     }

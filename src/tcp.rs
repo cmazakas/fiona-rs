@@ -1150,6 +1150,15 @@ impl Future for RecvFuture<'_>
                     return Poll::Ready(Ok(buf_seq));
                 }
 
+                if op.res == 0 {
+                    self.completed = true;
+                    assert!(op.done);
+                    if op.done {
+                        stream_impl.recv_op = None;
+                    }
+                    return Poll::Ready(Ok(Vec::new()));
+                }
+
                 if op.res < 0 {
                     self.completed = true;
                     let res = -op.res;
