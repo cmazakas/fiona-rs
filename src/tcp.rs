@@ -1058,7 +1058,7 @@ impl Future for RecvFuture<'_>
             None => {
                 let bgid = stream_impl.buf_group;
                 let ioprio =
-                    u16::try_from(IORING_RECVSEND_POLL_FIRST | IORING_RECVSEND_BUNDLE).unwrap();
+                    u16::try_from(IORING_RECVSEND_POLL_FIRST/*  | IORING_RECVSEND_BUNDLE */).unwrap();
 
                 let ref_count = &raw mut stream_impl.ref_count;
 
