@@ -684,7 +684,7 @@ fn tcp_connection_stress_test_no_cq_overflow()
     // const NUM_BUFS: u32 = 32;
 
     const NUM_BUFS: u32 = 64;
-    const BUF_LEN: usize = 1024;
+    const BUF_LEN: usize = 256;
 
     const TOTAL_CONNS: u32 = NR_FILES;
 

@@ -1058,7 +1058,7 @@ impl Future for RecvFuture<'_>
             None => {
                 let bgid = stream_impl.buf_group;
                 let ioprio =
-                    u16::try_from(IORING_RECVSEND_POLL_FIRST/*  | IORING_RECVSEND_BUNDLE */).unwrap();
+                    u16::try_from(IORING_RECVSEND_POLL_FIRST | IORING_RECVSEND_BUNDLE).unwrap();
 
                 let ref_count = &raw mut stream_impl.ref_count;
 
@@ -1141,7 +1141,15 @@ impl Future for RecvFuture<'_>
                     }
 
                     let count = buf_seq.len().try_into().unwrap();
-                    unsafe { io_uring_buf_ring_advance(br, count) };
+                    if count > 0 {
+                        unsafe { io_uring_buf_ring_advance(br, count) };
+                    }
+
+                    let b = &buf_seq[0];
+                    if b.len() > 5 && b[1..5] == [190, 190, 190, 190] {
+                        let user_data: *mut IoUringOp = Box::as_mut_ptr(op).cast();
+                        println!("recv user_data is: {user_data:?}");
+                    }
 
                     if op.done {
                         stream_impl.recv_op = None;
