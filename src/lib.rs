@@ -21,15 +21,17 @@ use std::{
     alloc::Layout,
     cell::UnsafeCell,
     collections::{HashMap, HashSet, VecDeque},
+    fmt::Debug,
     future::Future,
     hash::Hash,
     marker::PhantomData,
-    mem::{self, ManuallyDrop},
-    ops::Deref,
+    mem::ManuallyDrop,
+    ops::{Deref, Index},
     os::fd::AsRawFd,
     pin::Pin,
     ptr::{self, DynMetadata, NonNull, metadata},
     rc::Rc,
+    slice,
     sync::{
         atomic::{
             AtomicU64,
@@ -446,13 +448,20 @@ struct BufGroup
     num_bufs: u32,
     buf_len: usize,
     bgid: u16,
-    bufs: Vec<Vec<u8>>,
+    bufs: Vec<u8>,
+    bid_map: Vec<u16>,
     ring: *mut io_uring,
     tail: u32,
 }
 
 impl BufGroup
 {
+    fn buf_as_ptr(&mut self, bid: u16) -> *mut u8
+    {
+        assert!(u32::from(bid) < self.num_bufs);
+        unsafe { self.bufs.as_mut_ptr().add(self.buf_len * usize::from(bid)) }
+    }
+
     unsafe fn release(&mut self)
     {
         let ring = self.ring;
@@ -460,6 +469,202 @@ impl BufGroup
 
         unsafe { io_uring_unregister_buf_ring(ring, bgid) };
         unsafe { io_uring_free_buf_ring(ring, self.br, self.num_bufs, bgid) };
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+const SBO_NUM_BUFS: u32 = 16;
+
+#[derive(Copy, Clone, Debug)]
+struct BorrowedBuf
+{
+    bid: u16,
+    len: usize,
+}
+
+enum BufSequenceIds
+{
+    Inline
+    {
+        bufs: [BorrowedBuf; SBO_NUM_BUFS as usize],
+        num_bufs: u32,
+    },
+    Allocated
+    {
+        bufs: Vec<BorrowedBuf>,
+        num_bufs: u32,
+    },
+}
+
+impl BufSequenceIds
+{
+    fn new() -> BufSequenceIds
+    {
+        BufSequenceIds::Inline { bufs: [BorrowedBuf { bid: 0, len: 0 }; SBO_NUM_BUFS as usize],
+                                 num_bufs: 0 }
+    }
+
+    fn push(&mut self, borrowed_buf: BorrowedBuf)
+    {
+        match self {
+            BufSequenceIds::Inline { bufs: buf_ids,
+                                     num_bufs, } => {
+                let max = SBO_NUM_BUFS;
+                if *num_bufs == max {
+                    let mut bids = Vec::new();
+                    for bid in buf_ids {
+                        bids.push(*bid);
+                    }
+                    bids.push(borrowed_buf);
+                    *self = BufSequenceIds::Allocated { bufs: bids,
+                                                        num_bufs: max + 1 };
+                    return;
+                }
+                buf_ids[*num_bufs as usize] = borrowed_buf;
+                *num_bufs += 1;
+            }
+            BufSequenceIds::Allocated { bufs: buf_ids,
+                                        num_bufs, } => {
+                buf_ids.push(borrowed_buf);
+                *num_bufs += 1;
+            }
+        }
+    }
+
+    fn num_bufs(&self) -> u32
+    {
+        match self {
+            BufSequenceIds::Inline { num_bufs, .. }
+            | BufSequenceIds::Allocated { num_bufs, .. } => *num_bufs,
+        }
+    }
+
+    fn as_slice(&self) -> &[BorrowedBuf]
+    {
+        let slice = match self {
+            BufSequenceIds::Inline { bufs: buf_ids, .. } => buf_ids,
+            BufSequenceIds::Allocated { bufs: buf_ids, .. } => buf_ids.as_slice(),
+        };
+        &slice[0..self.num_bufs() as usize]
+    }
+}
+
+pub struct BorrowedBufs
+{
+    buf_group: *mut BufGroup,
+    buf_ids: BufSequenceIds,
+    ex: Executor,
+}
+
+pub struct BorrowedBufsIterator<'a>
+{
+    bufs: &'a BorrowedBufs,
+    idx: usize,
+}
+
+impl BorrowedBufs
+{
+    fn new(ex: Executor, buf_group: *mut BufGroup) -> BorrowedBufs
+    {
+        BorrowedBufs { buf_group,
+                       buf_ids: BufSequenceIds::new(),
+                       ex }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool
+    {
+        self.buf_ids.num_bufs() == 0
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize
+    {
+        self.buf_ids.num_bufs() as usize
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> BorrowedBufsIterator<'_>
+    {
+        self.into_iter()
+    }
+}
+
+impl Drop for BorrowedBufs
+{
+    fn drop(&mut self)
+    {
+        let buf_group = unsafe { &mut *self.buf_group };
+        let br = buf_group.br;
+        let mut count = 0;
+        let mask = io_uring_buf_ring_mask(buf_group.num_bufs);
+
+        for bid in self.buf_ids.as_slice() {
+            let addr = buf_group.buf_as_ptr(bid.bid).cast();
+            let tail = &mut buf_group.tail;
+            let len = buf_group.buf_len as _;
+            unsafe { io_uring_buf_ring_add(br, addr, len, *tail as _, mask, count) };
+            buf_group.bid_map[*tail as usize] = bid.bid;
+            *tail = (*tail + 1) & mask as u32;
+            count += 1;
+        }
+        unsafe { io_uring_buf_ring_advance(br, count) };
+        let _ = self.ex; // suppress unused warnings
+    }
+}
+
+impl Debug for BorrowedBufs
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
+    {
+        let iter = self.iter();
+        for buf in iter {
+            write!(f, "{buf:?}").unwrap();
+        }
+        Ok(())
+    }
+}
+
+impl Index<usize> for BorrowedBufs
+{
+    type Output = [u8];
+    fn index(&self, index: usize) -> &Self::Output
+    {
+        assert!(index < self.buf_ids.num_bufs() as usize);
+
+        let buf_id = self.buf_ids.as_slice()[index];
+        let p = unsafe { (*self.buf_group).buf_as_ptr(buf_id.bid) };
+        unsafe { slice::from_raw_parts(p, buf_id.len) }
+    }
+}
+
+impl<'a> IntoIterator for &'a BorrowedBufs
+{
+    type Item = &'a [u8];
+
+    type IntoIter = BorrowedBufsIterator<'a>;
+
+    fn into_iter(self) -> Self::IntoIter
+    {
+        BorrowedBufsIterator { bufs: self, idx: 0 }
+    }
+}
+
+impl<'a> Iterator for BorrowedBufsIterator<'a>
+{
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item>
+    {
+        if self.idx >= self.bufs.buf_ids.num_bufs() as usize {
+            return None;
+        }
+
+        let buf_id = self.bufs.buf_ids.as_slice()[self.idx];
+        let p = unsafe { (*self.bufs.buf_group).buf_as_ptr(buf_id.bid) };
+        self.idx += 1;
+        unsafe { Some(slice::from_raw_parts(p, buf_id.len)) }
     }
 }
 
@@ -566,7 +771,7 @@ enum OpType
     },
     MultishotTcpRecv
     {
-        bufs: Vec<Vec<u8>>,
+        bufs: BorrowedBufs,
         buf_group: *mut BufGroup,
         last_recv: *mut Instant,
     },
@@ -1118,39 +1323,7 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
 
     if op.eager_dropped {
         if cqe.res > 0 {
-            let buf_group = unsafe { &mut *buf_group };
-            let br = buf_group.br;
-            let buf_len = buf_group.buf_len;
-            let mask = io_uring_buf_ring_mask(buf_group.num_bufs) as u32;
-
-            let mut count = 0;
-            let mut num_bytes = usize::try_from(cqe.res).unwrap();
-
-            while num_bytes > 0 {
-                let mut n = buf_len;
-                if n > num_bytes {
-                    n = num_bytes;
-                }
-
-                let bid = buf_group.tail as _;
-                buf_group.tail = (buf_group.tail + 1) & mask;
-
-                let addr = unsafe { &raw mut *buf_group.bufs.as_mut_ptr().add(bid) };
-
-                unsafe {
-                    io_uring_buf_ring_add(br,
-                                          addr.cast(),
-                                          buf_len as _,
-                                          bid as _,
-                                          mask as _,
-                                          count);
-                }
-
-                count += 1;
-                num_bytes -= n;
-            }
-
-            unsafe { io_uring_buf_ring_advance(br, count) };
+            unimplemented!("eager-dropped multishot recv with buffers");
         }
 
         if has_more_cqes {
@@ -1174,27 +1347,20 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
     op.res = cqe.res;
     if op.res > 0 {
         let mut bid = cqe.flags >> IORING_CQE_BUFFER_SHIFT;
-
         let buf_group = unsafe { &mut *buf_group };
-
         let buf_len = buf_group.buf_len;
         let num_bufs = buf_group.num_bufs;
         let mask = io_uring_buf_ring_mask(num_bufs) as u32;
-
+        let bid_map = &buf_group.bid_map;
         let mut num_bytes = usize::try_from(cqe.res).unwrap();
         while num_bytes > 0 {
             let mut n = buf_len;
             if n > num_bytes {
                 n = num_bytes;
             }
-
-            let mut buf = Vec::new();
-
-            mem::swap(&mut buf, &mut buf_group.bufs[bid as usize]);
-            unsafe { buf.set_len(n) };
-
-            bufs.push(buf);
-
+            let bg_bid = bid_map[bid as usize];
+            bufs.buf_ids.push(BorrowedBuf { bid: bg_bid,
+                                            len: n });
             bid = (bid + 1) & mask;
             num_bytes -= n;
         }
@@ -1400,15 +1566,12 @@ impl Executor
             return Err(Errno::from_raw(-ret));
         }
 
-        let mut bufs = Vec::with_capacity(num_bufs as usize);
+        let mut bufs = vec![0; buf_len * num_bufs as usize];
+        let mut bid_map = Vec::with_capacity(num_bufs as usize);
 
         let mask = io_uring_buf_ring_mask(num_bufs);
         for bid in 0..num_bufs {
-            let mut buf = Vec::<u8>::with_capacity(buf_len);
-            let addr = buf.as_mut_ptr();
-
-            bufs.push(buf);
-
+            let addr = unsafe { bufs.as_mut_ptr().add(buf_len * bid as usize) };
             unsafe {
                 io_uring_buf_ring_add(buf_ring,
                                       addr.cast(),
@@ -1417,6 +1580,8 @@ impl Executor
                                       mask,
                                       bid as _);
             }
+
+            bid_map.push(bid as u16);
         }
 
         unsafe { io_uring_buf_ring_advance(buf_ring, num_bufs.try_into().unwrap()) };
@@ -1427,7 +1592,8 @@ impl Executor
                             bgid,
                             bufs,
                             ring,
-                            tail: 0 };
+                            tail: 0,
+                            bid_map };
 
         unsafe {
             (*self.p.get()).buf_groups

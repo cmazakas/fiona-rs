@@ -29,8 +29,7 @@ use nix::{
 use liburing_rs::{
     __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
     IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT,
-    IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK,
-    io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_get_sqe,
+    IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring_get_sqe,
     io_uring_prep_accept_direct, io_uring_prep_cancel, io_uring_prep_cancel_fd,
     io_uring_prep_cancel64, io_uring_prep_close_direct, io_uring_prep_connect,
     io_uring_prep_link_timeout, io_uring_prep_recv_multishot, io_uring_prep_send_zc,
@@ -40,7 +39,7 @@ use liburing_rs::{
 };
 
 use crate::{
-    Executor, IoUringOp, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
+    BorrowedBufs, Executor, IoUringOp, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
     make_io_uring_op, release_impl, release_obj, reserve_sqes, submit_ring,
 };
 
@@ -649,7 +648,7 @@ impl Client
         stream.send(buf).await
     }
 
-    pub async fn recv(&self) -> Result<Vec<Vec<u8>>>
+    pub async fn recv(&self) -> Result<BorrowedBufs>
     {
         let stream = self.as_stream();
         stream.recv().await
@@ -1044,7 +1043,7 @@ impl Drop for RecvFuture<'_>
 
 impl Future for RecvFuture<'_>
 {
-    type Output = Result<Vec<Vec<u8>>>;
+    type Output = Result<BorrowedBufs>;
 
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
             -> Poll<Self::Output>
@@ -1052,7 +1051,8 @@ impl Future for RecvFuture<'_>
         assert!(!self.completed);
 
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
-        let ring = stream_impl.ex.ring();
+        let ex = stream_impl.ex.clone();
+        let ring = ex.ring();
 
         match stream_impl.recv_op {
             None => {
@@ -1064,7 +1064,7 @@ impl Future for RecvFuture<'_>
 
                 let bgid = stream_impl.buf_group;
 
-                let buf_group = match unsafe { (*stream_impl.ex.p.get()).buf_groups.get(&bgid) } {
+                let buf_group = match unsafe { (*ex.p.get()).buf_groups.get(&bgid) } {
                     None => {
                         self.completed = true;
                         return Poll::Ready(Err(Errno::ENOENT));
@@ -1075,15 +1075,16 @@ impl Future for RecvFuture<'_>
                 stream_impl.last_recv = Instant::now();
                 let last_recv: *mut Instant = &raw mut stream_impl.last_recv;
 
-                let mut op = Box::new(make_io_uring_op(ref_count,
-                                                       OpType::MultishotTcpRecv { bufs:
-                                                                                      Vec::new(),
-                                                                                  buf_group,
-                                                                                  last_recv }));
+                let mut op =
+                    Box::new(make_io_uring_op(ref_count,
+                                              OpType::MultishotTcpRecv { bufs:
+                                                                             BorrowedBufs::new(ex.clone(), buf_group),
+                                                                         buf_group,
+                                                                         last_recv }));
 
                 let user_data = Box::as_mut_ptr(&mut op).cast();
 
-                let sqe = crate::get_sqe(&stream_impl.ex);
+                let sqe = crate::get_sqe(&ex);
 
                 let sockfd = stream_impl.fd;
                 let flags = IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT;
@@ -1112,50 +1113,15 @@ impl Future for RecvFuture<'_>
 
                 if !bufs.is_empty() {
                     self.completed = true;
-                    let buf_seq = mem::take(bufs);
 
-                    let buf_group = unsafe { &mut *buf_group };
-                    let br = buf_group.br;
-                    let buf_len = buf_group.buf_len;
-                    let mask = io_uring_buf_ring_mask(buf_group.num_bufs) as u32;
-
-                    for buf_offset in 0..buf_seq.len() {
-                        let bid = buf_group.tail as _;
-
-                        let mut buf = Vec::<u8>::with_capacity(buf_len);
-                        let addr = buf.as_mut_ptr().cast();
-
-                        buf_group.bufs[bid as usize] = buf;
-
-                        let buf_offset = buf_offset as _;
-                        buf_group.tail = (buf_group.tail + 1) & mask;
-
-                        unsafe {
-                            io_uring_buf_ring_add(br,
-                                                  addr,
-                                                  buf_len as _,
-                                                  bid,
-                                                  mask as _,
-                                                  buf_offset);
-                        }
-                    }
-
-                    let count = buf_seq.len().try_into().unwrap();
-                    if count > 0 {
-                        unsafe { io_uring_buf_ring_advance(br, count) };
-                    }
-
-                    let b = &buf_seq[0];
-                    if b.len() > 5 && b[1..5] == [190, 190, 190, 190] {
-                        let user_data: *mut IoUringOp = Box::as_mut_ptr(op).cast();
-                        println!("recv user_data is: {user_data:?}");
-                    }
+                    let mut user_bufs = BorrowedBufs::new(ex.clone(), buf_group);
+                    mem::swap(&mut user_bufs, bufs);
 
                     if op.done {
                         stream_impl.recv_op = None;
                     }
 
-                    return Poll::Ready(Ok(buf_seq));
+                    return Poll::Ready(Ok(user_bufs));
                 }
 
                 if op.res == 0 {
@@ -1164,7 +1130,7 @@ impl Future for RecvFuture<'_>
                     if op.done {
                         stream_impl.recv_op = None;
                     }
-                    return Poll::Ready(Ok(Vec::new()));
+                    return Poll::Ready(Ok(BorrowedBufs::new(ex.clone(), buf_group)));
                 }
 
                 if op.res < 0 {

@@ -20,7 +20,7 @@ use rand::SeedableRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BUF_SIZE: usize = 256 * 1024;
-const RECV_BUF_SIZE: usize = 2 * 4096;
+const RECV_BUF_SIZE: usize = 8 * 1024;
 const NUM_BUFS: u32 = 32 * 1024;
 
 static mut DURATION: Duration = Duration::new(0, 0);
