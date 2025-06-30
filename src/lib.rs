@@ -87,7 +87,7 @@ impl Deref for AlignedAtomicU64
 
 //-----------------------------------------------------------------------------
 
-struct TaskInnerHeader
+struct TaskHeader
 {
     strong: AlignedAtomicU64,
     weak: AlignedAtomicU64,
@@ -117,66 +117,64 @@ impl Task
                                                  ex: Executor)
                                                  -> Task
     {
-        let layout = Layout::new::<TaskInnerHeader>().extend(Layout::for_value(&f))
-                                                     .unwrap()
-                                                     .0
-                                                     .pad_to_align();
+        let layout = Layout::new::<TaskHeader>().extend(Layout::for_value(&f))
+                                                .unwrap()
+                                                .0
+                                                .pad_to_align();
 
         let p = unsafe { std::alloc::alloc(layout) };
         let p = NonNull::new(p).unwrap();
 
-        let header = TaskInnerHeader { strong: AlignedAtomicU64(AtomicU64::new(1)),
-                                       weak: AlignedAtomicU64(AtomicU64::new(1)),
-                                       future_vtable:
-                                           metadata(std::ptr::from_ref(&f
-                                                                       as &dyn Future<Output = ()>)),
-                                       sender: Some(sender),
-                                       event_fd,
-                                       ex: Rc::into_raw(ex.p) };
+        let header = TaskHeader { strong: AlignedAtomicU64(AtomicU64::new(1)),
+                                  weak: AlignedAtomicU64(AtomicU64::new(1)),
+                                  future_vtable:
+                                      metadata(std::ptr::from_ref::<dyn Future<Output = ()>>(&f)),
+                                  sender: Some(sender),
+                                  event_fd,
+                                  ex: Rc::into_raw(ex.p) };
 
-        unsafe { std::ptr::write(p.as_ptr().cast::<TaskInnerHeader>(), header) };
+        unsafe { std::ptr::write(p.as_ptr().cast::<TaskHeader>(), header) };
 
-        let offset = align_up(size_of::<TaskInnerHeader>(), layout.align());
+        let offset = align_up(size_of::<TaskHeader>(), layout.align());
         unsafe { std::ptr::write(p.as_ptr().add(offset).cast::<F>(), f) };
 
         Task { p,
                phantom: PhantomData }
     }
 
-    fn inner(&self) -> &TaskInnerHeader
+    fn task_header(&self) -> &TaskHeader
     {
-        unsafe { &*self.p.as_ptr().cast::<TaskInnerHeader>() }
+        unsafe { &*self.p.as_ptr().cast::<TaskHeader>() }
     }
 
-    fn as_ptr(&self) -> *mut (dyn Future<Output = ()> + 'static)
+    fn get_future(&mut self) -> Pin<&mut (dyn Future<Output = ()> + 'static)>
     {
         let align =
-            std::cmp::max(align_of::<TaskInnerHeader>(), self.inner().future_vtable.align_of());
+            std::cmp::max(align_of::<TaskHeader>(), self.task_header().future_vtable.align_of());
 
-        let offset = align_up(size_of::<TaskInnerHeader>(), align);
+        let offset = align_up(size_of::<TaskHeader>(), align);
 
-        unsafe {
+        let p = unsafe {
             std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(self.p
                                                                                   .as_ptr()
                                                                                   .add(offset),
-                                                                              self.inner()
+                                                                              self.task_header()
                                                                                   .future_vtable)
-        }
+        };
+
+        unsafe { Pin::new_unchecked(&mut *p) }
     }
 
     fn poll(&mut self, cx: &mut Context) -> Poll<()>
     {
-        let future = unsafe { &mut *self.as_ptr() };
-        let future = unsafe { Pin::new_unchecked(future) };
-
+        let future = self.get_future();
         future.poll(cx)
     }
 
     #[must_use]
     fn downgrade(this: &Task) -> Weak
     {
-        this.inner().weak.fetch_add(1, Relaxed);
-
+        this.task_header().weak.fetch_add(1, Relaxed);
         Weak { p: this.p,
                phantom: PhantomData }
     }
@@ -186,36 +184,36 @@ impl Drop for Task
 {
     fn drop(&mut self)
     {
-        if self.inner().strong.fetch_sub(1, Release) > 1 {
+        if self.task_header().strong.fetch_sub(1, Release) > 1 {
             return;
         }
-        self.inner().strong.load(Acquire);
-
-        unsafe { std::ptr::drop_in_place(self.as_ptr()) };
-        drop(unsafe { Rc::from_raw(self.inner().ex) });
-
-        if self.inner().weak.fetch_sub(1, Release) > 1 {
-            return;
-        }
-        self.inner().weak.load(Acquire);
+        self.task_header().strong.load(Acquire);
 
         unsafe {
-            std::ptr::drop_in_place(self.p.as_ptr().cast::<TaskInnerHeader>());
-        };
+            let p = std::ptr::from_mut(Pin::into_inner_unchecked(self.get_future()));
+            std::ptr::drop_in_place(p);
+        }
 
+        drop(unsafe { Rc::from_raw(self.task_header().ex) });
+
+        if self.task_header().weak.fetch_sub(1, Release) > 1 {
+            return;
+        }
+        self.task_header().weak.load(Acquire);
+
+        unsafe { std::ptr::drop_in_place(self.p.as_ptr().cast::<TaskHeader>()) };
         let layout = {
-            let align =
-                std::cmp::max(align_of::<TaskInnerHeader>(), self.inner().future_vtable.align_of());
+            let align = std::cmp::max(align_of::<TaskHeader>(),
+                                      self.task_header().future_vtable.align_of());
 
-            let offset = align_up(size_of::<TaskInnerHeader>(), align);
+            let offset = align_up(size_of::<TaskHeader>(), align);
 
-            Layout::from_size_align(align_up(offset + self.inner().future_vtable.size_of(), align),
+            Layout::from_size_align(align_up(offset + self.task_header().future_vtable.size_of(),
+                                             align),
                                     align).unwrap()
         };
 
-        unsafe {
-            std::alloc::dealloc(self.p.as_ptr(), layout);
-        };
+        unsafe { std::alloc::dealloc(self.p.as_ptr(), layout) };
     }
 }
 
@@ -223,7 +221,7 @@ impl Clone for Task
 {
     fn clone(&self) -> Task
     {
-        self.inner().strong.fetch_add(1, Relaxed);
+        self.task_header().strong.fetch_add(1, Relaxed);
         Self { p: self.p,
                phantom: PhantomData }
     }
@@ -270,9 +268,9 @@ impl Weak
                phantom: PhantomData }
     }
 
-    fn inner(&self) -> &TaskInnerHeader
+    fn inner(&self) -> &TaskHeader
     {
-        unsafe { &*self.p.as_ptr().cast::<TaskInnerHeader>() }
+        unsafe { &*self.p.as_ptr().cast::<TaskHeader>() }
     }
 
     // cannot be safely upgraded across thread boundaries
@@ -313,14 +311,14 @@ impl Drop for Weak
         self.inner().weak.load(Acquire);
 
         unsafe {
-            std::ptr::drop_in_place(self.p.as_ptr().cast::<TaskInnerHeader>());
+            std::ptr::drop_in_place(self.p.as_ptr().cast::<TaskHeader>());
         };
 
         let layout = {
             let align =
-                std::cmp::max(align_of::<TaskInnerHeader>(), self.inner().future_vtable.align_of());
+                std::cmp::max(align_of::<TaskHeader>(), self.inner().future_vtable.align_of());
 
-            let offset = align_up(size_of::<TaskInnerHeader>(), align);
+            let offset = align_up(size_of::<TaskHeader>(), align);
 
             Layout::from_size_align(align_up(offset + self.inner().future_vtable.size_of(), align),
                                     align).unwrap()
@@ -698,13 +696,11 @@ struct RefCount
 unsafe fn add_obj_ref(rc: *mut RefCount)
 {
     unsafe { (*rc).obj_count += 1 };
-    // println!("add_obj_ref: {:?}", *rc);
 }
 
 unsafe fn add_op_ref(rc: *mut RefCount)
 {
     unsafe { (*rc).op_count += 1 };
-    // println!("add_op_ref: {:?}", *rc);
 }
 
 unsafe fn release_impl<T>(p: *mut u8)
@@ -717,7 +713,6 @@ unsafe fn release_impl<T>(p: *mut u8)
 unsafe fn release_obj(rc: *mut RefCount)
 {
     unsafe { (*rc).obj_count -= 1 };
-    // println!("release_obj: {:?}", *rc);
     if unsafe { (*rc).obj_count == 0 && (*rc).op_count == 0 } {
         let fp = unsafe { (*rc).release_impl };
         let p = unsafe { (*rc).obj };
@@ -728,7 +723,6 @@ unsafe fn release_obj(rc: *mut RefCount)
 unsafe fn release_op(rc: *mut RefCount)
 {
     unsafe { (*rc).op_count -= 1 };
-    // println!("release_op: {:?}", *rc);
     if unsafe { (*rc).obj_count == 0 && (*rc).op_count == 0 } {
         let fp = unsafe { (*rc).release_impl };
         let p = unsafe { (*rc).obj };
@@ -844,13 +838,11 @@ unsafe fn submit_ring(ring: *mut io_uring)
 fn get_sqe(ex: &Executor) -> *mut io_uring_sqe
 {
     let ring = ex.ring();
-
     let mut sqe = unsafe { io_uring_get_sqe(ring) };
     while sqe.is_null() {
         unsafe { submit_ring(ring) };
         sqe = unsafe { io_uring_get_sqe(ring) };
     }
-
     sqe
 }
 
@@ -983,24 +975,23 @@ impl IoContext
         let mut params = unsafe { std::mem::zeroed::<io_uring_params>() };
         params.cq_entries = cq_entries;
         params.flags |= IORING_SETUP_CQSIZE;
-
         params.flags |= IORING_SETUP_SINGLE_ISSUER;
         params.flags |= IORING_SETUP_DEFER_TASKRUN;
 
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 
-        let p =
-            Rc::new(UnsafeCell::new(IoContextFrame { _params: params,
-                                                     tasks: HashSet::new(),
-                                                     available_fds: VecDeque::new(),
-                                                     receiver: rx,
-                                                     sender: tx,
-                                                     ioring,
-                                                     event_fd:
-                                                         nix::sys::eventfd::EventFd::new().unwrap(),
-                                                     buf_groups: HashMap::new(),
-                                                     runguard_blacklist: HashSet::new(),
-                                                     local_task_queue: VecDeque::new() }));
+        let ioc_frame = IoContextFrame { _params: params,
+                                         tasks: HashSet::new(),
+                                         available_fds: VecDeque::new(),
+                                         receiver: rx,
+                                         sender: tx,
+                                         ioring,
+                                         event_fd: nix::sys::eventfd::EventFd::new().unwrap(),
+                                         buf_groups: HashMap::new(),
+                                         runguard_blacklist: HashSet::new(),
+                                         local_task_queue: VecDeque::new() };
+
+        let p = Rc::new(UnsafeCell::new(ioc_frame));
 
         let ring = unsafe { &raw mut (*p.get()).ioring };
         let ret = unsafe { io_uring_queue_init_params(sq_entries, ring, &raw mut params) };
@@ -1011,11 +1002,12 @@ impl IoContext
 
         let ret = unsafe { io_uring_register_files_sparse(ring, nr_files) };
         assert_eq!(ret, 0);
-
-        let available_fds = unsafe { &mut (*p.get()).available_fds };
-        available_fds.reserve(nr_files as usize);
-        for i in 0..nr_files {
-            available_fds.push_back(i);
+        {
+            let available_fds = unsafe { &mut (*p.get()).available_fds };
+            available_fds.reserve(nr_files as usize);
+            for i in 0..nr_files {
+                available_fds.push_back(i);
+            }
         }
 
         Self { p }
@@ -1063,9 +1055,6 @@ impl IoContext
 
         let ex = self.get_executor();
         let ring = ex.ring();
-
-        // let cq_entries = ex.p.borrow().params.cq_entries;
-        // let mut cqes = Vec::<*mut io_uring_cqe>::with_capacity(cq_entries as usize);
 
         let mut need_eventfd_read = true;
 
@@ -1513,8 +1502,6 @@ impl<T> Future for SpawnFuture<T>
         match result {
             None => {
                 unsafe { (*self.value.get()).waker = Some(cx.waker().clone()) };
-                // TODO: do we need to assign the LocalWaker here as well?
-
                 Poll::Pending
             }
             Some(t) => {
@@ -1648,9 +1635,7 @@ mod test
         // reflecting this
         // this is supposed to replicate a user abusing our Timer future's
         // usage of cancel-on-drop and also proves that a user can generate
-        // any number of CQEs associated with our user_data, and we must
-        // ignore these CQEs as well
-
+        // any number of CQEs associated with our usea, and we must
         struct DropGuard
         {
             ring: *mut io_uring,
