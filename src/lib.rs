@@ -1063,16 +1063,25 @@ impl IoContext
                 break;
             }
 
-            while let Some(weak) = unsafe { (*self.p.get()).local_task_queue.pop_front() } {
-                num_completed += on_work_item(weak, &ex);
-            }
+            let (local_task, task) = unsafe {
+                ((*self.p.get()).local_task_queue.pop_front(), (*self.p.get()).receiver.try_recv())
+            };
 
-            while let Ok(weak) = unsafe { (*self.p.get()).receiver.try_recv() } {
-                num_completed += on_work_item(weak, &ex);
-            }
-
-            if unsafe { (*self.p.get()).tasks.is_empty() } {
-                break;
+            match (local_task, task) {
+                (Some(weak1), Ok(weak2)) => {
+                    num_completed += on_work_item(weak1, &ex);
+                    num_completed += on_work_item(weak2, &ex);
+                    continue;
+                }
+                (Some(weak1), Err(_)) => {
+                    num_completed += on_work_item(weak1, &ex);
+                    continue;
+                }
+                (None, Ok(weak2)) => {
+                    num_completed += on_work_item(weak2, &ex);
+                    continue;
+                }
+                _ => {}
             }
 
             if need_eventfd_read {
@@ -1448,7 +1457,7 @@ impl Default for IoContext
 struct SpawnValue<T>
 {
     t: Option<T>,
-    waker: Option<Waker>,
+    waker: Option<LocalWaker>,
 }
 
 //-----------------------------------------------------------------------------
@@ -1501,7 +1510,7 @@ impl<T> Future for SpawnFuture<T>
 
         match result {
             None => {
-                unsafe { (*self.value.get()).waker = Some(cx.waker().clone()) };
+                unsafe { (*self.value.get()).waker = Some(cx.local_waker().clone()) };
                 Poll::Pending
             }
             Some(t) => {
