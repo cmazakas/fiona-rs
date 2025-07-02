@@ -217,6 +217,59 @@ fn await_forgotten()
 }
 
 #[test]
+fn await_forgotten_recursive()
+{
+    static mut P_FUTURE: *mut fiona::SpawnFuture<Vec<i32>> = std::ptr::null_mut();
+
+    async fn make_vec() -> Vec<i32>
+    {
+        assert!(unsafe { !P_FUTURE.is_null() });
+        let f = unsafe { Pin::new_unchecked(&mut *P_FUTURE) };
+
+        let w = WakerFuture.await;
+        let mut cx = std::task::Context::from_waker(&w);
+
+        // In theory, turning this into a .await point should either infinitely loop or
+        // just hang indefinitely. A simple, single poll() call should hopefully
+        // be enough to help us detect soundness issues with a future poll()'ing
+        // its own associated SpawnFuture.
+        assert!(f.poll(&mut cx).is_pending());
+        vec![1, 2, 3, 4]
+    }
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let c = Rc::new(RefCell::new(0));
+    let c2 = c.clone();
+
+    async fn f(ex: fiona::Executor, c2: Rc<RefCell<i32>>)
+    {
+        let h = ex.spawn(make_vec());
+        *c2.borrow_mut() = 4321;
+        unsafe {
+            P_FUTURE = Box::into_raw(Box::new(h));
+        }
+    }
+    ex.spawn(f(ex.clone(), c2));
+
+    assert_eq!(ioc.run(), 2);
+    assert_eq!(*c.borrow(), 4321);
+
+    assert!(unsafe { !P_FUTURE.is_null() });
+    let f = unsafe { Box::from_raw(P_FUTURE) };
+    let f = std::pin::pin!(f);
+
+    let w = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(w);
+    if let Poll::Ready(v) = f.poll(&mut cx) {
+        assert_eq!(v, vec![1, 2, 3, 4]);
+    } else {
+        unreachable!();
+    };
+}
+
+#[test]
 fn await_sequential()
 {
     async fn identity(x: i32) -> i32
@@ -437,6 +490,7 @@ fn await_cycle()
 
             if self.recursions > 100 {
                 self.done = true;
+                *self.this.borrow_mut() = None;
                 return Poll::Ready(());
             }
 

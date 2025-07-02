@@ -91,6 +91,10 @@ struct TaskHeader
 {
     strong: AlignedAtomicU64,
     weak: AlignedAtomicU64,
+    task_layout: Layout,
+    value_offset: usize,
+    future_offset: usize,
+    value_vtable: DynMetadata<dyn Erased>,
     future_vtable: DynMetadata<dyn Future<Output = ()> + 'static>,
     sender: Option<Sender<Weak>>,
     event_fd: i32,
@@ -105,43 +109,11 @@ struct Task
     phantom: PhantomData<dyn Future<Output = ()> + 'static>,
 }
 
-fn align_up(n: usize, align: usize) -> usize
-{
-    (n + (align - 1)) & !(align - 1)
-}
+trait Erased {}
+impl<T> Erased for T {}
 
 impl Task
 {
-    #[must_use]
-    pub fn new<F: Future<Output = ()> + 'static>(f: F, sender: Sender<Weak>, event_fd: i32,
-                                                 ex: Executor)
-                                                 -> Task
-    {
-        let layout = Layout::new::<TaskHeader>().extend(Layout::for_value(&f))
-                                                .unwrap()
-                                                .0
-                                                .pad_to_align();
-
-        let p = unsafe { std::alloc::alloc(layout) };
-        let p = NonNull::new(p).unwrap();
-
-        let header = TaskHeader { strong: AlignedAtomicU64(AtomicU64::new(1)),
-                                  weak: AlignedAtomicU64(AtomicU64::new(1)),
-                                  future_vtable:
-                                      metadata(std::ptr::from_ref::<dyn Future<Output = ()>>(&f)),
-                                  sender: Some(sender),
-                                  event_fd,
-                                  ex: Rc::into_raw(ex.p) };
-
-        unsafe { std::ptr::write(p.as_ptr().cast::<TaskHeader>(), header) };
-
-        let offset = align_up(size_of::<TaskHeader>(), layout.align());
-        unsafe { std::ptr::write(p.as_ptr().add(offset).cast::<F>(), f) };
-
-        Task { p,
-               phantom: PhantomData }
-    }
-
     fn task_header(&self) -> &TaskHeader
     {
         unsafe { &*self.p.as_ptr().cast::<TaskHeader>() }
@@ -149,11 +121,7 @@ impl Task
 
     fn get_future(&mut self) -> Pin<&mut (dyn Future<Output = ()> + 'static)>
     {
-        let align =
-            std::cmp::max(align_of::<TaskHeader>(), self.task_header().future_vtable.align_of());
-
-        let offset = align_up(size_of::<TaskHeader>(), align);
-
+        let offset = self.task_header().future_offset;
         let p = unsafe {
             std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(self.p
                                                                                   .as_ptr()
@@ -161,7 +129,6 @@ impl Task
                                                                               self.task_header()
                                                                                   .future_vtable)
         };
-
         unsafe { Pin::new_unchecked(&mut *p) }
     }
 
@@ -189,30 +156,28 @@ impl Drop for Task
         }
         self.task_header().strong.load(Acquire);
 
-        unsafe {
-            let p = std::ptr::from_mut(Pin::into_inner_unchecked(self.get_future()));
-            std::ptr::drop_in_place(p);
-        }
-
+        let future_offset = self.task_header().future_offset;
+        let future = unsafe { self.p.add(future_offset).as_ptr() };
+        let p =
+            std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(future,
+                                                                              self.task_header()
+                                                                                  .future_vtable);
+        let value = unsafe { self.p.add(self.task_header().value_offset).as_ptr() };
+        let value =
+            std::ptr::from_raw_parts_mut::<dyn Erased>(value, self.task_header().value_vtable);
+        unsafe { std::ptr::drop_in_place(value) };
+        unsafe { std::ptr::drop_in_place(p) };
         drop(unsafe { Rc::from_raw(self.task_header().ex) });
 
-        if self.task_header().weak.fetch_sub(1, Release) > 1 {
+        let weak_count = self.task_header().weak.fetch_sub(1, Release);
+        if weak_count > 1 {
             return;
         }
         self.task_header().weak.load(Acquire);
 
+        let layout = self.task_header().task_layout;
+
         unsafe { std::ptr::drop_in_place(self.p.as_ptr().cast::<TaskHeader>()) };
-        let layout = {
-            let align = std::cmp::max(align_of::<TaskHeader>(),
-                                      self.task_header().future_vtable.align_of());
-
-            let offset = align_up(size_of::<TaskHeader>(), align);
-
-            Layout::from_size_align(align_up(offset + self.task_header().future_vtable.size_of(),
-                                             align),
-                                    align).unwrap()
-        };
-
         unsafe { std::alloc::dealloc(self.p.as_ptr(), layout) };
     }
 }
@@ -268,7 +233,7 @@ impl Weak
                phantom: PhantomData }
     }
 
-    fn inner(&self) -> &TaskHeader
+    fn task_header(&self) -> &TaskHeader
     {
         unsafe { &*self.p.as_ptr().cast::<TaskHeader>() }
     }
@@ -277,14 +242,14 @@ impl Weak
     // must only be upgraded on the main thread running the ring
     unsafe fn upgrade(&self) -> Option<Task>
     {
-        let mut c = self.inner().strong.load(Relaxed);
+        let mut c = self.task_header().strong.load(Relaxed);
 
         loop {
             if c == 0 {
                 return None;
             }
 
-            let r = self.inner()
+            let r = self.task_header()
                         .strong
                         .compare_exchange_weak(c, c + 1, Relaxed, Relaxed);
 
@@ -305,28 +270,14 @@ impl Drop for Weak
 {
     fn drop(&mut self)
     {
-        if self.inner().weak.fetch_sub(1, Release) > 1 {
+        let weak_count = self.task_header().weak.fetch_sub(1, Release);
+        if weak_count > 1 {
             return;
         }
-        self.inner().weak.load(Acquire);
-
-        unsafe {
-            std::ptr::drop_in_place(self.p.as_ptr().cast::<TaskHeader>());
-        };
-
-        let layout = {
-            let align =
-                std::cmp::max(align_of::<TaskHeader>(), self.inner().future_vtable.align_of());
-
-            let offset = align_up(size_of::<TaskHeader>(), align);
-
-            Layout::from_size_align(align_up(offset + self.inner().future_vtable.size_of(), align),
-                                    align).unwrap()
-        };
-
-        unsafe {
-            std::alloc::dealloc(self.p.as_ptr(), layout);
-        };
+        self.task_header().weak.load(Acquire);
+        let layout = self.task_header().task_layout;
+        unsafe { std::ptr::drop_in_place(self.p.as_ptr().cast::<TaskHeader>()) };
+        unsafe { std::alloc::dealloc(self.p.as_ptr(), layout) };
     }
 }
 
@@ -334,8 +285,7 @@ impl Clone for Weak
 {
     fn clone(&self) -> Self
     {
-        self.inner().weak.fetch_add(1, Relaxed);
-
+        self.task_header().weak.fetch_add(1, Relaxed);
         Self { p: self.p,
                phantom: PhantomData }
     }
@@ -357,11 +307,11 @@ unsafe fn task_waker_clone(p: *const ()) -> RawWaker
 unsafe fn task_wake(p: *const ())
 {
     let weak = unsafe { Weak::from_raw(p) };
-    if let Some(sender) = weak.inner().sender.as_ref() {
+    if let Some(sender) = weak.task_header().sender.as_ref() {
         sender.send(weak.clone()).unwrap();
         let buf = &0x01_u64.to_ne_bytes();
         unsafe {
-            nix::libc::write(weak.inner().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
+            nix::libc::write(weak.task_header().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
         }
     }
 }
@@ -369,11 +319,11 @@ unsafe fn task_wake(p: *const ())
 unsafe fn task_wake_by_ref(p: *const ())
 {
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
-    if let Some(sender) = weak.inner().sender.as_ref() {
+    if let Some(sender) = weak.task_header().sender.as_ref() {
         sender.send(ManuallyDrop::into_inner(weak.clone())).unwrap();
         let buf = &0x01_u64.to_ne_bytes();
         unsafe {
-            nix::libc::write(weak.inner().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
+            nix::libc::write(weak.task_header().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
         }
     }
 }
@@ -407,7 +357,7 @@ unsafe fn task_local_wake(p: *const ())
 {
     let weak = unsafe { Weak::from_raw(p) };
     if let Some(_task) = unsafe { weak.upgrade() } {
-        let ex = unsafe { &*weak.inner().ex };
+        let ex = unsafe { &*weak.task_header().ex };
         unsafe { (*ex.get()).local_task_queue.push_back(weak) };
     }
 }
@@ -416,7 +366,7 @@ unsafe fn task_local_wake_by_ref(p: *const ())
 {
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
     if let Some(_task) = unsafe { weak.upgrade() } {
-        let ex = unsafe { &*weak.inner().ex };
+        let ex = unsafe { &*weak.task_header().ex };
         unsafe { (*ex.get()).local_task_queue.push_back((*weak).clone()) };
     }
 }
@@ -911,7 +861,9 @@ impl Drop for RunGuard
         let ring = unsafe { &raw mut (*self.p.get()).ioring };
         {
             let tasks = unsafe { &mut (*self.p.get()).tasks };
+            let local_tasks = unsafe { &mut (*self.p.get()).local_task_queue };
             tasks.clear();
+            local_tasks.clear();
         }
 
         unsafe { submit_ring(ring) };
@@ -1465,7 +1417,7 @@ struct SpawnValue<T>
 struct WrapperFuture<T, F: Future<Output = T>>
 {
     f: F,
-    value: Rc<UnsafeCell<SpawnValue<T>>>,
+    value: *mut SpawnValue<T>,
 }
 
 impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F>
@@ -1480,10 +1432,10 @@ impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F>
         match r {
             Poll::Pending => Poll::Pending,
             Poll::Ready(t) => {
-                let state = unsafe { &mut *(*this.value).get() };
-                state.t = Some(t);
-                if let Some(ref w) = state.waker {
-                    w.wake_by_ref();
+                let spawn_value = unsafe { &mut *this.value };
+                spawn_value.t = Some(t);
+                if let Some(w) = spawn_value.waker.take() {
+                    w.wake();
                 }
                 Poll::Ready(())
             }
@@ -1496,25 +1448,39 @@ impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F>
 pub struct SpawnFuture<T>
 {
     done: bool,
-    value: Rc<UnsafeCell<SpawnValue<T>>>,
+    task: Option<Task>,
+    _marker: PhantomData<T>,
 }
+
+impl<T: Unpin> Unpin for SpawnFuture<T> {}
 
 impl<T> Future for SpawnFuture<T>
 {
     type Output = T;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
     {
         assert!(!self.done);
+        let this = unsafe { self.get_unchecked_mut() };
+        let offset = this.task.as_ref().unwrap().task_header().value_offset;
+        let spawn_value = unsafe {
+            &mut *this.task
+                      .as_ref()
+                      .unwrap()
+                      .p
+                      .add(offset)
+                      .cast::<SpawnValue<T>>()
+                      .as_ptr()
+        };
 
-        let result = unsafe { (*self.value.get()).t.take() };
-
+        let result = spawn_value.t.take();
         match result {
             None => {
-                unsafe { (*self.value.get()).waker = Some(cx.local_waker().clone()) };
+                spawn_value.waker = Some(cx.local_waker().clone());
                 Poll::Pending
             }
             Some(t) => {
-                self.done = true;
+                this.done = true;
+                this.task = None;
                 Poll::Ready(t)
             }
         }
@@ -1601,21 +1567,52 @@ impl Executor
 
     pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T>
     {
-        let value = Rc::new(UnsafeCell::new(SpawnValue { t: None,
-                                                         waker: None }));
-
         let sender = unsafe { (*self.p.get()).sender.clone() };
         let event_fd = unsafe { (*self.p.get()).event_fd.as_raw_fd() };
 
+        let future_vtable =
+            metadata::<dyn Future<Output = ()>>(std::ptr::null::<WrapperFuture<T, F>>());
+        let value_vtable = metadata::<dyn Erased>(std::ptr::null::<SpawnValue<T>>());
+
+        let (layout, value_offset) = Layout::new::<TaskHeader>().extend(value_vtable.layout())
+                                                                .unwrap();
+        let (layout, future_offset) = layout.extend(future_vtable.layout()).unwrap();
+        let layout = layout.pad_to_align();
+
+        let task_header = TaskHeader { strong: AlignedAtomicU64(AtomicU64::new(1)),
+                                       weak: AlignedAtomicU64(AtomicU64::new(1)),
+                                       value_offset,
+                                       future_offset,
+                                       future_vtable,
+                                       value_vtable,
+                                       sender: Some(sender),
+                                       event_fd,
+                                       ex: Rc::into_raw(self.clone().p),
+                                       task_layout: layout };
+
+        let p = unsafe { std::alloc::alloc(layout) };
+        assert!(!p.is_null());
+
         let wrapped = WrapperFuture { f,
-                                      value: value.clone() };
+                                      value: unsafe { p.add(value_offset).cast() } };
 
-        let task = Task::new(wrapped, sender.clone(), event_fd, self.clone());
+        let value = SpawnValue::<T> { t: None,
+                                      waker: None };
 
-        sender.send(Task::downgrade(&task)).unwrap();
-        unsafe { (*(*self.p).get()).tasks.insert(task) };
+        unsafe { std::ptr::write(p.cast::<TaskHeader>(), task_header) };
+        unsafe { std::ptr::write(p.add(value_offset).cast::<SpawnValue<T>>(), value) };
+        unsafe { std::ptr::write(p.add(future_offset).cast::<WrapperFuture<T, F>>(), wrapped) };
 
-        SpawnFuture { value, done: false }
+        let task = Task { p: NonNull::new(p).unwrap(),
+                          phantom: PhantomData };
+
+        let weak = Task::downgrade(&task);
+
+        unsafe { (*self.p.get()).tasks.insert(task.clone()) };
+        unsafe { (*self.p.get()).local_task_queue.push_back(weak.clone()) };
+        SpawnFuture::<T> { task: Some(task),
+                           done: false,
+                           _marker: PhantomData }
     }
 }
 
