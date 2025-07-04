@@ -87,9 +87,14 @@ impl Deref for AlignedAtomicU64
 
 //-----------------------------------------------------------------------------
 
+struct DanglingExecutor(*const UnsafeCell<IoContextFrame>);
+unsafe impl Send for DanglingExecutor {}
+
+//-----------------------------------------------------------------------------
+
 struct TaskHeader
 {
-    strong: AlignedAtomicU64,
+    strong: UnsafeCell<u64>,
     weak: AlignedAtomicU64,
     task_layout: Layout,
     value_offset: usize,
@@ -98,7 +103,7 @@ struct TaskHeader
     future_vtable: DynMetadata<dyn Future<Output = ()> + 'static>,
     sender: Option<Sender<Weak>>,
     event_fd: i32,
-    ex: *const UnsafeCell<IoContextFrame>,
+    ex: DanglingExecutor,
 }
 
 //-----------------------------------------------------------------------------
@@ -151,23 +156,24 @@ impl Drop for Task
 {
     fn drop(&mut self)
     {
-        if self.task_header().strong.fetch_sub(1, Release) > 1 {
+        unsafe { (*self.task_header().strong.get()) -= 1 };
+        if unsafe { *self.task_header().strong.get() > 0 } {
             return;
         }
-        self.task_header().strong.load(Acquire);
 
         let future_offset = self.task_header().future_offset;
         let future = unsafe { self.p.add(future_offset).as_ptr() };
-        let p =
+        let future =
             std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(future,
                                                                               self.task_header()
                                                                                   .future_vtable);
         let value = unsafe { self.p.add(self.task_header().value_offset).as_ptr() };
         let value =
             std::ptr::from_raw_parts_mut::<dyn Erased>(value, self.task_header().value_vtable);
+
         unsafe { std::ptr::drop_in_place(value) };
-        unsafe { std::ptr::drop_in_place(p) };
-        drop(unsafe { Rc::from_raw(self.task_header().ex) });
+        unsafe { std::ptr::drop_in_place(future) };
+        drop(unsafe { Rc::from_raw(self.task_header().ex.0) });
 
         let weak_count = self.task_header().weak.fetch_sub(1, Release);
         if weak_count > 1 {
@@ -186,7 +192,7 @@ impl Clone for Task
 {
     fn clone(&self) -> Task
     {
-        self.task_header().strong.fetch_add(1, Relaxed);
+        unsafe { *self.task_header().strong.get() += 1 };
         Self { p: self.p,
                phantom: PhantomData }
     }
@@ -242,27 +248,13 @@ impl Weak
     // must only be upgraded on the main thread running the ring
     unsafe fn upgrade(&self) -> Option<Task>
     {
-        let mut c = self.task_header().strong.load(Relaxed);
-
-        loop {
-            if c == 0 {
-                return None;
-            }
-
-            let r = self.task_header()
-                        .strong
-                        .compare_exchange_weak(c, c + 1, Relaxed, Relaxed);
-
-            match r {
-                Ok(_) => {
-                    return Some(Task { p: self.p,
-                                       phantom: PhantomData });
-                }
-                Err(c2) => {
-                    c = c2;
-                }
-            }
+        let c = unsafe { *self.task_header().strong.get() };
+        if c == 0 {
+            return None;
         }
+        unsafe { *self.task_header().strong.get() += 1 };
+        Some(Task { p: self.p,
+                    phantom: PhantomData })
     }
 }
 
@@ -357,7 +349,7 @@ unsafe fn task_local_wake(p: *const ())
 {
     let weak = unsafe { Weak::from_raw(p) };
     if let Some(_task) = unsafe { weak.upgrade() } {
-        let ex = unsafe { &*weak.task_header().ex };
+        let ex = unsafe { &*weak.task_header().ex.0 };
         unsafe { (*ex.get()).local_task_queue.push_back(weak) };
     }
 }
@@ -366,7 +358,7 @@ unsafe fn task_local_wake_by_ref(p: *const ())
 {
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
     if let Some(_task) = unsafe { weak.upgrade() } {
-        let ex = unsafe { &*weak.task_header().ex };
+        let ex = unsafe { &*weak.task_header().ex.0 };
         unsafe { (*ex.get()).local_task_queue.push_back((*weak).clone()) };
     }
 }
@@ -1579,7 +1571,7 @@ impl Executor
         let (layout, future_offset) = layout.extend(future_vtable.layout()).unwrap();
         let layout = layout.pad_to_align();
 
-        let task_header = TaskHeader { strong: AlignedAtomicU64(AtomicU64::new(1)),
+        let task_header = TaskHeader { strong: UnsafeCell::new(1),
                                        weak: AlignedAtomicU64(AtomicU64::new(1)),
                                        value_offset,
                                        future_offset,
@@ -1587,7 +1579,7 @@ impl Executor
                                        value_vtable,
                                        sender: Some(sender),
                                        event_fd,
-                                       ex: Rc::into_raw(self.clone().p),
+                                       ex: DanglingExecutor(Rc::into_raw(self.clone().p)),
                                        task_layout: layout };
 
         let p = unsafe { std::alloc::alloc(layout) };
@@ -1630,6 +1622,16 @@ mod test
         io_uring_prep_timeout, io_uring_prep_timeout_remove, io_uring_queue_exit,
         io_uring_queue_init, io_uring_submit_and_wait, io_uring_wait_cqe,
     };
+
+    use crate::TaskHeader;
+
+    fn send_only<T: Send>() {}
+
+    #[test]
+    fn is_task_header_send()
+    {
+        send_only::<TaskHeader>();
+    }
 
     #[test]
     fn timeout_inline_submit_cancel()
