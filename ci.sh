@@ -11,9 +11,9 @@ clear
 
 CARGO_FLAGS=(--target x86_64-unknown-linux-gnu -Zbuild-std)
 
-# RUSTFLAGS='-Zsanitizer=address' cargo test "${CARGO_FLAGS[@]}" -- --test-threads=1
-# RUSTFLAGS='-Zsanitizer=thread' cargo test "${CARGO_FLAGS[@]}" -- --test-threads=1
-# cargo test "${CARGO_FLAGS[@]}" -- --test-threads=1
+RUSTFLAGS='-Zsanitizer=address' cargo test "${CARGO_FLAGS[@]}" --profile=release-with-debug -- --test-threads=1
+RUSTFLAGS='-Zsanitizer=thread' cargo test "${CARGO_FLAGS[@]}" --profile=release-with-debug -- --test-threads=1
+cargo test "${CARGO_FLAGS[@]}" --profile=release-with-debug -- --test-threads=1
 
 RUSTFLAGS='-Zsanitizer=address -C embed-bitcode -C lto' cargo test "${CARGO_FLAGS[@]}" --release -- --test-threads=1
 RUSTFLAGS='-Zsanitizer=thread -C embed-bitcode -C lto' cargo test "${CARGO_FLAGS[@]}" --release -- --test-threads=1
