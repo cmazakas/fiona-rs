@@ -34,8 +34,8 @@ use liburing_rs::{
     io_uring_prep_cancel64, io_uring_prep_close_direct, io_uring_prep_connect,
     io_uring_prep_link_timeout, io_uring_prep_recv_multishot, io_uring_prep_send_zc,
     io_uring_prep_socket_direct, io_uring_prep_timeout, io_uring_prep_timeout_remove,
-    io_uring_register_files_update, io_uring_sqe_set_buf_group, io_uring_sqe_set_data,
-    io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    io_uring_prep_timeout_update, io_uring_register_files_update, io_uring_sqe_set_buf_group,
+    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
 
 use crate::{
@@ -509,25 +509,20 @@ impl Stream
     pub fn set_timeout(&self, dur: Duration)
     {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
-
         stream_impl.ts = dur.into();
 
         if let Some(ref mut timeout_op) = stream_impl.timeout_op {
             let ring = stream_impl.ex.ring();
-
             let sqe = get_sqe(&stream_impl.ex);
             let user_data = Box::as_mut_ptr(timeout_op) as u64;
-
             let OpType::MultishotTimeout { ref mut ts, .. } = timeout_op.op_type else {
                 unreachable!()
             };
 
             *ts = stream_impl.ts;
-            // let flags = 0;
-            // let ts = ptr::from_mut(ts).cast::<__kernel_timespec>();
-
-            // unsafe { io_uring_prep_timeout_update(sqe, ts, user_data, flags) };
-            unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
+            let flags = 0;
+            let ts = ptr::from_mut(ts).cast::<__kernel_timespec>();
+            unsafe { io_uring_prep_timeout_update(sqe, ts, user_data, flags) };
             unsafe { io_uring_sqe_set_data64(sqe, 0) };
             unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
         }
