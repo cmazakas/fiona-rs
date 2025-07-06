@@ -877,9 +877,12 @@ impl Drop for RunGuard
                     }
 
                     blacklist.insert(user_data);
+
                     let op = unsafe { &mut *(user_data as *mut IoUringOp) };
+                    let is_boxed_io_op = !matches!(op.op_type, OpType::Timeout { .. });
+
                     unsafe { release_op(op.ref_count) };
-                    if op.eager_dropped {
+                    if is_boxed_io_op && op.eager_dropped {
                         drop(unsafe { Box::from_raw(op) });
                     }
                 }
@@ -1083,15 +1086,12 @@ fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, 
 {
     let _ = ex;
     unsafe { release_op(op.ref_count) };
-
+    op.done = true;
     if op.eager_dropped {
-        drop(unsafe { Box::from_raw(op) });
         return;
     }
 
-    op.done = true;
     op.res = cqe.res;
-
     if let Some(local_waker) = op.local_waker.take() {
         local_waker.wake();
     }

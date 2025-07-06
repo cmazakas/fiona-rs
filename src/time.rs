@@ -1,29 +1,27 @@
-// Copyright 2024 Christian Mazakas
+// Copyright 2024-2025 Christian Mazakas
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 extern crate liburing_rs;
 
-use std::{future::Future, ptr::NonNull, task::Poll, time::Duration};
-
-use nix::{errno::Errno, libc::ETIME};
-
+use crate::{
+    Executor, IoUringOp, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
+    make_io_uring_op, release_impl, release_obj, reserve_sqes,
+};
 use liburing_rs::{
     __kernel_timespec, IOSQE_CQE_SKIP_SUCCESS, io_uring_get_sqe, io_uring_prep_timeout,
     io_uring_prep_timeout_remove, io_uring_sqe_set_data, io_uring_sqe_set_data64,
     io_uring_sqe_set_flags,
 };
-
-use crate::{
-    Executor, IoUringOp, OpType, RefCount, Result, add_obj_ref, add_op_ref, make_io_uring_op,
-    release_impl, release_obj, reserve_sqes,
-};
+use nix::{errno::Errno, libc::ETIME};
+use std::{future::Future, ptr::NonNull, task::Poll, time::Duration};
 
 struct TimerImpl
 {
     ref_count: RefCount,
     ex: Executor,
-    timeout_pending: bool,
+    has_future: bool,
+    op: Option<IoUringOp>,
 }
 
 pub struct Timer
@@ -34,7 +32,6 @@ pub struct Timer
 pub struct TimerFuture<'a>
 {
     timer: &'a Timer,
-    op: Option<Box<IoUringOp>>,
     completed: bool,
 }
 
@@ -55,7 +52,8 @@ impl Timer
 
         let timer_impl = TimerImpl { ref_count,
                                      ex,
-                                     timeout_pending: false };
+                                     op: None,
+                                     has_future: false };
 
         let p = p.cast::<TimerImpl>();
         unsafe { std::ptr::write(p, timer_impl) };
@@ -65,19 +63,21 @@ impl Timer
 
     #[inline]
     #[must_use]
-    pub fn wait(&self, dur: Duration) -> TimerFuture
+    pub fn wait(&self, dur: Duration) -> TimerFuture<'_>
     {
         let timer_impl = unsafe { &mut *self.p.as_ptr() };
-        assert!(!timer_impl.timeout_pending);
+        assert!(!timer_impl.has_future);
+        timer_impl.has_future = true;
 
-        timer_impl.timeout_pending = true;
+        if let Some(ref op) = timer_impl.op {
+            assert!(op.done);
+        }
 
         let ref_count = &raw mut timer_impl.ref_count;
+        timer_impl.op = Some(make_io_uring_op(ref_count, OpType::Timeout { dur: dur.into() }));
 
         TimerFuture { timer: self,
-                      completed: false,
-                      op: Some(Box::new(make_io_uring_op(ref_count,
-                                                         OpType::Timeout { dur: dur.into() }))) }
+                      completed: false }
     }
 }
 
@@ -96,7 +96,6 @@ impl Clone for Timer
     {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
         unsafe { add_obj_ref(rc) };
-
         Self { p: self.p }
     }
 }
@@ -108,30 +107,21 @@ impl Drop for TimerFuture<'_>
     fn drop(&mut self)
     {
         let timer_impl = unsafe { &mut *self.timer.p.as_ptr() };
-        timer_impl.timeout_pending = false;
-
-        let op = self.op.as_mut().unwrap();
-
-        if op.initiated && !op.done {
-            let ring = timer_impl.ex.ring();
-            unsafe { reserve_sqes(ring, 1) };
-            let sqe = unsafe { io_uring_get_sqe(ring) };
-
-            let user_data = Box::as_mut_ptr(op) as usize as u64;
-            unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
-            unsafe { io_uring_sqe_set_data64(sqe, 0) };
-            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-            // TODO: should we eventually remove this? because we now allocate
-            // per-Future state, so long as we mark this operation as eager-dropped,
-            // our CQE loop can safely ignore it which means we no longer need to
-            // cancel ASAP from the Drop impl and can instead rely on the next tick
-            // of the event loop to cancel the operation for us
-            //
-            // unsafe { submit_ring(ring) };
-
-            op.eager_dropped = true;
-            op.local_waker = None;
-            Box::leak(self.op.take().unwrap());
+        timer_impl.has_future = false;
+        if let Some(ref mut op) = timer_impl.op {
+            if op.initiated {
+                if op.done {
+                    timer_impl.op = None;
+                } else {
+                    let sqe = get_sqe(&timer_impl.ex);
+                    let user_data = op as *mut _ as u64;
+                    unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
+                    unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+                    op.eager_dropped = true;
+                    op.local_waker = None;
+                }
+            }
         }
     }
 }
@@ -146,16 +136,14 @@ impl Future for TimerFuture<'_>
         assert!(!self.completed);
 
         let timer_impl = unsafe { &mut *self.timer.p.as_ptr() };
-
-        let mut op = self.op.take().unwrap();
+        let Some(ref mut op) = timer_impl.op else {
+            unreachable!()
+        };
 
         match (op.initiated, op.done) {
             (true, true) => {
                 self.completed = true;
-
                 let res = op.res;
-
-                self.op = Some(op);
                 if res < 0 {
                     let res = -res;
                     if res == ETIME {
@@ -169,29 +157,23 @@ impl Future for TimerFuture<'_>
             }
             (true, false) => {
                 op.local_waker = Some(cx.local_waker().clone());
-                self.op = Some(op);
                 Poll::Pending
             }
-            (false, true) => panic!(),
+            (false, true) => unreachable!("Timer initiated/done logic bug"),
             (false, false) => {
-                let ring = timer_impl.ex.ring();
-                unsafe { reserve_sqes(ring, 1) };
-                let sqe = unsafe { io_uring_get_sqe(ring) };
-
+                let sqe = get_sqe(&timer_impl.ex);
                 let ts = match op.op_type {
                     OpType::Timeout { ref mut dur } => &raw mut *dur,
                     _ => unreachable!(),
                 };
 
-                let user_data = Box::as_mut_ptr(&mut op);
-
+                let user_data = op as *mut IoUringOp;
                 unsafe { io_uring_prep_timeout(sqe, ts.cast::<__kernel_timespec>(), 0, 0) };
                 unsafe { io_uring_sqe_set_data(sqe, user_data.cast()) };
 
                 unsafe { add_op_ref(&raw mut timer_impl.ref_count) };
                 op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
-                self.op = Some(op);
                 Poll::Pending
             }
         }
