@@ -123,7 +123,7 @@ fn timer_early_drop()
     async fn f1(ex: fiona::Executor)
     {
         let dur = Duration::from_millis(200);
-        let timer = fiona::time::Timer::new(ex.clone());
+        let timer = fiona::time::Timer::new(ex);
 
         let _guard = DurationGuard::new(dur);
         for _ in 0..5 {
@@ -135,11 +135,6 @@ fn timer_early_drop()
 
                 drop(f);
             }
-
-            // TODO: pseudo yield point
-            fiona::time::Timer::new(ex.clone()).wait(Duration::from_micros(100))
-                                               .await
-                                               .unwrap();
         }
 
         timer.wait(dur).await.unwrap();
@@ -157,7 +152,7 @@ fn timer_early_drop()
 }
 
 #[test]
-#[should_panic = "assertion failed: !timer_impl.has_future"]
+#[should_panic = "assertion failed: !timer_impl.timeout_pending"]
 fn timer_shared_panic()
 {
     // we use interior mutability for an ergonomic API but we should never
@@ -181,7 +176,7 @@ fn timer_shared_panic()
 
 #[test]
 #[inline(never)]
-#[should_panic = "assertion failed: !timer_impl.has_future"]
+#[should_panic = "assertion failed: !timer_impl.timeout_pending"]
 fn timer_forget_expired()
 {
     // this function must be marked inline(never) because if its name disappears,
@@ -243,7 +238,6 @@ fn timer_multiple_eager_drops()
     async fn f1(ex: fiona::Executor)
     {
         let timer = fiona::time::Timer::new(ex.clone());
-        let timer2 = fiona::time::Timer::new(ex.clone());
         let w = WakerFuture.await;
         let mut cx = std::task::Context::from_waker(&w);
 
@@ -257,26 +251,17 @@ fn timer_multiple_eager_drops()
             drop(f);
         }
 
-        // pseudo yield-point now required for CQ processing, which is required
-        // for reusing the object
-        // TODO: replace this with a real nop-based yield primitive
-        timer2.wait(Duration::from_micros(100)).await.unwrap();
-
         {
             let mut f = timer.wait(dur);
             assert!(std::pin::pin!(&mut f).poll(&mut cx).is_pending());
             drop(f);
         }
 
-        timer2.wait(Duration::from_micros(100)).await.unwrap();
-
         {
             let mut f = timer.wait(dur);
             assert!(std::pin::pin!(&mut f).poll(&mut cx).is_pending());
             drop(f);
         }
-
-        timer2.wait(Duration::from_micros(100)).await.unwrap();
 
         timer.wait(dur).await.unwrap();
         unsafe { NUM_RUNS += 1 };
@@ -399,11 +384,6 @@ fn timer_futures_select()
 
             assert_eq!(result, 1);
         }
-
-        // TODO: pseudo yield
-        fiona::time::Timer::new(ex.clone()).wait(Duration::from_micros(100))
-                                           .await
-                                           .unwrap();
 
         {
             let _guard = DurationGuard::new(Duration::from_millis(100));
