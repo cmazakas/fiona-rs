@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
     rc::Rc,
     sync::Arc,
-    task::{LocalWaker, Poll},
+    task::{LocalWaker, Poll, Waker},
     thread::JoinHandle,
     time::Duration,
 };
@@ -67,7 +67,7 @@ struct WakerFuture;
 
 impl Future for WakerFuture
 {
-    type Output = std::task::Waker;
+    type Output = Waker;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
     {
@@ -260,7 +260,7 @@ fn await_forgotten_recursive()
     let f = unsafe { Box::from_raw(P_FUTURE) };
     let f = std::pin::pin!(f);
 
-    let w = std::task::Waker::noop();
+    let w = Waker::noop();
     let mut cx = std::task::Context::from_waker(w);
     if let Poll::Ready(v) = f.poll(&mut cx) {
         assert_eq!(v, vec![1, 2, 3, 4]);
@@ -435,14 +435,21 @@ fn await_from_main()
 
     let mut ioc = fiona::IoContext::new();
     let mut future = Box::pin(ioc.get_executor().spawn(async { 1234 }));
+    let mut future2 = Box::pin(ioc.get_executor().spawn(async { vec![1234] }));
     ioc.run();
 
+    // Make sure this remains to test SpawnFuture outliving its backing IoContext.
     drop(ioc);
-    let w = Arc::new(PanicWaker).into();
+
+    let w = Waker::from(Arc::new(PanicWaker));
     let mut cx = std::task::Context::from_waker(&w);
     match future.as_mut().poll(&mut cx) {
         Poll::Pending => panic!(),
         Poll::Ready(x) => assert_eq!(x, 1234),
+    }
+    match future2.as_mut().poll(&mut cx) {
+        Poll::Pending => panic!(),
+        Poll::Ready(x) => assert_eq!(x, vec![1234]),
     }
 }
 
