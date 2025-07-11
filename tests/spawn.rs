@@ -437,6 +437,7 @@ fn await_from_main()
     let mut future = Box::pin(ioc.get_executor().spawn(async { 1234 }));
     ioc.run();
 
+    drop(ioc);
     let w = Arc::new(PanicWaker).into();
     let mut cx = std::task::Context::from_waker(&w);
     match future.as_mut().poll(&mut cx) {
