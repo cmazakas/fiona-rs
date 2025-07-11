@@ -368,7 +368,12 @@ fn tcp_send_recv_hello_world()
     let buf_len = 8;
     ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
 
-    let expected_bufs = message.len() / buf_len + if message.len() % buf_len > 0 { 1 } else { 0 };
+    let expected_bufs = message.len() / buf_len
+                        + if !message.len().is_multiple_of(buf_len) {
+                            1
+                        } else {
+                            0
+                        };
 
     ex.clone().spawn(async move {
                   let stream = acceptor.accept().await.unwrap();

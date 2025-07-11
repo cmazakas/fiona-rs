@@ -478,7 +478,7 @@ impl Stream
     }
 
     #[must_use]
-    pub fn send(&self, buf: Vec<u8>) -> SendFuture
+    pub fn send(&self, buf: Vec<u8>) -> SendFuture<'_>
     {
         assert!(unsafe { !(*self.p.as_ptr()).send_pending });
 
@@ -496,7 +496,7 @@ impl Stream
     }
 
     #[must_use]
-    pub fn recv(&self) -> RecvFuture
+    pub fn recv(&self) -> RecvFuture<'_>
     {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!stream_impl.recv_pending);
@@ -589,7 +589,7 @@ impl Client
     }
 
     #[must_use]
-    pub fn connect_ipv4(&self, addr: Ipv4Addr, port: u16) -> ConnectFuture
+    pub fn connect_ipv4(&self, addr: Ipv4Addr, port: u16) -> ConnectFuture<'_>
     {
         assert!(unsafe { !(*self.p.as_ptr()).connect_pending });
 
