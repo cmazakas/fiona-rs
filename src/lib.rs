@@ -67,6 +67,7 @@ use liburing_rs::{
 pub mod tcp;
 pub mod time;
 
+use slotmap::{DefaultKey, KeyData, SlotMap};
 use tcp::StreamImpl;
 
 pub type Result<T> = std::result::Result<T, nix::Error>;
@@ -622,6 +623,7 @@ struct IoContextFrame
     buf_groups: HashMap<u16, Box<UnsafeCell<BufGroup>>>,
     runguard_blacklist: HashSet<u64>,
     local_task_queue: VecDeque<Weak>,
+    io_ops: SlotMap<DefaultKey, UnsafeCell<IoUringOp>>,
 }
 
 //-----------------------------------------------------------------------------
@@ -877,6 +879,14 @@ impl Drop for RunGuard
                     }
 
                     blacklist.insert(user_data);
+
+                    let key = DefaultKey::from(KeyData::from_ffi(user_data));
+                    if let Some(op) = unsafe { (*self.p.get()).io_ops.get(key) } {
+                        unsafe { release_op((*op.get()).ref_count) };
+                        unsafe { (*self.p.get()).io_ops.remove(key).unwrap() };
+                        continue;
+                    }
+
                     let op = unsafe { &mut *(user_data as *mut IoUringOp) };
                     unsafe { release_op(op.ref_count) };
                     if op.eager_dropped {
@@ -933,7 +943,8 @@ impl IoContext
                                          event_fd: nix::sys::eventfd::EventFd::new().unwrap(),
                                          buf_groups: HashMap::new(),
                                          runguard_blacklist: HashSet::new(),
-                                         local_task_queue: VecDeque::new() };
+                                         local_task_queue: VecDeque::new(),
+                                         io_ops: SlotMap::with_capacity(512 * 1024) };
 
         let p = Rc::new(UnsafeCell::new(ioc_frame));
 
@@ -1056,18 +1067,28 @@ impl IoContext
                     return;
                 }
 
-                let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
-                match op.op_type {
-                    OpType::Timeout { .. } => on_timeout(op, cqe, ring, &ex),
-                    OpType::TimeoutCancel => todo!(),
-                    OpType::TcpAccept { .. } => on_tcp_accept(op, cqe, ring, &ex),
-                    OpType::TcpConnect { .. } => on_tcp_connect(op, cqe, ring, &ex),
-                    OpType::TcpSend { .. } => on_tcp_send(op, cqe, ring, &ex),
-                    OpType::MultishotTcpRecv { .. } => {
-                        on_multishot_tcp_recv(op, cqe, ring, &ex);
+                let key_data = cqe.user_data;
+                let key = DefaultKey::from(KeyData::from_ffi(key_data));
+                if let Some(value) = unsafe { (*self.p.get()).io_ops.get(key) } {
+                    let op = value.get();
+                    match unsafe { &(*op).op_type } {
+                        OpType::Timeout { .. } => unsafe { on_timeout(op, cqe, ring, &ex) },
+                        _ => unreachable!(),
                     }
-                    OpType::MultishotTimeout { .. } => {
-                        on_multishot_timeout(op, cqe, ring, &ex);
+                } else {
+                    let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
+                    match op.op_type {
+                        OpType::TimeoutCancel => todo!(),
+                        OpType::TcpAccept { .. } => on_tcp_accept(op, cqe, ring, &ex),
+                        OpType::TcpConnect { .. } => on_tcp_connect(op, cqe, ring, &ex),
+                        OpType::TcpSend { .. } => on_tcp_send(op, cqe, ring, &ex),
+                        OpType::MultishotTcpRecv { .. } => {
+                            on_multishot_tcp_recv(op, cqe, ring, &ex);
+                        }
+                        OpType::MultishotTimeout { .. } => {
+                            on_multishot_timeout(op, cqe, ring, &ex);
+                        }
+                        OpType::Timeout { .. } => unreachable!(),
                     }
                 }
             };
@@ -1079,20 +1100,22 @@ impl IoContext
     }
 }
 
-fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor)
+unsafe fn on_timeout(op: *mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
+                     ex: &Executor)
 {
     let _ = ex;
-    unsafe { release_op(op.ref_count) };
+    unsafe { release_op((*op).ref_count) };
 
-    if op.eager_dropped {
-        drop(unsafe { Box::from_raw(op) });
+    if unsafe { (*op).eager_dropped } {
+        let key = DefaultKey::from(KeyData::from_ffi(cqe.user_data));
+        unsafe { (*ex.p.get()).io_ops.remove(key).unwrap() };
         return;
     }
 
-    op.done = true;
-    op.res = cqe.res;
+    unsafe { (*op).done = true };
+    unsafe { (*op).res = cqe.res };
 
-    if let Some(local_waker) = op.local_waker.take() {
+    if let Some(local_waker) = unsafe { (*op).local_waker.take() } {
         local_waker.wake();
     }
 }

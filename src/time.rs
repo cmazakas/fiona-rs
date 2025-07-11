@@ -4,18 +4,18 @@
 
 extern crate liburing_rs;
 
-use std::{future::Future, ptr::NonNull, task::Poll, time::Duration};
+use std::{cell::UnsafeCell, future::Future, ptr::NonNull, task::Poll, time::Duration};
 
 use nix::{errno::Errno, libc::ETIME};
 
 use liburing_rs::{
     __kernel_timespec, IOSQE_CQE_SKIP_SUCCESS, io_uring_get_sqe, io_uring_prep_timeout,
-    io_uring_prep_timeout_remove, io_uring_sqe_set_data, io_uring_sqe_set_data64,
-    io_uring_sqe_set_flags,
+    io_uring_prep_timeout_remove, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
+use slotmap::{DefaultKey, Key, KeyData};
 
 use crate::{
-    Executor, IoUringOp, OpType, RefCount, Result, add_obj_ref, add_op_ref, make_io_uring_op,
+    Executor, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe, make_io_uring_op,
     release_impl, release_obj, reserve_sqes,
 };
 
@@ -34,7 +34,7 @@ pub struct Timer
 pub struct TimerFuture<'a>
 {
     timer: &'a Timer,
-    op: Option<Box<IoUringOp>>,
+    op: Option<u64>,
     completed: bool,
 }
 
@@ -65,7 +65,7 @@ impl Timer
 
     #[inline]
     #[must_use]
-    pub fn wait(&self, dur: Duration) -> TimerFuture
+    pub fn wait(&self, dur: Duration) -> TimerFuture<'_>
     {
         let timer_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!timer_impl.timeout_pending);
@@ -74,10 +74,15 @@ impl Timer
 
         let ref_count = &raw mut timer_impl.ref_count;
 
+        let key = unsafe {
+            (*timer_impl.ex.p.get()).io_ops
+                                    .insert(UnsafeCell::new(make_io_uring_op(ref_count,
+                                                             OpType::Timeout { dur: dur.into() })))
+        };
+
         TimerFuture { timer: self,
                       completed: false,
-                      op: Some(Box::new(make_io_uring_op(ref_count,
-                                                         OpType::Timeout { dur: dur.into() }))) }
+                      op: Some(key.data().as_ffi()) }
     }
 }
 
@@ -110,14 +115,14 @@ impl Drop for TimerFuture<'_>
         let timer_impl = unsafe { &mut *self.timer.p.as_ptr() };
         timer_impl.timeout_pending = false;
 
-        let op = self.op.as_mut().unwrap();
+        let key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let op = unsafe { (*timer_impl.ex.p.get()).io_ops.get(key).unwrap().get() };
 
-        if op.initiated && !op.done {
-            let ring = timer_impl.ex.ring();
-            unsafe { reserve_sqes(ring, 1) };
-            let sqe = unsafe { io_uring_get_sqe(ring) };
+        if unsafe { (*op).initiated && !(*op).done } {
+            let sqe = get_sqe(&timer_impl.ex);
 
-            let user_data = Box::as_mut_ptr(op) as usize as u64;
+            let user_data = key_data;
             unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
             unsafe { io_uring_sqe_set_data64(sqe, 0) };
             unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
@@ -129,9 +134,11 @@ impl Drop for TimerFuture<'_>
             //
             // unsafe { submit_ring(ring) };
 
-            op.eager_dropped = true;
-            op.local_waker = None;
-            Box::leak(self.op.take().unwrap());
+            unsafe { (*op).eager_dropped = true };
+            unsafe { (*op).local_waker = None };
+            self.op = None;
+        } else {
+            unsafe { (*timer_impl.ex.p.get()).io_ops.remove(key).unwrap() };
         }
     }
 }
@@ -147,15 +154,15 @@ impl Future for TimerFuture<'_>
 
         let timer_impl = unsafe { &mut *self.timer.p.as_ptr() };
 
-        let mut op = self.op.take().unwrap();
+        let key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let op = unsafe { (*timer_impl.ex.p.get()).io_ops.get(key).unwrap().get() };
 
-        match (op.initiated, op.done) {
+        match unsafe { ((*op).initiated, (*op).done) } {
             (true, true) => {
                 self.completed = true;
 
-                let res = op.res;
-
-                self.op = Some(op);
+                let res = unsafe { (*op).res };
                 if res < 0 {
                     let res = -res;
                     if res == ETIME {
@@ -168,8 +175,7 @@ impl Future for TimerFuture<'_>
                 }
             }
             (true, false) => {
-                op.local_waker = Some(cx.local_waker().clone());
-                self.op = Some(op);
+                unsafe { (*op).local_waker = Some(cx.local_waker().clone()) };
                 Poll::Pending
             }
             (false, true) => panic!(),
@@ -178,20 +184,19 @@ impl Future for TimerFuture<'_>
                 unsafe { reserve_sqes(ring, 1) };
                 let sqe = unsafe { io_uring_get_sqe(ring) };
 
-                let ts = match op.op_type {
-                    OpType::Timeout { ref mut dur } => &raw mut *dur,
+                let ts = match unsafe { &mut (*op).op_type } {
+                    OpType::Timeout { dur } => &raw mut *dur,
                     _ => unreachable!(),
                 };
 
-                let user_data = Box::as_mut_ptr(&mut op);
+                let user_data = key_data;
 
                 unsafe { io_uring_prep_timeout(sqe, ts.cast::<__kernel_timespec>(), 0, 0) };
-                unsafe { io_uring_sqe_set_data(sqe, user_data.cast()) };
+                unsafe { io_uring_sqe_set_data64(sqe, user_data) };
 
                 unsafe { add_op_ref(&raw mut timer_impl.ref_count) };
-                op.local_waker = Some(cx.local_waker().clone());
-                op.initiated = true;
-                self.op = Some(op);
+                unsafe { (*op).local_waker = Some(cx.local_waker().clone()) };
+                unsafe { (*op).initiated = true };
                 Poll::Pending
             }
         }
