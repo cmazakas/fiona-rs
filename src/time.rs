@@ -4,7 +4,7 @@
 
 extern crate liburing_rs;
 
-use std::{cell::UnsafeCell, future::Future, ptr::NonNull, task::Poll, time::Duration};
+use std::{future::Future, ptr::NonNull, task::Poll, time::Duration};
 
 use nix::{errno::Errno, libc::ETIME};
 
@@ -74,11 +74,12 @@ impl Timer
 
         let ref_count = &raw mut timer_impl.ref_count;
 
-        let key = unsafe {
-            (*timer_impl.ex.p.get()).io_ops
-                                    .insert(UnsafeCell::new(make_io_uring_op(ref_count,
-                                                             OpType::Timeout { dur: dur.into() })))
-        };
+        let key =
+            timer_impl.ex
+                      .p
+                      .io_ops
+                      .borrow_mut()
+                      .insert(make_io_uring_op(ref_count, OpType::Timeout { dur: dur.into() }));
 
         TimerFuture { timer: self,
                       completed: false,
@@ -117,9 +118,10 @@ impl Drop for TimerFuture<'_>
 
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let op = unsafe { (*timer_impl.ex.p.get()).io_ops.get(key).unwrap().get() };
+        let io_ops = &mut *timer_impl.ex.p.io_ops.borrow_mut();
+        let op = io_ops.get_mut(key).unwrap();
 
-        if unsafe { (*op).initiated && !(*op).done } {
+        if op.initiated && !op.done {
             let sqe = get_sqe(&timer_impl.ex);
 
             let user_data = key_data;
@@ -134,11 +136,11 @@ impl Drop for TimerFuture<'_>
             //
             // unsafe { submit_ring(ring) };
 
-            unsafe { (*op).eager_dropped = true };
-            unsafe { (*op).local_waker = None };
+            op.eager_dropped = true;
+            op.local_waker = None;
             self.op = None;
         } else {
-            unsafe { (*timer_impl.ex.p.get()).io_ops.remove(key).unwrap() };
+            io_ops.remove(key).unwrap();
         }
     }
 }
@@ -156,13 +158,14 @@ impl Future for TimerFuture<'_>
 
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let op = unsafe { (*timer_impl.ex.p.get()).io_ops.get(key).unwrap().get() };
+        let io_ops = &mut *timer_impl.ex.p.io_ops.borrow_mut();
+        let op = io_ops.get_mut(key).unwrap();
 
-        match unsafe { ((*op).initiated, (*op).done) } {
+        match (op.initiated, op.done) {
             (true, true) => {
                 self.completed = true;
 
-                let res = unsafe { (*op).res };
+                let res = op.res;
                 if res < 0 {
                     let res = -res;
                     if res == ETIME {
@@ -175,7 +178,7 @@ impl Future for TimerFuture<'_>
                 }
             }
             (true, false) => {
-                unsafe { (*op).local_waker = Some(cx.local_waker().clone()) };
+                op.local_waker = Some(cx.local_waker().clone());
                 Poll::Pending
             }
             (false, true) => panic!(),
@@ -184,8 +187,8 @@ impl Future for TimerFuture<'_>
                 unsafe { reserve_sqes(ring, 1) };
                 let sqe = unsafe { io_uring_get_sqe(ring) };
 
-                let ts = match unsafe { &mut (*op).op_type } {
-                    OpType::Timeout { dur } => &raw mut *dur,
+                let ts = match op.op_type {
+                    OpType::Timeout { ref mut dur } => &raw mut *dur,
                     _ => unreachable!(),
                 };
 
@@ -195,8 +198,8 @@ impl Future for TimerFuture<'_>
                 unsafe { io_uring_sqe_set_data64(sqe, user_data) };
 
                 unsafe { add_op_ref(&raw mut timer_impl.ref_count) };
-                unsafe { (*op).local_waker = Some(cx.local_waker().clone()) };
-                unsafe { (*op).initiated = true };
+                op.local_waker = Some(cx.local_waker().clone());
+                op.initiated = true;
                 Poll::Pending
             }
         }

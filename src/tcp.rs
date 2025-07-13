@@ -1059,7 +1059,7 @@ impl Future for RecvFuture<'_>
 
                 let bgid = stream_impl.buf_group;
 
-                let buf_group = match unsafe { (*ex.p.get()).buf_groups.get(&bgid) } {
+                let buf_group = match ex.p.buf_groups.borrow().get(&bgid) {
                     None => {
                         self.completed = true;
                         return Poll::Ready(Err(Errno::ENOENT));
