@@ -1079,7 +1079,12 @@ impl IoContext
                     match op.op_type {
                         OpType::Timeout { .. } => {
                             if on_timeout(op, cqe, ring, &ex) {
-                                io_ops.remove(key);
+                                io_ops.remove(key).unwrap();
+                            }
+                        }
+                        OpType::TcpAccept { .. } => {
+                            if on_tcp_accept(op, cqe, ring, &ex) {
+                                io_ops.remove(key).unwrap();
                             }
                         }
                         _ => unreachable!(),
@@ -1088,7 +1093,6 @@ impl IoContext
                     let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
                     match op.op_type {
                         OpType::TimeoutCancel => todo!(),
-                        OpType::TcpAccept { .. } => on_tcp_accept(op, cqe, ring, &ex),
                         OpType::TcpConnect { .. } => on_tcp_connect(op, cqe, ring, &ex),
                         OpType::TcpSend { .. } => on_tcp_send(op, cqe, ring, &ex),
                         OpType::MultishotTcpRecv { .. } => {
@@ -1097,7 +1101,7 @@ impl IoContext
                         OpType::MultishotTimeout { .. } => {
                             on_multishot_timeout(op, cqe, ring, &ex);
                         }
-                        OpType::Timeout { .. } => unreachable!(),
+                        _ => unreachable!(),
                     }
                 }
             };
@@ -1127,6 +1131,7 @@ fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, 
 }
 
 fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor)
+                 -> bool
 {
     unsafe { release_op(op.ref_count) };
 
@@ -1134,26 +1139,24 @@ fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_urin
 
     if op.eager_dropped {
         if res < 0 {
-            drop(unsafe { Box::from_raw(op) });
-        } else {
-            let OpType::TcpAccept { fd } = op.op_type else {
-                unreachable!()
-            };
-
-            let fd = fd.try_into().unwrap();
-
-            let sqe = get_sqe(ex);
-            unsafe { io_uring_prep_close_direct(sqe, fd) };
-            unsafe { io_uring_sqe_set_data64(sqe, 0) };
-            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-
-            // unsafe { submit_ring(ring) };
-
-            drop(unsafe { Box::from_raw(op) });
-            unsafe { ex.reclaim_fd(fd) };
+            return true;
         }
 
-        return;
+        let OpType::TcpAccept { fd } = op.op_type else {
+            unreachable!()
+        };
+
+        let fd = fd.try_into().unwrap();
+
+        let sqe = get_sqe(ex);
+        unsafe { io_uring_prep_close_direct(sqe, fd) };
+        unsafe { io_uring_sqe_set_data64(sqe, 0) };
+        unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+
+        // unsafe { submit_ring(ring) };
+
+        unsafe { ex.reclaim_fd(fd) };
+        return true;
     }
 
     op.done = true;
@@ -1161,6 +1164,8 @@ fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_urin
     if let Some(local_waker) = op.local_waker.take() {
         local_waker.wake();
     }
+
+    false
 }
 
 fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor)
@@ -1414,6 +1419,10 @@ impl Drop for IoContext
         buf_groups.clear();
 
         unsafe { io_uring_queue_exit(self.ring()) };
+
+        if !self.p.io_ops.borrow().is_empty() {
+            eprintln!("IO operation leak detected");
+        }
     }
 }
 

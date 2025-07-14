@@ -6,26 +6,10 @@
 
 extern crate liburing_rs;
 
-use std::{
-    alloc::Layout,
-    future::Future,
-    mem,
-    net::{Ipv4Addr, SocketAddrV4},
-    os::fd::AsRawFd,
-    ptr::{self, NonNull},
-    task::Poll,
-    time::{Duration, Instant},
+use crate::{
+    BorrowedBufs, Executor, IoUringOp, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
+    make_io_uring_op, release_impl, release_obj, reserve_sqes, submit_ring,
 };
-
-use nix::{
-    errno::Errno,
-    libc::{AF_INET, AF_INET6, ENFILE, IPPROTO_TCP, MSG_WAITALL, SOCK_STREAM},
-    sys::socket::{
-        AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrStorage,
-        bind, getsockname, listen, setsockopt, socket, sockopt::ReuseAddr,
-    },
-};
-
 use liburing_rs::{
     __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
     IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT,
@@ -37,10 +21,24 @@ use liburing_rs::{
     io_uring_prep_timeout_update, io_uring_register_files_update, io_uring_sqe_set_buf_group,
     io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
-
-use crate::{
-    BorrowedBufs, Executor, IoUringOp, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
-    make_io_uring_op, release_impl, release_obj, reserve_sqes, submit_ring,
+use nix::{
+    errno::Errno,
+    libc::{AF_INET, AF_INET6, ENFILE, IPPROTO_TCP, MSG_WAITALL, SOCK_STREAM},
+    sys::socket::{
+        AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrStorage,
+        bind, getsockname, listen, setsockopt, socket, sockopt::ReuseAddr,
+    },
+};
+use slotmap::{DefaultKey, Key, KeyData};
+use std::{
+    alloc::Layout,
+    future::Future,
+    mem,
+    net::{Ipv4Addr, SocketAddrV4},
+    os::fd::AsRawFd,
+    ptr::{self, NonNull},
+    task::Poll,
+    time::{Duration, Instant},
 };
 
 struct AcceptorImpl
@@ -92,7 +90,7 @@ pub struct AcceptFuture<'a>
 {
     acceptor: &'a Acceptor,
     completed: bool,
-    op: Option<Box<IoUringOp>>,
+    op: Option<u64>,
 }
 
 pub struct ConnectFuture<'a>
@@ -205,10 +203,15 @@ impl Acceptor
 
         let ref_count = &raw mut acceptor_impl.ref_count;
 
+        let key = acceptor_impl.ex
+                               .p
+                               .io_ops
+                               .borrow_mut()
+                               .insert(make_io_uring_op(ref_count, OpType::TcpAccept { fd: -1 }));
+
         AcceptFuture { acceptor: self,
                        completed: false,
-                       op: Some(Box::new(make_io_uring_op(ref_count,
-                                                          OpType::TcpAccept { fd: -1 }))) }
+                       op: Some(key.data().as_ffi()) }
     }
 }
 
@@ -250,8 +253,11 @@ impl Future for AcceptFuture<'_>
         assert!(!self.completed);
 
         let acceptor_impl = unsafe { &mut *self.acceptor.p.as_ptr() };
+        let key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let io_ops = &mut *acceptor_impl.ex.p.io_ops.borrow_mut();
+        let op = io_ops.get_mut(key).unwrap();
 
-        let mut op = self.op.take().unwrap();
         match (op.initiated, op.done) {
             (true, true) => {
                 self.completed = true;
@@ -260,20 +266,16 @@ impl Future for AcceptFuture<'_>
 
                 if res < 0 {
                     let res = -res;
-                    self.op = Some(op);
                     Poll::Ready(Err(Errno::from_raw(res)))
                 } else {
                     let OpType::TcpAccept { fd } = op.op_type else {
                         unreachable!()
                     };
-
-                    self.op = Some(op);
                     Poll::Ready(Ok(Stream::new(acceptor_impl.ex.clone(), fd)))
                 }
             }
             (true, false) => {
                 op.local_waker = Some(cx.local_waker().clone());
-                self.op = Some(op);
                 Poll::Pending
             }
             (false, true) => unreachable!(),
@@ -283,7 +285,6 @@ impl Future for AcceptFuture<'_>
                 let mfile_index = unsafe { acceptor_impl.ex.get_available_fd() };
                 let Some(file_index) = mfile_index else {
                     self.completed = true;
-                    self.op = Some(op);
                     return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                 };
 
@@ -305,13 +306,12 @@ impl Future for AcceptFuture<'_>
                                                 0,
                                                 file_index);
                 }
-                unsafe { io_uring_sqe_set_data(sqe, Box::as_mut_ptr(&mut op).cast()) };
+                unsafe { io_uring_sqe_set_data64(sqe, key_data) };
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) };
 
                 unsafe { add_op_ref(&raw mut acceptor_impl.ref_count) };
                 op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
-                self.op = Some(op);
                 Poll::Pending
             }
         }
@@ -325,7 +325,10 @@ impl Drop for AcceptFuture<'_>
         let acceptor_impl = unsafe { &mut *self.acceptor.p.as_ptr() };
         acceptor_impl.accept_pending = false;
 
-        let op = self.op.as_mut().unwrap();
+        let key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let io_ops = &mut *acceptor_impl.ex.p.io_ops.borrow_mut();
+        let op = io_ops.get_mut(key).unwrap();
 
         if op.initiated && !op.done {
             // We haven't seen the CQE yet, this means we can't reason about how long
@@ -335,7 +338,6 @@ impl Drop for AcceptFuture<'_>
             let ring = acceptor_impl.ex.ring();
             let sqe = crate::get_sqe(&acceptor_impl.ex);
 
-            let user_data = Box::as_mut_ptr(op) as usize as u64;
             unsafe {
                 io_uring_prep_cancel_fd(sqe,
                                         acceptor_impl.fd,
@@ -349,7 +351,7 @@ impl Drop for AcceptFuture<'_>
 
             op.eager_dropped = true;
             op.local_waker = None;
-            Box::leak(self.op.take().unwrap());
+            self.op = None;
             return;
         }
 
@@ -376,6 +378,8 @@ impl Drop for AcceptFuture<'_>
             // unsafe { submit_ring(ring) };
             unsafe { acceptor_impl.ex.reclaim_fd(fd) };
         }
+
+        io_ops.remove(key).unwrap();
     }
 }
 
