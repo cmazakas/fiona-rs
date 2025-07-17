@@ -14,12 +14,12 @@ use liburing_rs::{
     __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
     IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT,
     IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring_get_sqe,
-    io_uring_prep_accept_direct, io_uring_prep_cancel, io_uring_prep_cancel_fd,
-    io_uring_prep_cancel64, io_uring_prep_close_direct, io_uring_prep_connect,
-    io_uring_prep_link_timeout, io_uring_prep_recv_multishot, io_uring_prep_send_zc,
-    io_uring_prep_socket_direct, io_uring_prep_timeout, io_uring_prep_timeout_remove,
-    io_uring_prep_timeout_update, io_uring_register_files_update, io_uring_sqe_set_buf_group,
-    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    io_uring_prep_accept_direct, io_uring_prep_cancel_fd, io_uring_prep_cancel64,
+    io_uring_prep_close_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
+    io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_socket_direct,
+    io_uring_prep_timeout, io_uring_prep_timeout_remove, io_uring_prep_timeout_update,
+    io_uring_register_files_update, io_uring_sqe_set_buf_group, io_uring_sqe_set_data,
+    io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
 use nix::{
     errno::Errno,
@@ -97,7 +97,7 @@ pub struct ConnectFuture<'a>
 {
     client: &'a Client,
     completed: bool,
-    op: Option<Box<IoUringOp>>,
+    op: Option<u64>,
 }
 
 pub struct SendFuture<'a>
@@ -603,21 +603,19 @@ impl Client
         let ref_count = &raw mut client_impl.stream.ref_count;
         let addr = SocketAddrV4::new(addr, port);
 
-        ConnectFuture {
-            client: self,
-            completed: false,
-            op: Some(Box::new(make_io_uring_op(
-                ref_count,
-                OpType::TcpConnect {
-                    addr: SockaddrStorage::from(addr),
-                    port,
-                    ts: client_impl.stream.ts,
-                    needs_socket: false,
-                    got_socket: false,
-                    fd: -1,
-                },
-            ))),
-        }
+        let op = make_io_uring_op(ref_count,
+                                  OpType::TcpConnect { addr: SockaddrStorage::from(addr),
+                                                       port,
+                                                       ts: client_impl.stream.ts,
+                                                       needs_socket: false,
+                                                       got_socket: false,
+                                                       fd: -1 });
+
+        let key = client_impl.stream.ex.p.io_ops.borrow_mut().insert(op);
+
+        ConnectFuture { client: self,
+                        completed: false,
+                        op: Some(key.data().as_ffi()) }
     }
 
     #[must_use]
@@ -770,19 +768,21 @@ impl Future for ConnectFuture<'_>
 
         let client_impl = unsafe { &mut *self.client.p.as_ptr() };
 
-        let mut op = self.op.take().unwrap();
+        let key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let io_ops = &mut *client_impl.stream.ex.p.io_ops.borrow_mut();
+        let op = io_ops.get_mut(key).unwrap();
 
         match (op.initiated, op.done) {
             (false, true) => panic!(),
             (true, false) => {
                 op.local_waker = Some(cx.local_waker().clone());
-                self.op = Some(op);
                 Poll::Pending
             }
             (false, false) => {
                 let ring = client_impl.stream.ex.ring();
 
-                let user_data = Box::as_mut_ptr(&mut op);
+                let user_data = key_data;
 
                 let OpType::TcpConnect { ref addr,
                                          port,
@@ -813,7 +813,6 @@ impl Future for ConnectFuture<'_>
                 if *needs_socket {
                     let mfile_index = unsafe { client_impl.stream.ex.get_available_fd() };
                     let Some(file_idx) = mfile_index else {
-                        self.op = Some(op);
                         return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                     };
 
@@ -836,7 +835,7 @@ impl Future for ConnectFuture<'_>
                                                     file_index,
                                                     0);
                     }
-                    unsafe { io_uring_sqe_set_data(sqe, user_data.cast()) };
+                    unsafe { io_uring_sqe_set_data64(sqe, user_data) };
                     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK) }
                 }
 
@@ -848,7 +847,7 @@ impl Future for ConnectFuture<'_>
                                               std::ptr::from_ref(addr).cast(),
                                               addrlen.try_into().unwrap());
                     }
-                    unsafe { io_uring_sqe_set_data(sqe, user_data.cast()) };
+                    unsafe { io_uring_sqe_set_data64(sqe, user_data) };
                     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK | IOSQE_FIXED_FILE) };
                 }
 
@@ -863,7 +862,6 @@ impl Future for ConnectFuture<'_>
 
                 op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
-                self.op = Some(op);
                 Poll::Pending
             }
             (true, true) => {
@@ -879,7 +877,6 @@ impl Future for ConnectFuture<'_>
 
                 if needs_socket && got_socket {
                     if client_impl.stream.fd >= 0 {
-                        self.op = Some(op);
                         todo!();
                     }
 
@@ -887,7 +884,6 @@ impl Future for ConnectFuture<'_>
                 }
 
                 let res = op.res;
-                self.op = Some(op);
                 if res < 0 {
                     Poll::Ready(Err(Errno::from_raw(-res)))
                 } else {
@@ -905,21 +901,26 @@ impl Drop for ConnectFuture<'_>
         let client_impl = unsafe { &mut *self.client.p.as_ptr() };
         client_impl.connect_pending = false;
 
-        let op = self.op.as_mut().unwrap();
+        let key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let io_ops = &mut *client_impl.stream.ex.p.io_ops.borrow_mut();
+        let op = io_ops.get_mut(key).unwrap();
+
         if op.initiated && !op.done {
-            let mut op = self.op.take().unwrap();
             op.eager_dropped = true;
 
-            let user_data = Box::as_mut_ptr(&mut op);
+            let user_data = key_data;
 
             let ring = client_impl.stream.ex.ring();
             let sqe = crate::get_sqe(&client_impl.stream.ex);
 
-            unsafe { io_uring_prep_cancel(sqe, user_data.cast(), IORING_ASYNC_CANCEL_ALL as i32) };
+            unsafe { io_uring_prep_cancel64(sqe, user_data, IORING_ASYNC_CANCEL_ALL as i32) };
             unsafe { io_uring_sqe_set_data64(sqe, 0) };
             unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
 
-            Box::leak(op);
+            self.op = None;
+        } else {
+            io_ops.remove(key).unwrap();
         }
     }
 }

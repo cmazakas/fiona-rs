@@ -1087,13 +1087,17 @@ impl IoContext
                                 io_ops.remove(key).unwrap();
                             }
                         }
+                        OpType::TcpConnect { .. } => {
+                            if on_tcp_connect(op, cqe, ring, &ex) {
+                                io_ops.remove(key).unwrap();
+                            }
+                        }
                         _ => unreachable!(),
                     }
                 } else {
                     let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
                     match op.op_type {
                         OpType::TimeoutCancel => todo!(),
-                        OpType::TcpConnect { .. } => on_tcp_connect(op, cqe, ring, &ex),
                         OpType::TcpSend { .. } => on_tcp_send(op, cqe, ring, &ex),
                         OpType::MultishotTcpRecv { .. } => {
                             on_multishot_tcp_recv(op, cqe, ring, &ex);
@@ -1169,6 +1173,7 @@ fn on_tcp_accept(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_urin
 }
 
 fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor)
+                  -> bool
 {
     let _ = ex;
 
@@ -1192,7 +1197,7 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
         }
 
         if !is_last_cqe {
-            return;
+            return false;
         }
 
         // if our connect() op is borrowing an FD from the runtime,
@@ -1211,9 +1216,7 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
         }
 
         unsafe { release_op(op.ref_count) };
-        drop(unsafe { Box::from_raw(op) });
-
-        return;
+        return true;
     }
 
     let OpType::TcpConnect { ref mut needs_socket,
@@ -1234,7 +1237,7 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
         if let Some(local_waker) = op.local_waker.take() {
             local_waker.wake();
         }
-        return;
+        return false;
     }
 
     // we expect one more CQE after this, the result of the actual
@@ -1242,6 +1245,8 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
     if *needs_socket {
         *got_socket = true;
     }
+
+    false
 }
 
 fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor)
