@@ -1092,13 +1092,17 @@ impl IoContext
                                 io_ops.remove(key).unwrap();
                             }
                         }
+                        OpType::TcpSend { .. } => {
+                            if on_tcp_send(op, cqe, ring, &ex) {
+                                io_ops.remove(key).unwrap();
+                            }
+                        }
                         _ => unreachable!(),
                     }
                 } else {
                     let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
                     match op.op_type {
                         OpType::TimeoutCancel => todo!(),
-                        OpType::TcpSend { .. } => on_tcp_send(op, cqe, ring, &ex),
                         OpType::MultishotTcpRecv { .. } => {
                             on_multishot_tcp_recv(op, cqe, ring, &ex);
                         }
@@ -1250,17 +1254,19 @@ fn on_tcp_connect(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uri
 }
 
 fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor)
+               -> bool
 {
     let _ = ex;
 
     let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
 
     if op.eager_dropped {
-        if !has_more_cqes {
-            unsafe { release_op(op.ref_count) };
-            drop(unsafe { Box::from_raw(op) });
+        if has_more_cqes {
+            return false;
         }
-        return;
+
+        unsafe { release_op(op.ref_count) };
+        return true;
     }
 
     let OpType::TcpSend { ref mut buf,
@@ -1277,7 +1283,7 @@ fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
             let n: usize = cqe.res.try_into().unwrap();
             buf.drain(0..n);
         }
-        return;
+        return false;
     }
     assert!(cqe.flags & IORING_CQE_F_NOTIF > 0);
     op.done = true;
@@ -1287,6 +1293,8 @@ fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
     if let Some(local_waker) = op.local_waker.take() {
         local_waker.wake();
     }
+
+    false
 }
 
 fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,

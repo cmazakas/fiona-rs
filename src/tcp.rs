@@ -104,7 +104,7 @@ pub struct SendFuture<'a>
 {
     stream: &'a Stream,
     completed: bool,
-    op: Option<Box<IoUringOp>>,
+    op: Option<u64>,
 }
 
 pub struct RecvFuture<'a>
@@ -493,10 +493,16 @@ impl Stream
         let last_send = &raw mut stream_impl.last_send;
         let ref_count = &raw mut stream_impl.ref_count;
 
+        let key =
+            stream_impl.ex
+                       .p
+                       .io_ops
+                       .borrow_mut()
+                       .insert(make_io_uring_op(ref_count, OpType::TcpSend { buf, last_send }));
+
         SendFuture { stream: self,
                      completed: false,
-                     op: Some(Box::new(make_io_uring_op(ref_count,
-                                                        OpType::TcpSend { buf, last_send }))) }
+                     op: Some(key.data().as_ffi()) }
     }
 
     #[must_use]
@@ -932,15 +938,17 @@ impl Drop for SendFuture<'_>
     fn drop(&mut self)
     {
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
-
         stream_impl.send_pending = false;
 
-        let op = self.op.as_mut().unwrap();
+        let key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let op = io_ops.get_mut(key).unwrap();
+
         if op.initiated && !op.done {
             let ring = stream_impl.ex.ring();
             let sqe = crate::get_sqe(&stream_impl.ex);
 
-            let user_data = Box::as_mut_ptr(op) as usize as u64;
             unsafe {
                 io_uring_prep_cancel_fd(sqe,
                                         stream_impl.fd,
@@ -954,7 +962,9 @@ impl Drop for SendFuture<'_>
 
             op.eager_dropped = true;
             op.local_waker = None;
-            Box::leak(self.op.take().unwrap());
+            self.op = None;
+        } else {
+            io_ops.remove(key).unwrap();
         }
     }
 }
@@ -970,14 +980,17 @@ impl Future for SendFuture<'_>
 
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
 
-        let mut op = self.op.take().unwrap();
-        let user_data = Box::as_mut_ptr(&mut op);
+        let key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let op = io_ops.get_mut(key).unwrap();
+
+        let user_data = key_data;
 
         match (op.initiated, op.done) {
             (false, true) => panic!(),
             (true, false) => {
                 op.local_waker = Some(cx.local_waker().clone());
-                self.op = Some(op);
                 Poll::Pending
             }
             (false, false) => {
@@ -988,7 +1001,7 @@ impl Future for SendFuture<'_>
                 let ring = stream_impl.ex.ring();
 
                 {
-                    let sqe = crate::get_sqe(&stream_impl.ex);
+                    let sqe = get_sqe(&stream_impl.ex);
                     unsafe {
                         io_uring_prep_send_zc(sqe,
                                               stream_impl.fd,
@@ -998,7 +1011,7 @@ impl Future for SendFuture<'_>
                                               0);
                     }
 
-                    unsafe { io_uring_sqe_set_data(sqe, user_data.cast()) };
+                    unsafe { io_uring_sqe_set_data64(sqe, user_data) };
                     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) }
                 }
 
@@ -1006,7 +1019,6 @@ impl Future for SendFuture<'_>
 
                 op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
-                self.op = Some(op);
                 Poll::Pending
             }
             (true, true) => {
@@ -1018,11 +1030,9 @@ impl Future for SendFuture<'_>
 
                 let res = op.res;
                 if res < 0 {
-                    self.op = Some(op);
                     Poll::Ready(Err(Errno::from_raw(-res)))
                 } else {
                     let b = std::mem::take(buf);
-                    self.op = Some(op);
                     Poll::Ready(Ok(b))
                 }
             }
