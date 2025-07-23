@@ -947,7 +947,7 @@ impl IoContext
                              buf_groups: RefCell::new(HashMap::new()),
                              runguard_blacklist: RefCell::new(HashSet::new()),
                              local_task_queue: RefCell::new(VecDeque::new()),
-                             io_ops: RefCell::new(SlotMap::with_capacity(512 * 1024)) };
+                             io_ops: RefCell::new(SlotMap::with_capacity(512 * 512)) };
 
         let p = Rc::new(ioc_frame);
 
@@ -1075,42 +1075,39 @@ impl IoContext
                 let key = DefaultKey::from(KeyData::from_ffi(key_data));
 
                 let io_ops = &mut *self.p.io_ops.borrow_mut();
-                if let Some(op) = io_ops.get_mut(key) {
-                    match op.op_type {
-                        OpType::Timeout { .. } => {
-                            if on_timeout(op, cqe, ring, &ex) {
-                                io_ops.remove(key).unwrap();
-                            }
+                let op = io_ops.get_mut(key).unwrap();
+                match op.op_type {
+                    OpType::Timeout { .. } => {
+                        if on_timeout(op, cqe, ring, &ex) {
+                            io_ops.remove(key).unwrap();
                         }
-                        OpType::TcpAccept { .. } => {
-                            if on_tcp_accept(op, cqe, ring, &ex) {
-                                io_ops.remove(key).unwrap();
-                            }
-                        }
-                        OpType::TcpConnect { .. } => {
-                            if on_tcp_connect(op, cqe, ring, &ex) {
-                                io_ops.remove(key).unwrap();
-                            }
-                        }
-                        OpType::TcpSend { .. } => {
-                            if on_tcp_send(op, cqe, ring, &ex) {
-                                io_ops.remove(key).unwrap();
-                            }
-                        }
-                        _ => unreachable!(),
                     }
-                } else {
-                    let op = unsafe { &mut *(cqe.user_data as *mut IoUringOp) };
-                    match op.op_type {
-                        OpType::TimeoutCancel => todo!(),
-                        OpType::MultishotTcpRecv { .. } => {
-                            on_multishot_tcp_recv(op, cqe, ring, &ex);
+                    OpType::TcpAccept { .. } => {
+                        if on_tcp_accept(op, cqe, ring, &ex) {
+                            io_ops.remove(key).unwrap();
                         }
-                        OpType::MultishotTimeout { .. } => {
-                            on_multishot_timeout(op, cqe, ring, &ex);
-                        }
-                        _ => unreachable!(),
                     }
+                    OpType::TcpConnect { .. } => {
+                        if on_tcp_connect(op, cqe, ring, &ex) {
+                            io_ops.remove(key).unwrap();
+                        }
+                    }
+                    OpType::TcpSend { .. } => {
+                        if on_tcp_send(op, cqe, ring, &ex) {
+                            io_ops.remove(key).unwrap();
+                        }
+                    }
+                    OpType::MultishotTcpRecv { .. } => {
+                        if on_multishot_tcp_recv(op, cqe, ring, &ex) {
+                            io_ops.remove(key).unwrap();
+                        }
+                    }
+                    OpType::MultishotTimeout { .. } => {
+                        if on_multishot_timeout(op, cqe, ring, &ex) {
+                            io_ops.remove(key).unwrap();
+                        }
+                    }
+                    OpType::TimeoutCancel => todo!(),
                 }
             };
 
@@ -1299,6 +1296,7 @@ fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
 
 fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
                          ex: &Executor)
+                         -> bool
 {
     let _ = ex;
 
@@ -1316,14 +1314,12 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
         }
 
         if has_more_cqes {
-            return;
+            return false;
         }
 
         op.done = true;
         unsafe { release_op(op.ref_count) };
-
-        drop(unsafe { Box::from_raw(op) });
-        return;
+        return true;
     }
 
     if !has_more_cqes {
@@ -1358,22 +1354,22 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
     if let Some(local_waker) = op.local_waker.take() {
         local_waker.wake();
     }
+
+    false
 }
 
 fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
                         ex: &Executor)
+                        -> bool
 {
     let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
-
     let io_object_dropped = op.eager_dropped;
     if io_object_dropped {
         if has_more_cqes {
-            return;
+            return false;
         }
-
         unsafe { release_op(op.ref_count) };
-        drop(unsafe { Box::from_raw(op) });
-        return;
+        return true;
     }
 
     if !has_more_cqes {
@@ -1392,7 +1388,8 @@ fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut 
     }
 
     if cqe.res != -ETIME {
-        return;
+        assert!(!has_more_cqes);
+        return false;
     }
 
     let OpType::MultishotTimeout { ref mut ts, stream } = op.op_type else {
@@ -1417,6 +1414,8 @@ fn on_multishot_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut 
         unsafe { io_uring_sqe_set_data64(sqe, 0) };
         unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
     }
+
+    false
 }
 
 impl Drop for IoContext
