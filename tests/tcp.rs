@@ -113,30 +113,37 @@ fn tcp_multiple_accepts()
     let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
     assert!(acceptor.port() != 0);
 
-    let port = acceptor.port();
+    async fn async_main(acceptor: fiona::tcp::Acceptor, ex: fiona::Executor)
+    {
+        let port = acceptor.port();
 
-    ex.clone().spawn(async move {
-                  for _ in 0..2 {
-                      for _ in 0..NUM_CLIENTS {
-                          let client = fiona::tcp::Client::new(ex.clone());
-                          ex.spawn(async move {
-                                client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                                      .await
-                                      .unwrap();
+        for _ in 0..2 {
+            for _ in 0..NUM_CLIENTS {
+                let client = fiona::tcp::Client::new(ex.clone());
+                ex.spawn(async move {
+                      client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                            .await
+                            .unwrap();
 
-                                unsafe { NUM_RUNS += 1 };
-                            });
-                      }
+                      unsafe { NUM_RUNS += 1 };
+                  });
+            }
 
-                      let mut streams = Vec::new();
-                      for _ in 0..NUM_CLIENTS {
-                          let stream = acceptor.accept().await.unwrap();
-                          streams.push(stream);
-                      }
-                      assert_eq!(streams.len(), NUM_CLIENTS.try_into().unwrap());
-                  }
-                  unsafe { NUM_RUNS += 1 };
-              });
+            let mut streams = Vec::new();
+            for _ in 0..NUM_CLIENTS {
+                let stream = acceptor.accept().await.unwrap();
+                streams.push(stream);
+            }
+            assert_eq!(streams.len(), NUM_CLIENTS.try_into().unwrap());
+        }
+
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(100)).await.unwrap();
+
+        unsafe { NUM_RUNS += 1 };
+    }
+
+    ex.spawn(async_main(acceptor, ex.clone()));
 
     let n = ioc.run();
     assert_eq!(n, 2 * NUM_CLIENTS + 1);
