@@ -382,52 +382,64 @@ fn tcp_send_recv_hello_world()
                             0
                         };
 
-    ex.clone().spawn(async move {
-                  let stream = acceptor.accept().await.unwrap();
-                  stream.set_buf_group(bgid);
+    async fn server(acceptor: fiona::tcp::Acceptor, bgid: u16, message: &'static str,
+                    expected_bufs: usize)
+    {
+        let stream = acceptor.accept().await.unwrap();
+        stream.set_buf_group(bgid);
 
-                  let bufs = stream.recv().await.unwrap();
+        let bufs = stream.recv().await.unwrap();
 
-                  assert_eq!(bufs.len(), expected_bufs);
+        let mut s = String::new();
+        let mut count = 0;
+        for buf in bufs.iter() {
+            s.push_str(str::from_utf8(buf).unwrap());
+            count += 1;
+        }
 
-                  let mut s = String::new();
-                  for buf in bufs.iter() {
-                      s.push_str(str::from_utf8(buf).unwrap());
-                  }
+        assert_eq!(count, expected_bufs);
+        assert_eq!(s, message);
 
-                  assert_eq!(s, message);
+        let msg = String::from(message).into_bytes();
+        let _msg = stream.send(msg).await.unwrap();
 
-                  let msg = String::from(message).into_bytes();
-                  let _msg = stream.send(msg).await.unwrap();
+        unsafe { NUM_RUNS += 1 };
+    }
 
-                  unsafe { NUM_RUNS += 1 };
-              });
+    async fn client(ex: fiona::Executor, port: u16, message: &'static str, bgid: u16,
+                    expected_bufs: usize)
+    {
+        let client = fiona::tcp::Client::new(ex);
 
-    ex.clone().spawn(async move {
-                  let client = fiona::tcp::Client::new(ex);
+        client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+              .await
+              .unwrap();
 
-                  client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                        .await
-                        .unwrap();
+        let msg = String::from(message).into_bytes();
+        let _msg = client.send(msg).await.unwrap();
 
-                  let msg = String::from(message).into_bytes();
-                  let _msg = client.send(msg).await.unwrap();
+        client.set_buf_group(bgid);
 
-                  client.set_buf_group(bgid);
+        let bufs = client.recv().await.unwrap();
 
-                  let bufs = client.recv().await.unwrap();
+        let mut count = 0;
+        let mut s = String::new();
+        for buf in bufs.iter() {
+            s.push_str(str::from_utf8(buf).unwrap());
+            count += 1;
+        }
 
-                  assert_eq!(bufs.len(), expected_bufs);
+        assert_eq!(count, expected_bufs);
+        assert_eq!(s, message);
 
-                  let mut s = String::new();
-                  for buf in bufs.iter() {
-                      s.push_str(str::from_utf8(buf).unwrap());
-                  }
+        unsafe { NUM_RUNS += 1 };
+    }
 
-                  assert_eq!(s, message);
+    ex.clone()
+      .spawn(server(acceptor, bgid, message, expected_bufs));
 
-                  unsafe { NUM_RUNS += 1 };
-              });
+    ex.clone()
+      .spawn(client(ex, port, message, bgid, expected_bufs));
 
     let n = ioc.run();
     assert_eq!(n, 2);

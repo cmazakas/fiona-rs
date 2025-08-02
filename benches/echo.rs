@@ -47,9 +47,10 @@ fn fiona_echo() -> Result<(), String>
 
                                     for _ in 0..NUM_MSGS {
                                         let bufs = stream.recv().await.unwrap();
-                                        assert_eq!(&bufs[0], "hello, world!".as_bytes());
+                                        let buf = bufs.iter().next().unwrap();
+                                        assert_eq!(buf, "hello, world!".as_bytes());
 
-                                        message.extend_from_slice(&bufs[0]);
+                                        message.extend_from_slice(buf);
                                         message = stream.send(message).await.unwrap();
                                         assert!(message.is_empty());
                                     }
@@ -81,7 +82,8 @@ fn fiona_echo() -> Result<(), String>
                               assert!(message.is_empty());
 
                               let bufs = client.recv().await.unwrap();
-                              assert_eq!(&bufs[0], "hello, world!".as_bytes());
+                              let buf = bufs.iter().next().unwrap();
+                              assert_eq!(buf, "hello, world!".as_bytes());
                           }
 
                           NUM_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

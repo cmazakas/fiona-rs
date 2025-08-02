@@ -26,7 +26,7 @@ use std::{
     hash::Hash,
     marker::PhantomData,
     mem::ManuallyDrop,
-    ops::{Deref, Index},
+    ops::Deref,
     os::fd::AsRawFd,
     pin::Pin,
     ptr::{self, DynMetadata, NonNull, metadata},
@@ -383,6 +383,14 @@ fn make_local_waker(weak: Weak) -> LocalWaker
 
 //-----------------------------------------------------------------------------
 
+#[derive(Copy, Clone)]
+struct BufHeader
+{
+    next: isize,
+    prev: isize,
+    len: usize,
+}
+
 struct BufGroup
 {
     br: *mut io_uring_buf_ring,
@@ -390,6 +398,7 @@ struct BufGroup
     buf_len: usize,
     bgid: u16,
     bufs: Vec<u8>,
+    buf_headers: Vec<BufHeader>,
     bid_map: Vec<u16>,
     ring: *mut io_uring,
     tail: u32,
@@ -415,93 +424,18 @@ impl BufGroup
 
 //-----------------------------------------------------------------------------
 
-const SBO_NUM_BUFS: u32 = 16;
-
-#[derive(Copy, Clone, Debug)]
-struct BorrowedBuf
-{
-    bid: u16,
-    len: usize,
-}
-
-enum BufSequenceIds
-{
-    Inline
-    {
-        bufs: [BorrowedBuf; SBO_NUM_BUFS as usize],
-        num_bufs: u32,
-    },
-    Allocated
-    {
-        bufs: Vec<BorrowedBuf>,
-        num_bufs: u32,
-    },
-}
-
-impl BufSequenceIds
-{
-    fn new() -> BufSequenceIds
-    {
-        BufSequenceIds::Inline { bufs: [BorrowedBuf { bid: 0, len: 0 }; SBO_NUM_BUFS as usize],
-                                 num_bufs: 0 }
-    }
-
-    fn push(&mut self, borrowed_buf: BorrowedBuf)
-    {
-        match self {
-            BufSequenceIds::Inline { bufs: buf_ids,
-                                     num_bufs, } => {
-                let max = SBO_NUM_BUFS;
-                if *num_bufs == max {
-                    let mut bids = Vec::new();
-                    for bid in buf_ids {
-                        bids.push(*bid);
-                    }
-                    bids.push(borrowed_buf);
-                    *self = BufSequenceIds::Allocated { bufs: bids,
-                                                        num_bufs: max + 1 };
-                    return;
-                }
-                buf_ids[*num_bufs as usize] = borrowed_buf;
-                *num_bufs += 1;
-            }
-            BufSequenceIds::Allocated { bufs: buf_ids,
-                                        num_bufs, } => {
-                buf_ids.push(borrowed_buf);
-                *num_bufs += 1;
-            }
-        }
-    }
-
-    fn num_bufs(&self) -> u32
-    {
-        match self {
-            BufSequenceIds::Inline { num_bufs, .. }
-            | BufSequenceIds::Allocated { num_bufs, .. } => *num_bufs,
-        }
-    }
-
-    fn as_slice(&self) -> &[BorrowedBuf]
-    {
-        let slice = match self {
-            BufSequenceIds::Inline { bufs: buf_ids, .. } => buf_ids,
-            BufSequenceIds::Allocated { bufs: buf_ids, .. } => buf_ids.as_slice(),
-        };
-        &slice[0..self.num_bufs() as usize]
-    }
-}
-
 pub struct BorrowedBufs
 {
     buf_group: *mut BufGroup,
-    buf_ids: BufSequenceIds,
+    head: isize,
+    tail: isize,
     ex: Executor,
 }
 
 pub struct BorrowedBufsIterator<'a>
 {
     bufs: &'a BorrowedBufs,
-    idx: usize,
+    buf_id: isize,
 }
 
 impl BorrowedBufs
@@ -509,20 +443,15 @@ impl BorrowedBufs
     fn new(ex: Executor, buf_group: *mut BufGroup) -> BorrowedBufs
     {
         BorrowedBufs { buf_group,
-                       buf_ids: BufSequenceIds::new(),
-                       ex }
+                       ex,
+                       head: -1,
+                       tail: -1 }
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool
     {
-        self.buf_ids.num_bufs() == 0
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize
-    {
-        self.buf_ids.num_bufs() as usize
+        self.head == -1
     }
 
     #[must_use]
@@ -538,18 +467,31 @@ impl Drop for BorrowedBufs
     {
         let buf_group = unsafe { &mut *self.buf_group };
         let br = buf_group.br;
-        let mut count = 0;
         let mask = io_uring_buf_ring_mask(buf_group.num_bufs);
 
-        for bid in self.buf_ids.as_slice() {
-            let addr = buf_group.buf_as_ptr(bid.bid).cast();
+        let mut count = 0;
+
+        let mut buf_id = self.head;
+        while buf_id > 0 {
+            let addr = buf_group.buf_as_ptr(buf_id as u16).cast();
             let tail = &mut buf_group.tail;
             let len = buf_group.buf_len as _;
+
             unsafe { io_uring_buf_ring_add(br, addr, len, *tail as _, mask, count) };
-            buf_group.bid_map[*tail as usize] = bid.bid;
+            buf_group.bid_map[*tail as usize] = buf_id as _;
+
             *tail = (*tail + 1) & mask as u32;
             count += 1;
+
+            let header = &mut buf_group.buf_headers[buf_id as usize];
+            let next = header.next;
+            header.next = -1;
+            header.prev = -1;
+            header.len = 0;
+
+            buf_id = next;
         }
+
         unsafe { io_uring_buf_ring_advance(br, count) };
         let _ = self.ex; // suppress unused warnings
     }
@@ -567,19 +509,6 @@ impl Debug for BorrowedBufs
     }
 }
 
-impl Index<usize> for BorrowedBufs
-{
-    type Output = [u8];
-    fn index(&self, index: usize) -> &Self::Output
-    {
-        assert!(index < self.buf_ids.num_bufs() as usize);
-
-        let buf_id = self.buf_ids.as_slice()[index];
-        let p = unsafe { (*self.buf_group).buf_as_ptr(buf_id.bid) };
-        unsafe { slice::from_raw_parts(p, buf_id.len) }
-    }
-}
-
 impl<'a> IntoIterator for &'a BorrowedBufs
 {
     type Item = &'a [u8];
@@ -588,7 +517,8 @@ impl<'a> IntoIterator for &'a BorrowedBufs
 
     fn into_iter(self) -> Self::IntoIter
     {
-        BorrowedBufsIterator { bufs: self, idx: 0 }
+        BorrowedBufsIterator { bufs: self,
+                               buf_id: self.head }
     }
 }
 
@@ -598,14 +528,18 @@ impl<'a> Iterator for BorrowedBufsIterator<'a>
 
     fn next(&mut self) -> Option<Self::Item>
     {
-        if self.idx >= self.bufs.buf_ids.num_bufs() as usize {
+        if self.buf_id < 0 {
             return None;
         }
 
-        let buf_id = self.bufs.buf_ids.as_slice()[self.idx];
-        let p = unsafe { (*self.bufs.buf_group).buf_as_ptr(buf_id.bid) };
-        self.idx += 1;
-        unsafe { Some(slice::from_raw_parts(p, buf_id.len)) }
+        let buf_group = unsafe { &mut *self.bufs.buf_group };
+        let curr = self.buf_id as usize;
+        let len = buf_group.buf_headers[curr].len;
+        let next = buf_group.buf_headers[curr].next;
+        self.buf_id = next;
+
+        let p = unsafe { (*self.bufs.buf_group).buf_as_ptr(curr as u16) };
+        unsafe { Some(slice::from_raw_parts(p, len)) }
     }
 }
 
@@ -850,6 +784,7 @@ impl Drop for IncrGuard<'_>
 
 impl Drop for RunGuard
 {
+    #![allow(clippy::redundant_closure_call)]
     fn drop(&mut self)
     {
         {
@@ -1331,23 +1266,43 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
 
     op.res = cqe.res;
     if op.res > 0 {
-        let mut bid = cqe.flags >> IORING_CQE_BUFFER_SHIFT;
         let buf_group = unsafe { &mut *buf_group };
         let buf_len = buf_group.buf_len;
         let num_bufs = buf_group.num_bufs;
-        let mask = io_uring_buf_ring_mask(num_bufs) as u32;
         let bid_map = &buf_group.bid_map;
-        let mut num_bytes = usize::try_from(cqe.res).unwrap();
+        let buf_headers = &mut buf_group.buf_headers;
+
+        let mask = io_uring_buf_ring_mask(num_bufs) as u32;
+
+        let mut bid = cqe.flags >> IORING_CQE_BUFFER_SHIFT;
+        let mut num_bytes = cqe.res as usize;
+
         while num_bytes > 0 {
             let mut n = buf_len;
             if n > num_bytes {
                 n = num_bytes;
             }
+
             let bg_bid = bid_map[bid as usize];
-            bufs.buf_ids.push(BorrowedBuf { bid: bg_bid,
-                                            len: n });
+
+            if bufs.head < 0 {
+                bufs.head = bg_bid as _;
+            }
+
+            if bufs.tail >= 0 {
+                buf_headers[bufs.tail as usize].next = bg_bid as _;
+                buf_headers[bg_bid as usize].prev = bufs.tail;
+            }
+
+            buf_headers[bg_bid as usize].len = n;
             bid = (bid + 1) & mask;
             num_bytes -= n;
+            bufs.tail = bg_bid as _;
+
+            if num_bytes > 0 {
+                buf_headers[bg_bid as usize].next = bid_map[bid as usize] as isize;
+                buf_headers[bid_map[bid as usize] as usize].prev = bg_bid as isize;
+            }
         }
     }
 
@@ -1432,8 +1387,9 @@ impl Drop for IoContext
 
         unsafe { io_uring_queue_exit(self.ring()) };
 
-        if !self.p.io_ops.borrow().is_empty() {
-            eprintln!("IO operation leak detected");
+        let n = self.p.io_ops.borrow().len();
+        if n > 0 {
+            eprintln!("IO operation leak detected. {n} ops leaked.");
         }
     }
 }
@@ -1572,6 +1528,12 @@ impl Executor
 
         let mut bufs = vec![0; buf_len * num_bufs as usize];
         let mut bid_map = Vec::with_capacity(num_bufs as usize);
+        let buf_headers = vec![
+            BufHeader { next: -1,
+                        prev: -1,
+                        len: 0 };
+            num_bufs as usize
+        ];
 
         let mask = io_uring_buf_ring_mask(num_bufs);
         for bid in 0..num_bufs {
@@ -1595,6 +1557,7 @@ impl Executor
                             buf_len,
                             bgid,
                             bufs,
+                            buf_headers,
                             ring,
                             tail: 0,
                             bid_map };
