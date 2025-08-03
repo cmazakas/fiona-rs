@@ -207,7 +207,8 @@ impl Acceptor
                                .p
                                .io_ops
                                .borrow_mut()
-                               .insert(make_io_uring_op(ref_count, OpType::TcpAccept { fd: -1 }));
+                               .insert(make_io_uring_op(ref_count, OpType::TcpAccept { fd: -1 }),
+                                       &acceptor_impl.ex);
 
         AcceptFuture { acceptor: self,
                        completed: false,
@@ -449,7 +450,8 @@ impl Stream
         let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
         let key = io_ops.insert(make_io_uring_op(ref_count,
                                                  OpType::MultishotTimeout { ts: stream_impl.ts,
-                                                                            stream: p.as_ptr() }));
+                                                                            stream: p.as_ptr() }),
+                                &stream_impl.ex);
 
         let op = io_ops.get_mut(key).unwrap();
         let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
@@ -502,7 +504,8 @@ impl Stream
                        .p
                        .io_ops
                        .borrow_mut()
-                       .insert(make_io_uring_op(ref_count, OpType::TcpSend { buf, last_send }));
+                       .insert(make_io_uring_op(ref_count, OpType::TcpSend { buf, last_send }),
+                               &stream_impl.ex);
 
         SendFuture { stream: self,
                      completed: false,
@@ -590,7 +593,7 @@ impl Client
                                      OpType::MultishotTimeout { ts: stream_impl.ts,
                                                                 stream: &raw mut *stream_impl });
         let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
-        let key = io_ops.insert(io_op);
+        let key = io_ops.insert(io_op, &stream_impl.ex);
 
         let op = io_ops.get_mut(key).unwrap();
         let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
@@ -627,7 +630,12 @@ impl Client
                                                        got_socket: false,
                                                        fd: -1 });
 
-        let key = client_impl.stream.ex.p.io_ops.borrow_mut().insert(op);
+        let key = client_impl.stream
+                             .ex
+                             .p
+                             .io_ops
+                             .borrow_mut()
+                             .insert(op, &client_impl.stream.ex);
 
         ConnectFuture { client: self,
                         completed: false,
@@ -1117,7 +1125,7 @@ impl Future for RecvFuture<'_>
                                               OpType::MultishotTcpRecv { bufs:
                                                                              BorrowedBufs::new(ex.clone(), buf_group),
                                                                          buf_group,
-                                                                         last_recv }));
+                                                                         last_recv }), &stream_impl.ex);
 
                 let op = io_ops.get_mut(key).unwrap();
 

@@ -74,12 +74,11 @@ impl Timer
 
         let ref_count = &raw mut timer_impl.ref_count;
 
-        let key =
-            timer_impl.ex
-                      .p
-                      .io_ops
-                      .borrow_mut()
-                      .insert(make_io_uring_op(ref_count, OpType::Timeout { dur: dur.into() }));
+        let mut guard = timer_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *guard;
+
+        let key = io_ops.insert(make_io_uring_op(ref_count, OpType::Timeout { dur: dur.into() }),
+                                &timer_impl.ex);
 
         TimerFuture { timer: self,
                       completed: false,

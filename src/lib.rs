@@ -67,8 +67,10 @@ use liburing_rs::{
 pub mod tcp;
 pub mod time;
 
-use slotmap::{DefaultKey, KeyData, SlotMap};
+use slotmap::{DefaultKey, KeyData};
 use tcp::StreamImpl;
+
+use crate::io_ops::IoOpsMap;
 
 pub type Result<T> = std::result::Result<T, nix::Error>;
 
@@ -545,6 +547,56 @@ impl<'a> Iterator for BorrowedBufsIterator<'a>
 
 //-----------------------------------------------------------------------------
 
+mod io_ops
+{
+    use slotmap::{DefaultKey, SlotMap};
+
+    use crate::{Executor, IoUringOp, submit_ring};
+
+    pub struct IoOpsMap
+    {
+        slots: SlotMap<DefaultKey, IoUringOp>,
+    }
+
+    impl IoOpsMap
+    {
+        pub fn with_capacity(capacity: usize) -> IoOpsMap
+        {
+            IoOpsMap { slots: SlotMap::with_capacity(capacity) }
+        }
+
+        pub fn len(&self) -> usize
+        {
+            self.slots.len()
+        }
+
+        pub fn get(&self, key: DefaultKey) -> Option<&IoUringOp>
+        {
+            self.slots.get(key)
+        }
+
+        pub fn get_mut(&mut self, key: DefaultKey) -> Option<&mut IoUringOp>
+        {
+            self.slots.get_mut(key)
+        }
+
+        pub fn remove(&mut self, key: DefaultKey) -> Option<IoUringOp>
+        {
+            self.slots.remove(key)
+        }
+
+        pub fn insert(&mut self, value: IoUringOp, ex: &Executor) -> DefaultKey
+        {
+            if self.slots.len() == self.slots.capacity() {
+                unsafe { submit_ring(ex.ring()) };
+            }
+            self.slots.insert(value)
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+
 struct IoContextFrame
 {
     ioring: RefCell<io_uring>,
@@ -557,7 +609,7 @@ struct IoContextFrame
     buf_groups: RefCell<HashMap<u16, Box<UnsafeCell<BufGroup>>>>,
     runguard_blacklist: RefCell<HashSet<u64>>,
     local_task_queue: RefCell<VecDeque<Weak>>,
-    io_ops: RefCell<SlotMap<DefaultKey, IoUringOp>>,
+    io_ops: RefCell<IoOpsMap>,
 }
 
 //-----------------------------------------------------------------------------
@@ -882,7 +934,7 @@ impl IoContext
                              buf_groups: RefCell::new(HashMap::new()),
                              runguard_blacklist: RefCell::new(HashSet::new()),
                              local_task_queue: RefCell::new(VecDeque::new()),
-                             io_ops: RefCell::new(SlotMap::with_capacity(512 * 512)) };
+                             io_ops: RefCell::new(IoOpsMap::with_capacity(512 * 512)) };
 
         let p = Rc::new(ioc_frame);
 
