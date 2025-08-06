@@ -3,6 +3,7 @@ use std::{
     future::Future,
     net::Ipv4Addr,
     panic::{AssertUnwindSafe, catch_unwind},
+    rc::Rc,
     task::Poll,
     time::Duration,
 };
@@ -10,6 +11,14 @@ use std::{
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use nix::{errno::Errno, libc::EISCONN};
 use rand::SeedableRng;
+
+fn make_bytes(num_bytes: usize) -> Vec<u8>
+{
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1234);
+    let mut bytes = vec![0_u8; num_bytes];
+    rand::RngCore::fill_bytes(&mut rng, &mut bytes);
+    bytes
+}
 
 struct WakerFuture;
 
@@ -26,7 +35,7 @@ impl Future for WakerFuture
 #[test]
 fn tcp_acceptor_eager_drop()
 {
-    // Test basic handling of eager-dropping a TCP socket
+    // Test eager-dropping an AcceptFuture that has only been initiated.
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
@@ -1076,17 +1085,84 @@ fn tcp_double_connect()
 }
 
 #[test]
-fn connect_select_ready_always()
+fn tcp_concurrent_send_recv()
 {
-    let mut ioc = fiona::IoContext::new();
+    const NUM_CLIENTS: u64 = 500;
+    const MESSAGE_LEN: usize = 64 * 1024;
+    const BGID: u16 = 14;
+
+    let params = fiona::IoContextParams { sq_entries: 256,
+                                          cq_entries: 4 * 1024,
+                                          nr_files: 3 * NUM_CLIENTS as u32 };
+    let mut ioc = fiona::IoContext::with_params(&params);
 
     let ex = ioc.get_executor();
-
     let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+
     let port = acceptor.port();
-    let _ = port;
+
+    let mut messages = Vec::new();
+    for _ in 0..NUM_CLIENTS {
+        messages.push(make_bytes(MESSAGE_LEN));
+    }
+
+    let messages = Rc::new(messages);
+
+    ex.register_buf_group(BGID, 4 * 1024, MESSAGE_LEN).unwrap();
+
+    async fn send(stream: fiona::tcp::Stream, messages: Rc<Vec<Vec<u8>>>, message_idx: usize)
+    {
+        let mut message = Vec::<u8>::with_capacity(4 * 1024);
+        for buf in messages[message_idx].chunks_exact(4 * 1024) {
+            message.extend_from_slice(buf);
+            message = stream.send(message).await.unwrap();
+            assert!(message.is_empty());
+        }
+    }
+
+    async fn recv(stream: fiona::tcp::Stream, messages: Rc<Vec<Vec<u8>>>, message_idx: usize)
+    {
+        let mut message = Vec::<u8>::new();
+        let expected_message = &messages[message_idx];
+
+        while message.len() < expected_message.len() {
+            let bufs = stream.recv().await.unwrap();
+            for buf in &bufs {
+                message.extend(buf.iter());
+            }
+        }
+
+        assert!(&message == expected_message);
+    }
+
+    async fn accept(acceptor: fiona::tcp::Acceptor, messages: Rc<Vec<Vec<u8>>>)
+    {
+        for i in 0..NUM_CLIENTS {
+            let stream = acceptor.accept().await.unwrap();
+            stream.set_buf_group(BGID);
+            let ex = stream.get_executor();
+            ex.spawn(recv(stream.clone(), messages.clone(), i as usize));
+            ex.spawn(send(stream, messages.clone(), i as usize));
+        }
+    }
+
+    async fn client(ex: fiona::Executor, port: u16, messages: Rc<Vec<Vec<u8>>>)
+    {
+        for i in 0..NUM_CLIENTS {
+            let client = fiona::tcp::Client::new(ex.clone());
+            client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                  .await
+                  .unwrap();
+
+            client.set_buf_group(BGID);
+            ex.spawn(recv(client.as_stream(), messages.clone(), i as usize));
+            ex.spawn(send(client.as_stream(), messages.clone(), i as usize));
+        }
+    }
+
+    ex.clone().spawn(accept(acceptor, messages.clone()));
+    ex.clone().spawn(client(ex, port, messages));
 
     let n = ioc.run();
-    let _ = n;
-    // assert!(n > 0);
+    assert_eq!(n, 1 + 1 + 4 * NUM_CLIENTS);
 }

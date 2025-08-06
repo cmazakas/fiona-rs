@@ -733,6 +733,16 @@ impl Drop for Stream
     }
 }
 
+impl Clone for Stream
+{
+    fn clone(&self) -> Self
+    {
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
+        unsafe { add_obj_ref(rc) };
+        Self { p: self.p }
+    }
+}
+
 impl Clone for Client
 {
     fn clone(&self) -> Self
