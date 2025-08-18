@@ -9,14 +9,14 @@ use std::{future::Future, ptr::NonNull, task::Poll, time::Duration};
 use nix::{errno::Errno, libc::ETIME};
 
 use liburing_rs::{
-    __kernel_timespec, IOSQE_CQE_SKIP_SUCCESS, io_uring_get_sqe, io_uring_prep_timeout,
-    io_uring_prep_timeout_remove, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    __kernel_timespec, IOSQE_CQE_SKIP_SUCCESS, io_uring_prep_timeout, io_uring_prep_timeout_remove,
+    io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
 use slotmap::{DefaultKey, Key, KeyData};
 
 use crate::{
     Executor, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe, make_io_uring_op,
-    release_impl, release_obj, reserve_sqes,
+    release_impl, release_obj,
 };
 
 struct TimerImpl
@@ -182,9 +182,7 @@ impl Future for TimerFuture<'_>
             }
             (false, true) => panic!(),
             (false, false) => {
-                let ring = timer_impl.ex.ring();
-                unsafe { reserve_sqes(ring, 1) };
-                let sqe = unsafe { io_uring_get_sqe(ring) };
+                let sqe = get_sqe(&timer_impl.ex);
 
                 let ts = match op.op_type {
                     OpType::Timeout { ref mut dur } => &raw mut *dur,
