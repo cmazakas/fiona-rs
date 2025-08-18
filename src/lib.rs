@@ -600,7 +600,7 @@ mod io_ops
 struct IoContextFrame
 {
     ioring: RefCell<io_uring>,
-    _params: RefCell<io_uring_params>,
+    params: RefCell<io_uring_params>,
     available_fds: RefCell<VecDeque<u32>>,
     tasks: RefCell<HashSet<Task>>,
     receiver: RefCell<Receiver<Weak>>,
@@ -916,6 +916,7 @@ impl IoContext
                               nr_files, } = *params;
 
         let mut params = unsafe { std::mem::zeroed::<io_uring_params>() };
+        params.sq_entries = sq_entries;
         params.cq_entries = cq_entries;
         params.flags |= IORING_SETUP_CQSIZE;
         params.flags |= IORING_SETUP_SINGLE_ISSUER;
@@ -924,7 +925,7 @@ impl IoContext
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 
         let ioc_frame =
-            IoContextFrame { _params: RefCell::new(params),
+            IoContextFrame { params: RefCell::new(params),
                              tasks: RefCell::new(HashSet::new()),
                              available_fds: RefCell::new(VecDeque::new()),
                              receiver: RefCell::new(rx),
@@ -934,7 +935,7 @@ impl IoContext
                              buf_groups: RefCell::new(HashMap::new()),
                              runguard_blacklist: RefCell::new(HashSet::new()),
                              local_task_queue: RefCell::new(VecDeque::new()),
-                             io_ops: RefCell::new(IoOpsMap::with_capacity(512 * 512)) };
+                             io_ops: RefCell::new(IoOpsMap::with_capacity(1024)) };
 
         let p = Rc::new(ioc_frame);
 
@@ -1281,6 +1282,49 @@ fn on_tcp_send(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
     false
 }
 
+unsafe fn append_recv_buffers(buf_group: *mut BufGroup, cqe: &mut io_uring_cqe,
+                              bufs: &mut BorrowedBufs)
+{
+    let buf_group = unsafe { &mut *buf_group };
+    let buf_len = buf_group.buf_len;
+    let num_bufs = buf_group.num_bufs;
+    let bid_map = &buf_group.bid_map;
+    let buf_headers = &mut buf_group.buf_headers;
+
+    let mask = io_uring_buf_ring_mask(num_bufs) as u32;
+
+    let mut bid = cqe.flags >> IORING_CQE_BUFFER_SHIFT;
+    let mut num_bytes = cqe.res as usize;
+
+    while num_bytes > 0 {
+        let mut n = buf_len;
+        if n > num_bytes {
+            n = num_bytes;
+        }
+
+        let bg_bid = bid_map[bid as usize];
+
+        if bufs.head < 0 {
+            bufs.head = bg_bid as _;
+        }
+
+        if bufs.tail >= 0 {
+            buf_headers[bufs.tail as usize].next = bg_bid as _;
+            buf_headers[bg_bid as usize].prev = bufs.tail;
+        }
+
+        buf_headers[bg_bid as usize].len = n;
+        bid = (bid + 1) & mask;
+        num_bytes -= n;
+        bufs.tail = bg_bid as _;
+
+        if num_bytes > 0 {
+            buf_headers[bg_bid as usize].next = bid_map[bid as usize] as isize;
+            buf_headers[bid_map[bid as usize] as usize].prev = bg_bid as isize;
+        }
+    }
+}
+
 fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
                          ex: &Executor)
                          -> bool
@@ -1297,7 +1341,7 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
 
     if op.eager_dropped {
         if cqe.res > 0 {
-            unimplemented!("eager-dropped multishot recv with buffers");
+            unsafe { append_recv_buffers(buf_group, cqe, bufs) };
         }
 
         if has_more_cqes {
@@ -1317,45 +1361,8 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
     unsafe { *last_recv = Instant::now() };
 
     op.res = cqe.res;
-    if op.res > 0 {
-        let buf_group = unsafe { &mut *buf_group };
-        let buf_len = buf_group.buf_len;
-        let num_bufs = buf_group.num_bufs;
-        let bid_map = &buf_group.bid_map;
-        let buf_headers = &mut buf_group.buf_headers;
-
-        let mask = io_uring_buf_ring_mask(num_bufs) as u32;
-
-        let mut bid = cqe.flags >> IORING_CQE_BUFFER_SHIFT;
-        let mut num_bytes = cqe.res as usize;
-
-        while num_bytes > 0 {
-            let mut n = buf_len;
-            if n > num_bytes {
-                n = num_bytes;
-            }
-
-            let bg_bid = bid_map[bid as usize];
-
-            if bufs.head < 0 {
-                bufs.head = bg_bid as _;
-            }
-
-            if bufs.tail >= 0 {
-                buf_headers[bufs.tail as usize].next = bg_bid as _;
-                buf_headers[bg_bid as usize].prev = bufs.tail;
-            }
-
-            buf_headers[bg_bid as usize].len = n;
-            bid = (bid + 1) & mask;
-            num_bytes -= n;
-            bufs.tail = bg_bid as _;
-
-            if num_bytes > 0 {
-                buf_headers[bg_bid as usize].next = bid_map[bid as usize] as isize;
-                buf_headers[bid_map[bid as usize] as usize].prev = bg_bid as isize;
-            }
-        }
+    if cqe.res > 0 {
+        unsafe { append_recv_buffers(buf_group, cqe, bufs) };
     }
 
     if let Some(local_waker) = op.local_waker.take() {
@@ -1562,6 +1569,16 @@ impl Executor
     {
         let fds = &mut *self.p.available_fds.borrow_mut();
         fds.push_back(fd);
+    }
+
+    #[must_use]
+    pub fn get_params(&self) -> IoContextParams
+    {
+        let ring_params = &*self.p.params.borrow();
+        let nr_files = self.p.available_fds.borrow().len() as u32;
+        IoContextParams { sq_entries: ring_params.sq_entries,
+                          cq_entries: ring_params.cq_entries,
+                          nr_files }
     }
 
     pub fn register_buf_group(&self, bgid: u16, num_bufs: u32, buf_len: usize) -> Result<()>

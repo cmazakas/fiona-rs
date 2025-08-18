@@ -214,6 +214,13 @@ impl Acceptor
                        completed: false,
                        op: Some(key.data().as_ffi()) }
     }
+
+    #[must_use]
+    pub fn get_executor(&self) -> Executor
+    {
+        let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
+        acceptor_impl.ex.clone()
+    }
 }
 
 impl Drop for Acceptor
