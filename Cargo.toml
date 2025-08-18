@@ -8,15 +8,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-nix = { version = "0.29.0", features = ["event", "socket", "net"] }
+nix = { version = "0.30.1", features = ["event", "socket", "net"] }
 slotmap = { version = "1.0.7" }
 axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "b13ddfdd28a3b39087dc7484d3eff9be708d9314" }
 
 [dev-dependencies]
-futures = "0.3.30"
-rand = "0.9.0"
+futures = "0.3.31"
+rand = "0.9.2"
 tokio = { version = "1.47.1", features = ["full"] }
-clap = { version = "4.5.32", features = ["derive"] }
+clap = { version = "4.5.45", features = ["derive"] }
 
 [profile.release-with-debug]
 inherits = "release"
