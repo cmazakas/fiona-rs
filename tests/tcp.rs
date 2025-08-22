@@ -1108,3 +1108,92 @@ fn tcp_select_drop_ready_recv_future()
     let n = ioc.run();
     assert_eq!(n, 2);
 }
+
+#[test]
+fn tcp_close()
+{
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    async fn server(acceptor: fiona::tcp::Acceptor)
+    {
+        let stream = acceptor.accept().await.unwrap();
+        let r = stream.close().await;
+        assert!(r.is_ok());
+
+        let r = stream.close().await;
+        assert!(r.is_err());
+    }
+
+    async fn client(ex: fiona::Executor, port: u16)
+    {
+        let client = fiona::tcp::Client::new(ex.clone());
+        client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+              .await
+              .unwrap();
+
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(100)).await.unwrap();
+
+        let stream = client.as_stream();
+        let r = stream.close().await;
+        assert!(r.is_ok());
+    }
+
+    ex.clone().spawn(server(acceptor));
+    ex.clone().spawn(client(ex.clone(), port));
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn tcp_close_eager_drop()
+{
+    // Test that our Future can handle being dropped once it's been initiated.
+
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    async fn server(acceptor: fiona::tcp::Acceptor)
+    {
+        let stream = acceptor.accept().await.unwrap();
+        let mut f = stream.close();
+        assert!(futures::poll!(&mut f).is_pending());
+
+        drop(f);
+
+        let ex = stream.get_executor();
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(100)).await.unwrap();
+    }
+
+    async fn client(ex: fiona::Executor, port: u16)
+    {
+        let client = fiona::tcp::Client::new(ex.clone());
+        client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+              .await
+              .unwrap();
+
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(100)).await.unwrap();
+
+        let stream = client.as_stream();
+        let r = stream.close().await;
+        assert!(r.is_ok());
+    }
+
+    ex.clone().spawn(server(acceptor));
+    ex.clone().spawn(client(ex.clone(), port));
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+}

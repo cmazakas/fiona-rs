@@ -666,7 +666,7 @@ enum OpType
 {
     Timeout
     {
-        dur: __kernel_timespec
+        dur: __kernel_timespec,
     },
     #[allow(dead_code)]
     TimeoutCancel,
@@ -677,7 +677,7 @@ enum OpType
     },
     TcpAccept
     {
-        fd: i32
+        fd: i32,
     },
     TcpConnect
     {
@@ -699,6 +699,8 @@ enum OpType
         buf_group: *mut BufGroup,
         last_recv: *mut Instant,
     },
+    TcpClose {},
+    DropCancel {},
 }
 
 struct IoUringOp
@@ -1064,6 +1066,7 @@ impl IoContext
 
                 let io_ops = &mut *self.p.io_ops.borrow_mut();
                 let op = io_ops.get_mut(key).unwrap();
+
                 match op.op_type {
                     OpType::Timeout { .. } => {
                         if on_timeout(op, cqe, ring, &ex) {
@@ -1085,6 +1088,11 @@ impl IoContext
                             io_ops.remove(key).unwrap();
                         }
                     }
+                    OpType::TcpClose {} => {
+                        if on_tcp_close(op, cqe, ring, &ex) {
+                            io_ops.remove(key).unwrap();
+                        }
+                    }
                     OpType::MultishotTcpRecv { .. } => {
                         if on_multishot_tcp_recv(op, cqe, ring, &ex) {
                             io_ops.remove(key).unwrap();
@@ -1096,6 +1104,10 @@ impl IoContext
                         }
                     }
                     OpType::TimeoutCancel => todo!(),
+                    OpType::DropCancel {} => {
+                        unsafe { release_op(op.ref_count) };
+                        io_ops.remove(key).unwrap();
+                    }
                 }
             };
 
@@ -1111,11 +1123,13 @@ fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, 
 {
     let _ = ex;
     unsafe { release_op(op.ref_count) };
+
+    op.done = true;
+    op.res = cqe.res;
     if op.eager_dropped {
         return true;
     }
-    op.done = true;
-    op.res = cqe.res;
+
     if let Some(local_waker) = op.local_waker.take() {
         local_waker.wake();
     }
@@ -1363,6 +1377,23 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
     op.res = cqe.res;
     if cqe.res > 0 {
         unsafe { append_recv_buffers(buf_group, cqe, bufs) };
+    }
+
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
+    }
+
+    false
+}
+
+fn on_tcp_close(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, _ex: &Executor)
+                -> bool
+{
+    op.done = true;
+    op.res = cqe.res;
+    unsafe { release_op(op.ref_count) };
+    if op.eager_dropped {
+        return true;
     }
 
     if let Some(local_waker) = op.local_waker.take() {
