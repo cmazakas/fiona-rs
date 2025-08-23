@@ -1312,6 +1312,7 @@ impl Future for RecvFuture<'_>
                     assert!(op.done);
                     if op.done {
                         stream_impl.recv_op = None;
+                        io_ops.remove(key).unwrap();
                     }
                     return Poll::Ready(Ok(BorrowedBufs::new(ex.clone(), buf_group)));
                 }
