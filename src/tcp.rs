@@ -16,10 +16,10 @@ use liburing_rs::{
     IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring_get_sqe,
     io_uring_prep_accept_direct, io_uring_prep_cancel_fd, io_uring_prep_cancel64,
     io_uring_prep_close_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
-    io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_socket_direct,
-    io_uring_prep_timeout, io_uring_prep_timeout_remove, io_uring_prep_timeout_update,
-    io_uring_register_files_update, io_uring_sqe_set_buf_group, io_uring_sqe_set_data,
-    io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_shutdown,
+    io_uring_prep_socket_direct, io_uring_prep_timeout, io_uring_prep_timeout_remove,
+    io_uring_prep_timeout_update, io_uring_register_files_update, io_uring_sqe_set_buf_group,
+    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
 use nix::{
     errno::Errno,
@@ -54,6 +54,7 @@ pub(crate) struct StreamImpl
 {
     pub(crate) fd: i32,
     pub(crate) send_pending: bool,
+    pub(crate) shutdown_pending: bool,
     pub(crate) close_pending: bool,
     pub(crate) recv_op: Option<u64>,
     pub(crate) last_send: Instant,
@@ -429,6 +430,7 @@ impl Stream
                                            buf_group: u16::MAX,
                                            send_pending: false,
                                            recv_pending: false,
+                                           shutdown_pending: false,
                                            close_pending: false,
                                            last_send: Instant::now(),
                                            last_recv: Instant::now(),
@@ -519,6 +521,28 @@ impl Stream
     }
 
     #[must_use]
+    pub fn shutdown(&self, how: i32) -> ShutdownFuture<'_>
+    {
+        assert!(unsafe { !(*self.p.as_ptr()).shutdown_pending });
+
+        let stream_impl = unsafe { &mut *self.p.as_ptr() };
+        stream_impl.shutdown_pending = true;
+
+        let ref_count = &raw mut stream_impl.ref_count;
+        let key =
+            stream_impl.ex
+                       .p
+                       .io_ops
+                       .borrow_mut()
+                       .insert(make_io_uring_op(ref_count, OpType::TcpShutdown), &stream_impl.ex);
+
+        ShutdownFuture { stream: self,
+                         completed: false,
+                         op: Some(key.data().as_ffi()),
+                         how }
+    }
+
+    #[must_use]
     pub fn close(&self) -> CloseFuture<'_>
     {
         assert!(unsafe { !(*self.p.as_ptr()).close_pending });
@@ -591,6 +615,7 @@ impl Client
                                   buf_group: u16::MAX,
                                   send_pending: false,
                                   recv_pending: false,
+                                  shutdown_pending: false,
                                   close_pending: false,
                                   last_send: Instant::now(),
                                   last_recv: Instant::now(),
@@ -1142,7 +1167,7 @@ impl Future for CloseFuture<'_>
                 Poll::Pending
             }
             (false, false) => {
-                let OpType::TcpClose {} = op.op_type else {
+                let OpType::TcpClose = op.op_type else {
                     unreachable!()
                 };
 
@@ -1161,7 +1186,7 @@ impl Future for CloseFuture<'_>
             (true, true) => {
                 self.completed = true;
 
-                let OpType::TcpClose {} = op.op_type else {
+                let OpType::TcpClose = op.op_type else {
                     unreachable!()
                 };
 
@@ -1194,7 +1219,107 @@ impl Drop for CloseFuture<'_>
 
             let ref_count = &raw mut stream_impl.ref_count;
             let key =
-                io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel {}), &stream_impl.ex);
+                io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel), &stream_impl.ex);
+            unsafe { add_op_ref(ref_count) };
+
+            let sqe = get_sqe(&stream_impl.ex);
+            let user_data = key.data().as_ffi();
+            unsafe { io_uring_prep_cancel64(sqe, key_data, 0) };
+            unsafe { io_uring_sqe_set_data64(sqe, user_data) };
+        } else {
+            io_ops.remove(key).unwrap();
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+pub struct ShutdownFuture<'a>
+{
+    stream: &'a Stream,
+    completed: bool,
+    op: Option<u64>,
+    how: i32,
+}
+
+impl Future for ShutdownFuture<'_>
+{
+    type Output = Result<()>;
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
+            -> Poll<Self::Output>
+    {
+        let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
+
+        let key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let op = io_ops.get_mut(key).unwrap();
+
+        let user_data = key_data;
+
+        match (op.initiated, op.done) {
+            (false, true) => unreachable!(),
+            (true, false) => {
+                op.local_waker = Some(cx.local_waker().clone());
+                Poll::Pending
+            }
+            (false, false) => {
+                let OpType::TcpShutdown = op.op_type else {
+                    unreachable!()
+                };
+
+                let ring = stream_impl.ex.ring();
+
+                let sqe = get_sqe(&stream_impl.ex);
+                let fd = stream_impl.fd;
+                unsafe { io_uring_prep_shutdown(sqe, fd, self.how) };
+                unsafe { io_uring_sqe_set_data64(sqe, user_data) };
+                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) };
+
+                unsafe { add_op_ref(&raw mut stream_impl.ref_count) };
+
+                op.local_waker = Some(cx.local_waker().clone());
+                op.initiated = true;
+                Poll::Pending
+            }
+            (true, true) => {
+                self.completed = true;
+
+                let OpType::TcpShutdown = op.op_type else {
+                    unreachable!()
+                };
+
+                let res = op.res;
+                if res < 0 {
+                    Poll::Ready(Err(Errno::from_raw(-res)))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ShutdownFuture<'_>
+{
+    fn drop(&mut self)
+    {
+        let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
+        stream_impl.shutdown_pending = false;
+
+        let key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let op = io_ops.get_mut(key).unwrap();
+
+        if op.initiated && !op.done {
+            op.eager_dropped = true;
+            op.local_waker = None;
+
+            let ref_count = &raw mut stream_impl.ref_count;
+            let key =
+                io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel), &stream_impl.ex);
             unsafe { add_op_ref(ref_count) };
 
             let sqe = get_sqe(&stream_impl.ex);

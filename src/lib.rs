@@ -12,7 +12,8 @@
          clippy::similar_names,
          clippy::cast_possible_wrap,
          clippy::cast_sign_loss,
-         clippy::cast_possible_truncation)]
+         clippy::cast_possible_truncation,
+         clippy::struct_excessive_bools)]
 
 extern crate liburing_rs;
 extern crate nix;
@@ -699,8 +700,9 @@ enum OpType
         buf_group: *mut BufGroup,
         last_recv: *mut Instant,
     },
-    TcpClose {},
-    DropCancel {},
+    TcpShutdown,
+    TcpClose,
+    DropCancel,
 }
 
 struct IoUringOp
@@ -1088,8 +1090,13 @@ impl IoContext
                             io_ops.remove(key).unwrap();
                         }
                     }
-                    OpType::TcpClose {} => {
+                    OpType::TcpClose => {
                         if on_tcp_close(op, cqe, ring, &ex) {
+                            io_ops.remove(key).unwrap();
+                        }
+                    }
+                    OpType::TcpShutdown => {
+                        if on_tcp_shutdown(op, cqe, ring, &ex) {
                             io_ops.remove(key).unwrap();
                         }
                     }
@@ -1104,7 +1111,7 @@ impl IoContext
                         }
                     }
                     OpType::TimeoutCancel => todo!(),
-                    OpType::DropCancel {} => {
+                    OpType::DropCancel => {
                         unsafe { release_op(op.ref_count) };
                         io_ops.remove(key).unwrap();
                     }
@@ -1388,6 +1395,24 @@ fn on_multishot_tcp_recv(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut
 
 fn on_tcp_close(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, _ex: &Executor)
                 -> bool
+{
+    op.done = true;
+    op.res = cqe.res;
+    unsafe { release_op(op.ref_count) };
+    if op.eager_dropped {
+        return true;
+    }
+
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
+    }
+
+    false
+}
+
+fn on_tcp_shutdown(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
+                   _ex: &Executor)
+                   -> bool
 {
     op.done = true;
     op.res = cqe.res;

@@ -10,7 +10,10 @@ use std::{
 };
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
-use nix::{errno::Errno, libc::EISCONN};
+use nix::{
+    errno::Errno,
+    libc::{EISCONN, SHUT_RD, SHUT_RDWR, SHUT_WR},
+};
 use rand::SeedableRng;
 
 fn make_bytes(num_bytes: usize) -> Vec<u8>
@@ -1187,6 +1190,124 @@ fn tcp_close_eager_drop()
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
         let stream = client.as_stream();
+        let r = stream.close().await;
+        assert!(r.is_ok());
+    }
+
+    ex.clone().spawn(server(acceptor));
+    ex.clone().spawn(client(ex.clone(), port));
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn tcp_shutdown()
+{
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.register_buf_group(0, 128, 16).unwrap();
+
+    async fn server(acceptor: fiona::tcp::Acceptor)
+    {
+        let stream = acceptor.accept().await.unwrap();
+
+        let r = stream.shutdown(1234).await;
+        assert_eq!(r.unwrap_err(), Errno::EINVAL);
+
+        let r = stream.shutdown(SHUT_WR).await;
+        assert!(r.is_ok());
+
+        let r = stream.shutdown(SHUT_RD).await;
+        assert!(r.is_ok());
+
+        let r = stream.send(vec![0, 1, 2, 3, 4]).await;
+        assert_eq!(r.unwrap_err(), Errno::EPIPE);
+
+        stream.set_buf_group(0);
+        let r = stream.recv().await.unwrap();
+        assert!(r.is_empty());
+
+        let r = stream.close().await;
+        assert!(r.is_ok());
+    }
+
+    async fn client(ex: fiona::Executor, port: u16)
+    {
+        let client = fiona::tcp::Client::new(ex.clone());
+        client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+              .await
+              .unwrap();
+
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(100)).await.unwrap();
+
+        let stream = client.as_stream();
+
+        let r = stream.shutdown(SHUT_RDWR).await;
+        assert!(r.is_ok());
+
+        let r = stream.send(vec![0, 1, 2, 3, 4]).await;
+        assert_eq!(r.unwrap_err(), Errno::EPIPE);
+
+        stream.set_buf_group(0);
+        let r = stream.recv().await.unwrap();
+        assert!(r.is_empty());
+
+        let r = stream.close().await;
+        assert!(r.is_ok());
+    }
+
+    ex.clone().spawn(server(acceptor));
+    ex.clone().spawn(client(ex.clone(), port));
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn tcp_shutdown_eager_drop()
+{
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    async fn server(acceptor: fiona::tcp::Acceptor)
+    {
+        let stream = acceptor.accept().await.unwrap();
+
+        let mut f = stream.shutdown(SHUT_RDWR);
+        assert!(futures::poll!(&mut f).is_pending());
+
+        drop(f);
+
+        let r = stream.close().await;
+        assert!(r.is_ok());
+    }
+
+    async fn client(ex: fiona::Executor, port: u16)
+    {
+        let client = fiona::tcp::Client::new(ex.clone());
+        client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+              .await
+              .unwrap();
+
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(100)).await.unwrap();
+
+        let stream = client.as_stream();
+
+        let r = stream.shutdown(SHUT_RDWR).await;
+        assert!(r.is_ok());
+
         let r = stream.close().await;
         assert!(r.is_ok());
     }
