@@ -1032,6 +1032,9 @@ fn tcp_concurrent_send_recv()
 #[test]
 fn tcp_select_drop_ready_recv_future()
 {
+    // Test that if we drop a recv future early and it's successfully read in a
+    // buffer sequence, that we properly return the buffers back to the ring.
+
     let mut ioc = fiona::IoContext::new();
 
     let ex = ioc.get_executor();
@@ -1129,7 +1132,10 @@ fn tcp_close()
         assert!(r.is_ok());
 
         let r = stream.close().await;
-        assert!(r.is_err());
+        assert_eq!(r.unwrap_err(), Errno::EBADF);
+
+        let r = stream.send(vec![0, 1, 2, 3, 4]).await;
+        assert_eq!(r.unwrap_err(), Errno::EBADF);
     }
 
     async fn client(ex: fiona::Executor, port: u16)
@@ -1145,6 +1151,12 @@ fn tcp_close()
         let stream = client.as_stream();
         let r = stream.close().await;
         assert!(r.is_ok());
+
+        let r = stream.send(vec![0, 1, 2, 3, 4]).await;
+        assert_eq!(r.unwrap_err(), Errno::EBADF);
+
+        let r = client.connect_ipv4(Ipv4Addr::LOCALHOST, port).await;
+        assert_eq!(r.unwrap_err(), Errno::EBADF);
     }
 
     ex.clone().spawn(server(acceptor));
@@ -1317,4 +1329,71 @@ fn tcp_shutdown_eager_drop()
 
     let n = ioc.run();
     assert_eq!(n, 2);
+}
+
+#[test]
+fn tcp_cancel()
+{
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.register_buf_group(0, 128, 256).unwrap();
+
+    async fn recv_op(stream: fiona::tcp::Stream)
+    {
+        stream.set_buf_group(0);
+
+        let r = stream.recv().await;
+        assert_eq!(r.unwrap_err(), Errno::ECANCELED);
+
+        let bufs = stream.recv().await.unwrap();
+
+        let msg = bufs.iter()
+                      .map(|buf| str::from_utf8(buf).unwrap())
+                      .collect::<String>();
+        assert_eq!(msg, "hello, world!");
+    }
+
+    async fn server(acceptor: fiona::tcp::Acceptor)
+    {
+        let stream = acceptor.accept().await.unwrap();
+        let ex = stream.get_executor();
+
+        ex.spawn(recv_op(stream.clone()));
+
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(10)).await.unwrap();
+
+        stream.cancel().await.unwrap();
+    }
+
+    async fn client(ex: fiona::Executor, port: u16)
+    {
+        let client = fiona::tcp::Client::new(ex.clone());
+        client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+              .await
+              .unwrap();
+
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(100)).await.unwrap();
+
+        let stream = client.as_stream();
+
+        stream.send(String::from("hello, world!").into_bytes())
+              .await
+              .unwrap();
+
+        let r = stream.close().await;
+        assert!(r.is_ok());
+    }
+
+    ex.clone().spawn(server(acceptor));
+    ex.clone().spawn(client(ex.clone(), port));
+
+    let n = ioc.run();
+    assert_eq!(n, 3);
 }

@@ -702,6 +702,7 @@ enum OpType
     },
     TcpShutdown,
     TcpClose,
+    TcpCancel,
     DropCancel,
 }
 
@@ -1100,6 +1101,11 @@ impl IoContext
                             io_ops.remove(key).unwrap();
                         }
                     }
+                    OpType::TcpCancel => {
+                        if on_cancel(op, cqe, ring, &ex) {
+                            io_ops.remove(key).unwrap();
+                        }
+                    }
                     OpType::MultishotTcpRecv { .. } => {
                         if on_multishot_tcp_recv(op, cqe, ring, &ex) {
                             io_ops.remove(key).unwrap();
@@ -1413,6 +1419,23 @@ fn on_tcp_close(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring
 fn on_tcp_shutdown(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring,
                    _ex: &Executor)
                    -> bool
+{
+    op.done = true;
+    op.res = cqe.res;
+    unsafe { release_op(op.ref_count) };
+    if op.eager_dropped {
+        return true;
+    }
+
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
+    }
+
+    false
+}
+
+fn on_cancel(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, _ex: &Executor)
+             -> bool
 {
     op.done = true;
     op.res = cqe.res;
