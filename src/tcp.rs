@@ -1064,23 +1064,20 @@ impl Drop for SendFuture<'_>
         let op = io_ops.get_mut(key).unwrap();
 
         if op.initiated && !op.done {
-            let ring = stream_impl.ex.ring();
-            let sqe = get_sqe(&stream_impl.ex);
-
-            // TODO: don't cancel all pending ops, this makes `select!` unusable
-            unsafe {
-                io_uring_prep_cancel_fd(sqe,
-                                        stream_impl.fd,
-                                        IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED);
-            }
-
-            unsafe { io_uring_sqe_set_data64(sqe, 0) };
-            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-
-            // TODO: same as TimerFuture::drop() comments
-
             op.eager_dropped = true;
             op.local_waker = None;
+
+            let ref_count = &raw mut stream_impl.ref_count;
+            let key =
+                io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel), &stream_impl.ex);
+
+            unsafe { add_op_ref(ref_count) };
+
+            let sqe = get_sqe(&stream_impl.ex);
+            let user_data = key.data().as_ffi();
+            unsafe { io_uring_prep_cancel64(sqe, key_data, 0) };
+            unsafe { io_uring_sqe_set_data64(sqe, user_data) };
+
             self.op = None;
         } else {
             io_ops.remove(key).unwrap();
@@ -1244,6 +1241,7 @@ impl Drop for CloseFuture<'_>
             let ref_count = &raw mut stream_impl.ref_count;
             let key =
                 io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel), &stream_impl.ex);
+
             unsafe { add_op_ref(ref_count) };
 
             let sqe = get_sqe(&stream_impl.ex);

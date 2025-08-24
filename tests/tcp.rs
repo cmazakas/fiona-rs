@@ -1397,3 +1397,71 @@ fn tcp_cancel()
     let n = ioc.run();
     assert_eq!(n, 3);
 }
+
+#[test]
+fn tcp_eager_drop_send_ready()
+{
+    // Test that our drop-on-cancel for send() doesn't interfere with other
+    // operations on the socket like recv().
+
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.register_buf_group(0, 128, 8).unwrap();
+
+    async fn recv_op(stream: fiona::tcp::Stream)
+    {
+        stream.set_buf_group(0);
+        let bufs = stream.recv().await.unwrap();
+        let msg = bufs.iter().flatten().copied().collect::<Vec<u8>>();
+        assert_eq!(msg, vec![0, 1, 2, 3, 4]);
+    }
+
+    async fn server(acceptor: fiona::tcp::Acceptor)
+    {
+        let stream = acceptor.accept().await.unwrap();
+
+        let ex = stream.get_executor();
+        ex.spawn(recv_op(stream.clone()));
+
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(10)).await.unwrap();
+
+        let mut f = stream.send(vec![0, 1, 2, 3, 4]);
+        assert!(futures::poll!(&mut f).is_pending());
+        drop(f);
+
+        timer.wait(Duration::from_millis(150)).await.unwrap();
+
+        let r = stream.close().await;
+        assert!(r.is_ok());
+    }
+
+    async fn client(ex: fiona::Executor, port: u16)
+    {
+        let client = fiona::tcp::Client::new(ex.clone());
+        client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+              .await
+              .unwrap();
+
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(100)).await.unwrap();
+
+        let stream = client.as_stream();
+
+        stream.send(vec![0, 1, 2, 3, 4]).await.unwrap();
+
+        let r = stream.close().await;
+        assert!(r.is_ok());
+    }
+
+    ex.clone().spawn(server(acceptor));
+    ex.clone().spawn(client(ex.clone(), port));
+
+    let n = ioc.run();
+    assert_eq!(n, 3);
+}
