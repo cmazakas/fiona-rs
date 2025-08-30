@@ -216,7 +216,8 @@ impl Drop for Acceptor
 {
     fn drop(&mut self)
     {
-        unsafe { release_obj(self.p.cast::<RefCount>().as_ptr()) };
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
+        unsafe { release_obj(rc) };
     }
 }
 
@@ -714,7 +715,8 @@ impl Client
         let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.ref_count };
         unsafe { add_obj_ref(rc) };
 
-        Stream { p: self.p.cast() }
+        let p = unsafe { &raw mut (*self.p.as_ptr()).stream };
+        Stream { p: unsafe { NonNull::new_unchecked(p) } }
     }
 
     pub fn set_buf_group(&self, bgid: u16)
