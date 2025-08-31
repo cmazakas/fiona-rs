@@ -8,7 +8,7 @@ extern crate liburing_rs;
 
 use crate::{
     BorrowedBufs, Executor, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
-    make_io_uring_op, release_impl, release_obj, reserve_sqes, submit_ring,
+    make_io_uring_op, release_impl, release_obj, reserve_sqes,
 };
 use liburing_rs::{
     __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
@@ -41,15 +41,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-struct AcceptorImpl
-{
-    ref_count: RefCount,
-    ex: Executor,
-    fd: i32,
-    addr: SockaddrStorage,
-    accept_pending: bool,
-}
-
 pub(crate) struct StreamImpl
 {
     pub(crate) fd: i32,
@@ -74,11 +65,6 @@ struct ClientImpl
     connect_pending: bool,
 }
 
-pub struct Acceptor
-{
-    p: NonNull<AcceptorImpl>,
-}
-
 pub struct Stream
 {
     p: NonNull<StreamImpl>,
@@ -87,13 +73,6 @@ pub struct Stream
 pub struct Client
 {
     p: NonNull<ClientImpl>,
-}
-
-pub struct AcceptFuture<'a>
-{
-    acceptor: &'a Acceptor,
-    completed: bool,
-    op: Option<u64>,
 }
 
 pub struct ConnectFuture<'a>
@@ -111,6 +90,11 @@ pub struct RecvFuture<'a>
 
 //-----------------------------------------------------------------------------
 
+pub struct Acceptor
+{
+    p: NonNull<AcceptorImpl>,
+}
+
 impl Acceptor
 {
     pub fn new(ex: Executor, ipv4_addr: Ipv4Addr, port: u16) -> Result<Acceptor>
@@ -120,30 +104,23 @@ impl Acceptor
 
         setsockopt(&socket, ReuseAddr, &true).unwrap();
 
-        let addr = SocketAddrV4::new(ipv4_addr, port);
-        let addr: SockaddrIn = addr.into();
-
+        let addr = SockaddrIn::from(SocketAddrV4::new(ipv4_addr, port));
         bind(socket.as_raw_fd(), &addr)?;
         listen(&socket, Backlog::new(2048).unwrap())?;
 
-        let ring = ex.ring();
-        let fd = socket.as_raw_fd();
-
-        // we need to do this for when `port == 0` (the wildcard port)
-        let addr = getsockname::<SockaddrIn>(socket.as_raw_fd())?;
-
-        let offset = unsafe { ex.get_available_fd() };
-        if offset.is_none() {
+        let Some(offset) = ex.get_available_fd() else {
             return Err(Errno::from_raw(ENFILE));
-        }
+        };
 
-        let offset = offset.unwrap();
-
-        let ret = unsafe { io_uring_register_files_update(ring, offset, &raw const fd, 1) };
-        if ret < 0 {
-            return Err(Errno::from_raw(-ret));
+        {
+            let ring = ex.ring();
+            let fd = socket.as_raw_fd();
+            let ret = unsafe { io_uring_register_files_update(ring, offset, &raw const fd, 1) };
+            if ret < 0 {
+                return Err(Errno::from_raw(-ret));
+            }
+            assert_eq!(ret, 1);
         }
-        assert_eq!(ret, 1);
 
         let layout = Layout::new::<AcceptorImpl>();
         let p = unsafe { std::alloc::alloc(layout) };
@@ -154,11 +131,15 @@ impl Acceptor
                                    release_impl: release_impl::<AcceptorImpl>,
                                    obj: p.as_ptr() };
 
+        // we need to do this for when `port == 0` (the wildcard port)
+        let addr = getsockname::<SockaddrIn>(socket.as_raw_fd())?;
+
         let acceptor_impl = AcceptorImpl { ref_count,
                                            ex,
                                            fd: offset.try_into().unwrap(),
                                            addr:
-                                               SocketAddrV4::new(addr.ip(), addr.port()).into(),
+                                               SockaddrStorage::from(SocketAddrV4::new(addr.ip(),
+                                                                                       addr.port())),
                                            accept_pending: false };
 
         let p = p.cast::<AcceptorImpl>();
@@ -221,25 +202,44 @@ impl Drop for Acceptor
     }
 }
 
+struct AcceptorImpl
+{
+    ref_count: RefCount,
+    ex: Executor,
+    fd: i32,
+    addr: SockaddrStorage,
+    accept_pending: bool,
+}
+
 impl Drop for AcceptorImpl
 {
     fn drop(&mut self)
     {
         if self.fd >= 0 {
-            let ring = self.ex.ring();
             let fd = self.fd.try_into().unwrap();
 
-            let sqe = crate::get_sqe(&self.ex);
-            unsafe { io_uring_prep_close_direct(sqe, fd) };
-            unsafe { io_uring_sqe_set_data64(sqe, 0) };
-            unsafe { submit_ring(ring) };
+            let key =
+                self.ex
+                    .p
+                    .io_ops
+                    .borrow_mut()
+                    .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), &self.ex);
 
-            unsafe { self.ex.reclaim_fd(fd) };
+            let sqe = get_sqe(&self.ex);
+            unsafe { io_uring_prep_close_direct(sqe, fd) };
+            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
         }
     }
 }
 
 //-----------------------------------------------------------------------------
+
+pub struct AcceptFuture<'a>
+{
+    acceptor: &'a Acceptor,
+    completed: bool,
+    op: Option<u64>,
+}
 
 impl Future for AcceptFuture<'_>
 {
@@ -283,7 +283,7 @@ impl Future for AcceptFuture<'_>
             (false, false) => {
                 let ring = acceptor_impl.ex.ring();
 
-                let mfile_index = unsafe { acceptor_impl.ex.get_available_fd() };
+                let mfile_index = acceptor_impl.ex.get_available_fd();
                 let Some(file_index) = mfile_index else {
                     self.completed = true;
                     return Poll::Ready(Err(Errno::from_raw(ENFILE)));
@@ -376,8 +376,7 @@ impl Drop for AcceptFuture<'_>
                 io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
             }
 
-            // unsafe { submit_ring(ring) };
-            unsafe { acceptor_impl.ex.reclaim_fd(fd) };
+            acceptor_impl.ex.reclaim_fd(fd);
         }
 
         io_ops.remove(key).unwrap();
@@ -391,16 +390,18 @@ impl Drop for StreamImpl
     fn drop(&mut self)
     {
         if self.fd >= 0 {
-            let ring = self.ex.ring();
             let fd = self.fd.try_into().unwrap();
+
+            let key =
+                self.ex
+                    .p
+                    .io_ops
+                    .borrow_mut()
+                    .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), &self.ex);
 
             let sqe = get_sqe(&self.ex);
             unsafe { io_uring_prep_close_direct(sqe, fd) };
-            unsafe { io_uring_sqe_set_data64(sqe, 0) };
-            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-
-            // unsafe { submit_ring(ring) };
-            unsafe { self.ex.reclaim_fd(fd) };
+            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
         }
     }
 }
@@ -930,7 +931,7 @@ impl Future for ConnectFuture<'_>
                 *needs_socket = client_impl.stream.fd < 0;
 
                 if *needs_socket {
-                    let mfile_index = unsafe { client_impl.stream.ex.get_available_fd() };
+                    let mfile_index = client_impl.stream.ex.get_available_fd();
                     let Some(file_idx) = mfile_index else {
                         return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                     };
