@@ -570,6 +570,11 @@ mod io_ops
             self.slots.len()
         }
 
+        pub fn get(&self, key: DefaultKey) -> Option<&IoUringOp>
+        {
+            self.slots.get(key)
+        }
+
         pub fn get_mut(&mut self, key: DefaultKey) -> Option<&mut IoUringOp>
         {
             self.slots.get_mut(key)
@@ -703,6 +708,8 @@ enum OpType
         fd: u32,
     },
 }
+
+type CqeHandler = fn(ex: &Executor, cqe: &mut io_uring_cqe);
 
 struct IoUringOp
 {
@@ -970,26 +977,6 @@ impl IoContext
 
     pub fn run(&mut self) -> u64
     {
-        fn on_work_item(weak: Weak, ex: &Executor) -> u64
-        {
-            match unsafe { weak.upgrade() } {
-                None => 0,
-                Some(mut task) => {
-                    let w = make_waker(weak.clone());
-                    let lw = make_local_waker(weak);
-
-                    let mut cx = ContextBuilder::from_waker(&w).local_waker(&lw).build();
-
-                    if let Poll::Ready(()) = task.poll(&mut cx) {
-                        ex.p.tasks.borrow_mut().remove(&task);
-                        1
-                    } else {
-                        0
-                    }
-                }
-            }
-        }
-
         let _guard = RunGuard { p: self.p.clone() };
 
         let mut num_completed = 0;
@@ -1041,367 +1028,485 @@ impl IoContext
 
             let mut guard = CQEAdvanceGuard { ring, n: 0 };
 
-            let on_cqe = |cqe: *mut io_uring_cqe| {
-                let _g = IncrGuard { n: &mut guard.n };
-
-                let cqe = unsafe { &mut *cqe };
-
-                if cqe.user_data == 0 {
-                    return;
-                }
-
-                if cqe.user_data == 1 {
-                    need_eventfd_read = true;
-                    return;
-                }
-
-                let key_data = cqe.user_data;
-                let key = DefaultKey::from(KeyData::from_ffi(key_data));
-
-                let mut borrow_guard = self.p.io_ops.borrow_mut();
-                let io_ops = &mut *borrow_guard;
-                let op = io_ops.get_mut(key).unwrap();
-
-                match op.op_type {
-                    OpType::Timeout { .. } => {
-                        if on_timeout(op, cqe, ring, &ex) {
-                            io_ops.remove(key).unwrap();
-                        }
-                    }
-                    OpType::TcpAccept { .. } => {
-                        let res = cqe.res;
-                        op.res = res;
-                        op.done = true;
-
-                        if op.eager_dropped {
-                            let op = io_ops.remove(key).unwrap();
-                            drop(borrow_guard);
-
-                            unsafe { release_op(op.ref_count) };
-
-                            if op.res >= 0 {
-                                let OpType::TcpAccept { fd } = op.op_type else {
-                                    unreachable!()
-                                };
-
-                                let fd = fd.try_into().unwrap();
-                                let key = ex.p
-                                            .io_ops
-                                            .borrow_mut()
-                                            .insert(make_io_uring_op(ptr::null_mut(),
-                                                                     OpType::DropClose { fd }),
-                                                    &ex);
-
-                                let sqe = get_sqe(&ex);
-                                unsafe { io_uring_prep_close_direct(sqe, fd) };
-                                unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
-                            }
-
-                            return;
-                        }
-
-                        unsafe { release_op(op.ref_count) };
-
-                        if let Some(local_waker) = op.local_waker.take() {
-                            local_waker.wake();
-                        }
-                    }
-                    OpType::TcpConnect { .. } => {
-                        let _ = ex;
-
-                        if op.eager_dropped {
-                            // if the Future was eager-dropped:
-                            // * we need to release the borrowed direct descriptor back to the pool
-                            // * if the connect() succeeded, we need to close() it
-
-                            let OpType::TcpConnect { ref mut needs_socket,
-                                                     ref mut got_socket,
-                                                     .. } = op.op_type
-                            else {
-                                unreachable!()
-                            };
-
-                            let is_last_cqe = cqe.res < 0 || *got_socket || !*needs_socket;
-
-                            if *needs_socket && !*got_socket && cqe.res >= 0 {
-                                *got_socket = true;
-                            }
-
-                            if !is_last_cqe {
-                                return;
-                            }
-
-                            let mut op = io_ops.remove(key).unwrap();
-                            let OpType::TcpConnect { ref mut needs_socket,
-                                                     ref mut got_socket,
-                                                     fd,
-                                                     .. } = op.op_type
-                            else {
-                                unreachable!()
-                            };
-
-                            drop(borrow_guard);
-
-                            // if our connect() op is borrowing an FD from the runtime,
-                            // we need to close it and return it
-                            if *needs_socket {
-                                // this means our socket() call completed with a success
-                                if *got_socket {
-                                    let sqe = get_sqe(&ex);
-
-                                    let fd = fd.try_into().unwrap();
-                                    let key = ex.p
-                                                .io_ops
-                                                .borrow_mut()
-                                                .insert(make_io_uring_op(ptr::null_mut(),
-                                                                         OpType::DropClose { fd }),
-                                                        &ex);
-
-                                    unsafe { io_uring_prep_close_direct(sqe, fd) };
-                                    unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
-                                } else {
-                                    ex.reclaim_fd(fd.try_into().unwrap());
-                                }
-                            }
-
-                            unsafe { release_op(op.ref_count) };
-                            return;
-                        }
-
-                        let OpType::TcpConnect { ref mut needs_socket,
-                                                 ref mut got_socket,
-                                                 .. } = op.op_type
-                        else {
-                            unreachable!()
-                        };
-
-                        // if we hit an error, this is our last CQE
-                        // if we don't need a socket, this is our last CQE
-                        // if we've already gotten a socket, this is our last CQE
-                        if cqe.res < 0 || !*needs_socket || *got_socket {
-                            unsafe { release_op(op.ref_count) };
-
-                            op.res = cqe.res;
-                            op.done = true;
-                            if let Some(local_waker) = op.local_waker.take() {
-                                local_waker.wake();
-                            }
-                            return;
-                        }
-
-                        // we expect one more CQE after this, the result of the actual
-                        // connect() call
-                        if *needs_socket {
-                            *got_socket = true;
-                        }
-                    }
-                    OpType::TcpSend { .. } => {
-                        let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
-
-                        if op.eager_dropped {
-                            if has_more_cqes {
-                                return;
-                            }
-
-                            let op = io_ops.remove(key).unwrap();
-                            drop(borrow_guard);
-                            unsafe { release_op(op.ref_count) };
-                            return;
-                        }
-
-                        let OpType::TcpSend { ref mut buf,
-                                              last_send, } = op.op_type
-                        else {
-                            unreachable!()
-                        };
-
-                        unsafe { *last_send = Instant::now() };
-
-                        if has_more_cqes {
-                            op.res = cqe.res;
-                            if cqe.res >= 0 {
-                                let n: usize = cqe.res.try_into().unwrap();
-                                buf.drain(0..n);
-                            }
-                            return;
-                        }
-
-                        assert!(cqe.flags & IORING_CQE_F_NOTIF > 0);
-                        op.done = true;
-
-                        unsafe { release_op(op.ref_count) };
-
-                        if let Some(local_waker) = op.local_waker.take() {
-                            local_waker.wake();
-                        }
-                    }
-                    OpType::TcpClose | OpType::TcpShutdown | OpType::TcpCancel => {
-                        op.done = true;
-                        op.res = cqe.res;
-
-                        if op.eager_dropped {
-                            let op = io_ops.remove(key).unwrap();
-
-                            drop(borrow_guard);
-
-                            let rc = op.ref_count;
-                            unsafe { release_op(rc) };
-                            return;
-                        }
-
-                        unsafe { release_op(op.ref_count) };
-                        if let Some(local_waker) = op.local_waker.take() {
-                            local_waker.wake();
-                        }
-                    }
-                    OpType::MultishotTcpRecv { .. } => {
-                        let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
-                        let OpType::MultishotTcpRecv { ref mut bufs,
-                                                       buf_group,
-                                                       last_recv, } = op.op_type
-                        else {
-                            unreachable!()
-                        };
-
-                        if op.eager_dropped {
-                            if cqe.res > 0 {
-                                unsafe { append_recv_buffers(buf_group, cqe, bufs) };
-                            }
-
-                            if has_more_cqes {
-                                return;
-                            }
-
-                            op.done = true;
-
-                            let op = io_ops.remove(key).unwrap();
-                            assert!(op.done);
-
-                            drop(borrow_guard);
-                            let rc = op.ref_count;
-                            unsafe { release_op(rc) };
-
-                            return;
-                        }
-
-                        if !has_more_cqes {
-                            op.done = true;
-                            unsafe { release_op(op.ref_count) };
-                        }
-
-                        unsafe { *last_recv = Instant::now() };
-
-                        op.res = cqe.res;
-                        if cqe.res > 0 {
-                            unsafe { append_recv_buffers(buf_group, cqe, bufs) };
-                        }
-
-                        if let Some(local_waker) = op.local_waker.take() {
-                            local_waker.wake();
-                        }
-                    }
-                    OpType::MultishotTimeout { .. } => {
-                        let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
-                        let io_object_dropped = op.eager_dropped;
-                        if io_object_dropped {
-                            if has_more_cqes {
-                                return;
-                            }
-
-                            let op = io_ops.remove(key).unwrap();
-
-                            drop(borrow_guard);
-
-                            unsafe { release_op(op.ref_count) };
-                            return;
-                        }
-
-                        if !has_more_cqes {
-                            unimplemented!();
-                            // let user_data: *mut IoUringOp = &raw mut *op;
-                            // let user_data = user_data.cast();
-
-                            // let OpType::MultishotTimeout { ref mut ts, .. } =
-                            // op.op_type else {
-                            //     unreachable!()
-                            // };
-
-                            // let ts = ptr::from_mut(ts).cast();
-
-                            // let sqe = get_sqe(ex);
-                            // unsafe { io_uring_prep_timeout(sqe, ts, 0,
-                            // IORING_TIMEOUT_MULTISHOT) };
-                            // unsafe { io_uring_sqe_set_data(sqe, user_data) };
-                        }
-
-                        if cqe.res != -ETIME {
-                            assert!(!has_more_cqes);
-                            return;
-                        }
-
-                        let OpType::MultishotTimeout { ref mut ts, stream } = op.op_type else {
-                            unreachable!()
-                        };
-
-                        let dur = Duration::new(ts.tv_sec.try_into().unwrap(),
-                                                ts.tv_nsec.try_into().unwrap());
-
-                        let now = Instant::now();
-                        let stream_impl = unsafe { &mut *stream };
-
-                        let recv_expired = stream_impl.recv_op.is_some()
-                                           && now.duration_since(stream_impl.last_recv) > dur;
-
-                        let send_expired = stream_impl.send_pending
-                                           && now.duration_since(stream_impl.last_send) > dur;
-
-                        if recv_expired || send_expired {
-                            let sqe = get_sqe(&ex);
-                            let fd = stream_impl.fd;
-                            let flags = IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED;
-                            unsafe { io_uring_prep_cancel_fd(sqe, fd, flags) };
-                            unsafe { io_uring_sqe_set_data64(sqe, 0) };
-                            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-                        }
-                    }
-                    OpType::TimeoutCancel => todo!(),
-                    OpType::DropCancel => {
-                        let op = io_ops.remove(key).unwrap();
-                        drop(borrow_guard);
-                        unsafe { release_op(op.ref_count) };
-                    }
-                    OpType::DropClose { fd } => {
-                        let _op = io_ops.remove(key).unwrap();
-                        drop(borrow_guard);
-                        ex.reclaim_fd(fd);
-                    }
-                }
+            let f = |cqe: *mut io_uring_cqe| {
+                unsafe { on_cqe(&ex, cqe, &mut guard, &mut need_eventfd_read) };
             };
 
-            unsafe { io_uring_for_each_cqe(ring, on_cqe) };
+            unsafe { io_uring_for_each_cqe(ring, f) };
         }
 
         num_completed
     }
 }
 
-fn on_timeout(op: &mut IoUringOp, cqe: &mut io_uring_cqe, _ring: *mut io_uring, ex: &Executor)
-              -> bool
+unsafe fn on_cqe(ex: &Executor, cqe: *mut io_uring_cqe, guard: &mut CQEAdvanceGuard,
+                 need_eventfd_read: &mut bool)
 {
-    let _ = ex;
-    unsafe { release_op(op.ref_count) };
+    let _g = IncrGuard { n: &mut guard.n };
+
+    let cqe = unsafe { &mut *cqe };
+
+    if cqe.user_data == 0 {
+        return;
+    }
+
+    if cqe.user_data == 1 {
+        *need_eventfd_read = true;
+        return;
+    }
+
+    let cqe_handler = {
+        let key_data = cqe.user_data;
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+        let mut borrow_guard = ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *borrow_guard;
+        let op = io_ops.get(key).unwrap();
+        get_cqe_handler(op)
+    };
+
+    (cqe_handler)(ex, cqe);
+}
+
+fn on_work_item(weak: Weak, ex: &Executor) -> u64
+{
+    match unsafe { weak.upgrade() } {
+        None => 0,
+        Some(mut task) => {
+            let w = make_waker(weak.clone());
+            let lw = make_local_waker(weak);
+
+            let mut cx = ContextBuilder::from_waker(&w).local_waker(&lw).build();
+
+            if let Poll::Ready(()) = task.poll(&mut cx) {
+                ex.p.tasks.borrow_mut().remove(&task);
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn get_cqe_handler(op: &IoUringOp) -> CqeHandler
+{
+    match &op.op_type {
+        OpType::Timeout { .. } => on_timeout,
+        OpType::TimeoutCancel => todo!(),
+        OpType::MultishotTimeout { .. } => on_timeout_multishot,
+        OpType::TcpAccept { .. } => on_tcp_accept,
+        OpType::TcpConnect { .. } => on_tcp_connect,
+        OpType::TcpSend { .. } => on_tcp_send,
+        OpType::MultishotTcpRecv { .. } => on_tcp_multishot_recv,
+        OpType::TcpShutdown | OpType::TcpClose | OpType::TcpCancel => on_tcp_close,
+        OpType::DropCancel => on_drop_cancel,
+        OpType::DropClose { .. } => on_drop_close,
+    }
+}
+
+fn on_timeout(ex: &Executor, cqe: &mut io_uring_cqe)
+{
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.get_mut(key).unwrap();
 
     op.done = true;
     op.res = cqe.res;
     if op.eager_dropped {
-        return true;
+        let op = io_ops.remove(key).unwrap();
+        drop(borrow_guard);
+
+        unsafe { release_op(op.ref_count) };
+        return;
+    }
+
+    unsafe { release_op(op.ref_count) };
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
+    }
+}
+
+fn on_tcp_accept(ex: &Executor, cqe: &mut io_uring_cqe)
+{
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.get_mut(key).unwrap();
+
+    let res = cqe.res;
+    op.res = res;
+    op.done = true;
+
+    if op.eager_dropped {
+        let op = io_ops.remove(key).unwrap();
+        drop(borrow_guard);
+
+        unsafe { release_op(op.ref_count) };
+
+        if op.res >= 0 {
+            let OpType::TcpAccept { fd } = op.op_type else {
+                unreachable!()
+            };
+
+            let fd = fd.try_into().unwrap();
+            let key = ex.p
+                        .io_ops
+                        .borrow_mut()
+                        .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), ex);
+
+            let sqe = get_sqe(ex);
+            unsafe { io_uring_prep_close_direct(sqe, fd) };
+            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+        }
+
+        return;
+    }
+
+    unsafe { release_op(op.ref_count) };
+
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
+    }
+}
+
+fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
+{
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.get_mut(key).unwrap();
+
+    if op.eager_dropped {
+        // if the Future was eager-dropped:
+        // * we need to release the borrowed direct descriptor back to the pool
+        // * if the connect() succeeded, we need to close() it
+
+        let OpType::TcpConnect { ref mut needs_socket,
+                                 ref mut got_socket,
+                                 .. } = op.op_type
+        else {
+            unreachable!()
+        };
+
+        let is_last_cqe = cqe.res < 0 || *got_socket || !*needs_socket;
+
+        if *needs_socket && !*got_socket && cqe.res >= 0 {
+            *got_socket = true;
+        }
+
+        if !is_last_cqe {
+            return;
+        }
+
+        let mut op = io_ops.remove(key).unwrap();
+        let OpType::TcpConnect { ref mut needs_socket,
+                                 ref mut got_socket,
+                                 fd,
+                                 .. } = op.op_type
+        else {
+            unreachable!()
+        };
+
+        drop(borrow_guard);
+
+        // if our connect() op is borrowing an FD from the runtime,
+        // we need to close it and return it
+        if *needs_socket {
+            // this means our socket() call completed with a success
+            if *got_socket {
+                let sqe = get_sqe(ex);
+
+                let fd = fd.try_into().unwrap();
+                let key =
+                    ex.p
+                      .io_ops
+                      .borrow_mut()
+                      .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), ex);
+
+                unsafe { io_uring_prep_close_direct(sqe, fd) };
+                unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+            } else {
+                ex.reclaim_fd(fd.try_into().unwrap());
+            }
+        }
+
+        unsafe { release_op(op.ref_count) };
+        return;
+    }
+
+    let OpType::TcpConnect { ref mut needs_socket,
+                             ref mut got_socket,
+                             .. } = op.op_type
+    else {
+        unreachable!()
+    };
+
+    // if we hit an error, this is our last CQE
+    // if we don't need a socket, this is our last CQE
+    // if we've already gotten a socket, this is our last CQE
+    if cqe.res < 0 || !*needs_socket || *got_socket {
+        unsafe { release_op(op.ref_count) };
+
+        op.res = cqe.res;
+        op.done = true;
+        if let Some(local_waker) = op.local_waker.take() {
+            local_waker.wake();
+        }
+        return;
+    }
+
+    // we expect one more CQE after this, the result of the actual
+    // connect() call
+    if *needs_socket {
+        *got_socket = true;
+    }
+}
+
+fn on_tcp_send(ex: &Executor, cqe: &mut io_uring_cqe)
+{
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.get_mut(key).unwrap();
+
+    let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
+
+    if op.eager_dropped {
+        if has_more_cqes {
+            return;
+        }
+
+        let op = io_ops.remove(key).unwrap();
+        drop(borrow_guard);
+        unsafe { release_op(op.ref_count) };
+        return;
+    }
+
+    let OpType::TcpSend { ref mut buf,
+                          last_send, } = op.op_type
+    else {
+        unreachable!()
+    };
+
+    unsafe { *last_send = Instant::now() };
+
+    if has_more_cqes {
+        op.res = cqe.res;
+        if cqe.res >= 0 {
+            let n: usize = cqe.res.try_into().unwrap();
+            buf.drain(0..n);
+        }
+        return;
+    }
+
+    assert!(cqe.flags & IORING_CQE_F_NOTIF > 0);
+    op.done = true;
+
+    unsafe { release_op(op.ref_count) };
+
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
+    }
+}
+
+fn on_tcp_close(ex: &Executor, cqe: &mut io_uring_cqe)
+{
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.get_mut(key).unwrap();
+
+    op.done = true;
+    op.res = cqe.res;
+
+    if op.eager_dropped {
+        let op = io_ops.remove(key).unwrap();
+
+        drop(borrow_guard);
+
+        let rc = op.ref_count;
+        unsafe { release_op(rc) };
+        return;
+    }
+
+    unsafe { release_op(op.ref_count) };
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
+    }
+}
+
+fn on_tcp_multishot_recv(ex: &Executor, cqe: &mut io_uring_cqe)
+{
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.get_mut(key).unwrap();
+
+    let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
+    let OpType::MultishotTcpRecv { ref mut bufs,
+                                   buf_group,
+                                   last_recv, } = op.op_type
+    else {
+        unreachable!()
+    };
+
+    if op.eager_dropped {
+        if cqe.res > 0 {
+            unsafe { append_recv_buffers(buf_group, cqe, bufs) };
+        }
+
+        if has_more_cqes {
+            return;
+        }
+
+        op.done = true;
+
+        let op = io_ops.remove(key).unwrap();
+        assert!(op.done);
+
+        drop(borrow_guard);
+        let rc = op.ref_count;
+        unsafe { release_op(rc) };
+
+        return;
+    }
+
+    if !has_more_cqes {
+        op.done = true;
+        unsafe { release_op(op.ref_count) };
+    }
+
+    unsafe { *last_recv = Instant::now() };
+
+    op.res = cqe.res;
+    if cqe.res > 0 {
+        unsafe { append_recv_buffers(buf_group, cqe, bufs) };
     }
 
     if let Some(local_waker) = op.local_waker.take() {
         local_waker.wake();
     }
+}
 
-    false
+fn on_timeout_multishot(ex: &Executor, cqe: &mut io_uring_cqe)
+{
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.get_mut(key).unwrap();
+
+    let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
+    let io_object_dropped = op.eager_dropped;
+    if io_object_dropped {
+        if has_more_cqes {
+            return;
+        }
+
+        let op = io_ops.remove(key).unwrap();
+
+        drop(borrow_guard);
+
+        unsafe { release_op(op.ref_count) };
+        return;
+    }
+
+    if !has_more_cqes {
+        unimplemented!();
+        // let user_data: *mut IoUringOp = &raw mut *op;
+        // let user_data = user_data.cast();
+
+        // let OpType::MultishotTimeout { ref mut ts, .. } =
+        // op.op_type else {
+        //     unreachable!()
+        // };
+
+        // let ts = ptr::from_mut(ts).cast();
+
+        // let sqe = get_sqe(ex);
+        // unsafe { io_uring_prep_timeout(sqe, ts, 0,
+        // IORING_TIMEOUT_MULTISHOT) };
+        // unsafe { io_uring_sqe_set_data(sqe, user_data) };
+    }
+
+    if cqe.res != -ETIME {
+        assert!(!has_more_cqes);
+        return;
+    }
+
+    let OpType::MultishotTimeout { ref mut ts, stream } = op.op_type else {
+        unreachable!()
+    };
+
+    let dur = Duration::new(ts.tv_sec.try_into().unwrap(), ts.tv_nsec.try_into().unwrap());
+
+    let now = Instant::now();
+    let stream_impl = unsafe { &mut *stream };
+
+    let recv_expired =
+        stream_impl.recv_op.is_some() && now.duration_since(stream_impl.last_recv) > dur;
+
+    let send_expired = stream_impl.send_pending && now.duration_since(stream_impl.last_send) > dur;
+
+    if recv_expired || send_expired {
+        let sqe = get_sqe(ex);
+        let fd = stream_impl.fd;
+        let flags = IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED;
+        unsafe { io_uring_prep_cancel_fd(sqe, fd, flags) };
+        unsafe { io_uring_sqe_set_data64(sqe, 0) };
+        unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+    }
+}
+
+fn on_drop_cancel(ex: &Executor, cqe: &mut io_uring_cqe)
+{
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.remove(key).unwrap();
+    drop(borrow_guard);
+    unsafe { release_op(op.ref_count) };
+}
+
+fn on_drop_close(ex: &Executor, cqe: &mut io_uring_cqe)
+{
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.remove(key).unwrap();
+    let OpType::DropClose { fd } = op.op_type else {
+        unreachable!()
+    };
+
+    drop(borrow_guard);
+    ex.reclaim_fd(fd);
 }
 
 unsafe fn append_recv_buffers(buf_group: *mut BufGroup, cqe: &mut io_uring_cqe,
