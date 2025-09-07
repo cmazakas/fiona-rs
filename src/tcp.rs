@@ -233,40 +233,22 @@ impl Future for AcceptFuture<'_>
         assert!(!self.completed);
 
         let acceptor_impl = unsafe { &mut *self.acceptor.p.as_ptr() };
+
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let mut refmut = acceptor_impl.ex.p.io_ops.borrow_mut();
-        let io_ops = &mut *refmut;
+
+        let mut borrow_guard = acceptor_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *borrow_guard;
         let op = io_ops.get_mut(key).unwrap();
 
         match (op.initiated, op.done) {
-            (true, true) => {
-                self.completed = true;
-
-                let res = op.res;
-
-                if res < 0 {
-                    let res = -res;
-                    Poll::Ready(Err(Errno::from_raw(res)))
-                } else {
-                    let OpType::TcpAccept { fd } = op.op_type else {
-                        unreachable!()
-                    };
-
-                    drop(refmut);
-                    Poll::Ready(Ok(Stream::new(acceptor_impl.ex.clone(), fd)))
-                }
-            }
             (true, false) => {
                 op.local_waker = Some(cx.local_waker().clone());
                 Poll::Pending
             }
             (false, true) => unreachable!(),
             (false, false) => {
-                let ring = acceptor_impl.ex.ring();
-
-                let mfile_index = acceptor_impl.ex.get_available_fd();
-                let Some(file_index) = mfile_index else {
+                let Some(file_index) = acceptor_impl.ex.get_available_fd() else {
                     self.completed = true;
                     return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                 };
@@ -279,7 +261,7 @@ impl Future for AcceptFuture<'_>
                     *fd = file_index.try_into().unwrap();
                 }
 
-                let sqe = crate::get_sqe(&acceptor_impl.ex);
+                let sqe = get_sqe(&acceptor_impl.ex);
 
                 unsafe {
                     io_uring_prep_accept_direct(sqe,
@@ -297,6 +279,23 @@ impl Future for AcceptFuture<'_>
                 op.initiated = true;
                 Poll::Pending
             }
+            (true, true) => {
+                self.completed = true;
+
+                let res = op.res;
+
+                if res < 0 {
+                    let res = -res;
+                    Poll::Ready(Err(Errno::from_raw(res)))
+                } else {
+                    let OpType::TcpAccept { fd } = op.op_type else {
+                        unreachable!()
+                    };
+
+                    drop(borrow_guard);
+                    Poll::Ready(Ok(Stream::new(acceptor_impl.ex.clone(), fd)))
+                }
+            }
         }
     }
 }
@@ -310,7 +309,9 @@ impl Drop for AcceptFuture<'_>
 
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let io_ops = &mut *acceptor_impl.ex.p.io_ops.borrow_mut();
+
+        let mut borrow_guard = acceptor_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *borrow_guard;
         let op = io_ops.get_mut(key).unwrap();
 
         if op.initiated && !op.done {
@@ -318,22 +319,23 @@ impl Drop for AcceptFuture<'_>
             // io_uring needs our operation state to stay alive, thus we must leak.
             // But first, we attempt cancellation across the board for our file descriptor
 
-            let ring = acceptor_impl.ex.ring();
-            let sqe = crate::get_sqe(&acceptor_impl.ex);
+            op.eager_dropped = true;
+            op.local_waker = None;
 
+            let ref_count = &raw mut acceptor_impl.ref_count;
+            let key =
+                io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel), &acceptor_impl.ex);
+
+            unsafe { add_op_ref(ref_count) };
+
+            let sqe = get_sqe(&acceptor_impl.ex);
             unsafe {
                 io_uring_prep_cancel_fd(sqe,
                                         acceptor_impl.fd,
                                         IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED);
             }
+            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
 
-            unsafe { io_uring_sqe_set_data64(sqe, 0) };
-            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-
-            // TODO: same as TimerFuture::drop() comments
-
-            op.eager_dropped = true;
-            op.local_waker = None;
             self.op = None;
             return;
         }
@@ -343,22 +345,24 @@ impl Drop for AcceptFuture<'_>
             // we're still eager-dropping the Future (i.e. it never returned Poll::Ready).
             // Because the user is never going to retrieve the RAII handle to the accepted
             // connection, we have to remember to close it manually.
-
             assert!(op.initiated);
             assert!(op.done);
 
             let fd = op.res.try_into().unwrap();
 
-            let ring = acceptor_impl.ex.ring();
+            io_ops.remove(key).unwrap();
+            drop(borrow_guard);
 
-            let sqe = get_sqe(&acceptor_impl.ex);
-            unsafe {
-                io_uring_prep_close_direct(sqe, fd);
-                io_uring_sqe_set_data64(sqe, 0);
-                io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
-            }
+            let ex = &acceptor_impl.ex;
+            let key = ex.p
+                        .io_ops
+                        .borrow_mut()
+                        .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), ex);
 
-            acceptor_impl.ex.reclaim_fd(fd);
+            let sqe = get_sqe(ex);
+            unsafe { io_uring_prep_close_direct(sqe, fd) };
+            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+            return;
         }
 
         io_ops.remove(key).unwrap();
@@ -1016,22 +1020,28 @@ impl Drop for ConnectFuture<'_>
         let client_impl = unsafe { &mut *self.client.p.as_ptr() };
         client_impl.connect_pending = false;
 
-        let key_data = self.op.unwrap();
-        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let op_cancel_key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(op_cancel_key_data));
         let io_ops = &mut *client_impl.stream.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         if op.initiated && !op.done {
             op.eager_dropped = true;
+            op.local_waker = None;
 
-            let user_data = key_data;
+            let user_data = op_cancel_key_data;
+
+            let ref_count = &raw mut client_impl.stream.ref_count;
+            let key = io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel),
+                                    &client_impl.stream.ex);
+
+            unsafe { add_op_ref(ref_count) };
 
             let ring = client_impl.stream.ex.ring();
             let sqe = crate::get_sqe(&client_impl.stream.ex);
 
             unsafe { io_uring_prep_cancel64(sqe, user_data, IORING_ASYNC_CANCEL_ALL as i32) };
-            unsafe { io_uring_sqe_set_data64(sqe, 0) };
-            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
 
             self.op = None;
         } else {
@@ -1056,8 +1066,8 @@ impl Drop for SendFuture<'_>
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
         stream_impl.send_pending = false;
 
-        let key_data = self.op.unwrap();
-        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let op_cancel_key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(op_cancel_key_data));
         let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
@@ -1072,9 +1082,8 @@ impl Drop for SendFuture<'_>
             unsafe { add_op_ref(ref_count) };
 
             let sqe = get_sqe(&stream_impl.ex);
-            let user_data = key.data().as_ffi();
-            unsafe { io_uring_prep_cancel64(sqe, key_data, 0) };
-            unsafe { io_uring_sqe_set_data64(sqe, user_data) };
+            unsafe { io_uring_prep_cancel64(sqe, op_cancel_key_data, 0) };
+            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
 
             self.op = None;
         } else {
