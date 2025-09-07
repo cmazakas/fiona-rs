@@ -10,6 +10,7 @@ use crate::{
     BorrowedBufs, Executor, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
     make_io_uring_op, release_impl, release_obj, reserve_sqes,
 };
+use core::panic;
 use liburing_rs::{
     __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
     IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT,
@@ -717,6 +718,13 @@ impl Client
         Stream { p: unsafe { NonNull::new_unchecked(p) } }
     }
 
+    #[must_use]
+    pub fn get_executor(&self) -> Executor
+    {
+        let client_impl = unsafe { &mut *self.p.as_ptr() };
+        client_impl.stream.ex.clone()
+    }
+
     pub fn set_buf_group(&self, bgid: u16)
     {
         let stream_impl = unsafe { &mut (*self.p.as_ptr()).stream };
@@ -1022,7 +1030,9 @@ impl Drop for ConnectFuture<'_>
 
         let op_cancel_key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(op_cancel_key_data));
-        let io_ops = &mut *client_impl.stream.ex.p.io_ops.borrow_mut();
+
+        let mut borrow_guard = client_impl.stream.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *borrow_guard;
         let op = io_ops.get_mut(key).unwrap();
 
         if op.initiated && !op.done {
@@ -1044,9 +1054,42 @@ impl Drop for ConnectFuture<'_>
             unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
 
             self.op = None;
-        } else {
-            io_ops.remove(key).unwrap();
+            return;
         }
+
+        let OpType::TcpConnect { needs_socket,
+                                 got_socket,
+                                 fd,
+                                 .. } = op.op_type
+        else {
+            unreachable!();
+        };
+
+        if !self.completed && needs_socket && got_socket {
+            assert!(op.initiated);
+            assert!(op.done);
+
+            let fd = fd.try_into().unwrap();
+
+            io_ops.remove(key).unwrap();
+            drop(borrow_guard);
+
+            let ex = &client_impl.stream.ex;
+            let key = ex.p
+                        .io_ops
+                        .borrow_mut()
+                        .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), ex);
+
+            let sqe = get_sqe(ex);
+            unsafe { io_uring_prep_close_direct(sqe, fd) };
+            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+
+            self.op = None;
+
+            return;
+        }
+
+        io_ops.remove(key).unwrap();
     }
 }
 

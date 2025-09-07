@@ -1465,3 +1465,54 @@ fn tcp_eager_drop_send_ready()
     let n = ioc.run();
     assert_eq!(n, 3);
 }
+
+#[test]
+fn tcp_eager_drop_connect_ready()
+{
+    // Test the code path that we've seen the CQE for a successful connect but
+    // we never poll() the Future to completion, which means that the connected
+    // client FD be closed.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.clone().spawn(server(acceptor));
+    ex.clone().spawn(client(ex.clone(), port));
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+
+    async fn client(ex: fiona::Executor, port: u16)
+    {
+        let client = fiona::tcp::Client::new(ex);
+        let mut connect_future = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
+        let w = WakerFuture.await;
+        let mut cx = std::task::Context::from_waker(&w);
+
+        assert!(std::pin::pin!(&mut connect_future).poll(&mut cx)
+                                                   .is_pending());
+
+        let timer = fiona::time::Timer::new(client.get_executor());
+        timer.wait(Duration::from_millis(250)).await.unwrap();
+
+        drop(connect_future);
+        timer.wait(Duration::from_millis(250)).await.unwrap();
+
+        client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+              .await
+              .unwrap();
+    }
+
+    async fn server(acceptor: fiona::tcp::Acceptor)
+    {
+        let stream = acceptor.accept().await.unwrap();
+        let timer = fiona::time::Timer::new(stream.get_executor());
+        timer.wait(Duration::from_millis(500)).await.unwrap();
+
+        let stream = acceptor.accept().await.unwrap();
+        let _ = stream;
+    }
+}
