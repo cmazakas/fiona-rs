@@ -1246,6 +1246,7 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
 
     let OpType::TcpConnect { ref mut needs_socket,
                              ref mut got_socket,
+                             ref mut fd,
                              .. } = op.op_type
     else {
         unreachable!()
@@ -1259,9 +1260,37 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
 
         op.res = cqe.res;
         op.done = true;
+
         if let Some(local_waker) = op.local_waker.take() {
             local_waker.wake();
         }
+
+        // if our connect() op is borrowing an FD from the runtime,
+        // we need to close it and return it
+        if cqe.res < 0 && *needs_socket {
+            let reclaimed_fd = (*fd).try_into().unwrap();
+            *fd = -1;
+
+            // this means our socket() call completed with a success
+            if *got_socket {
+                drop(borrow_guard);
+
+                let sqe = get_sqe(ex);
+
+                let key = ex.p
+                            .io_ops
+                            .borrow_mut()
+                            .insert(make_io_uring_op(ptr::null_mut(),
+                                                     OpType::DropClose { fd: reclaimed_fd }),
+                                    ex);
+
+                unsafe { io_uring_prep_close_direct(sqe, reclaimed_fd) };
+                unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+            } else {
+                ex.reclaim_fd(reclaimed_fd);
+            }
+        }
+
         return;
     }
 

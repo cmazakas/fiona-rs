@@ -59,27 +59,9 @@ pub(crate) struct StreamImpl
     timeout_op: Option<u64>,
 }
 
-struct ClientImpl
-{
-    stream: StreamImpl,
-    connect_pending: bool,
-}
-
 pub struct Stream
 {
     p: NonNull<StreamImpl>,
-}
-
-pub struct Client
-{
-    p: NonNull<ClientImpl>,
-}
-
-pub struct ConnectFuture<'a>
-{
-    client: &'a Client,
-    completed: bool,
-    op: Option<u64>,
 }
 
 pub struct RecvFuture<'a>
@@ -619,6 +601,17 @@ impl Stream
 
 //-----------------------------------------------------------------------------
 
+pub struct Client
+{
+    p: NonNull<ClientImpl>,
+}
+
+struct ClientImpl
+{
+    stream: StreamImpl,
+    connect_pending: bool,
+}
+
 impl Client
 {
     #[must_use]
@@ -877,6 +870,13 @@ impl Drop for Client
 
 //-----------------------------------------------------------------------------
 
+pub struct ConnectFuture<'a>
+{
+    client: &'a Client,
+    completed: bool,
+    op: Option<u64>,
+}
+
 impl Future for ConnectFuture<'_>
 {
     type Output = Result<()>;
@@ -913,8 +913,6 @@ impl Future for ConnectFuture<'_>
                 else {
                     unreachable!();
                 };
-
-                assert!(*fd < 0);
 
                 let (af, addrlen) = {
                     if let Some(x) = addr.as_sockaddr_in() {
@@ -995,11 +993,8 @@ impl Future for ConnectFuture<'_>
                     unreachable!();
                 };
 
-                if needs_socket && got_socket {
-                    if client_impl.stream.fd >= 0 {
-                        todo!();
-                    }
-
+                if needs_socket && got_socket && op.res >= 0 {
+                    assert!(client_impl.stream.fd < 0);
                     client_impl.stream.fd = fd;
                 }
 
