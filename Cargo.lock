@@ -84,8 +84,8 @@ checksum = "ace50bade8e6234aa140d9a2f552bbee1db4d353f69b8217bc503490fc1a9f26"
 
 [[package]]
 name = "axboe-liburing"
-version = "2.12.0"
-source = "git+https://github.com/cmazakas/liburing.git?rev=3cd827edb4ba2712a1bd509873d4534212ff2135#3cd827edb4ba2712a1bd509873d4534212ff2135"
+version = "2.13.0"
+source = "git+https://github.com/cmazakas/liburing.git?rev=7e3ff59e14bb99fbc024a9365ad6687cbae6ebe4#7e3ff59e14bb99fbc024a9365ad6687cbae6ebe4"
 dependencies = [
  "bindgen",
 ]
