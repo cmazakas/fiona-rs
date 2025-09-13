@@ -682,7 +682,7 @@ enum OpType
     TcpConnect
     {
         addr: SockaddrStorage,
-        port: u16,
+        _port: u16,
         ts: __kernel_timespec,
         needs_socket: bool,
         got_socket: bool,
