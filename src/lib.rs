@@ -20,6 +20,7 @@ extern crate nix;
 
 use std::{
     alloc::Layout,
+    any::Any,
     cell::{RefCell, UnsafeCell},
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
@@ -100,13 +101,27 @@ struct TaskHeader
     strong: UnsafeCell<u64>,
     weak: AlignedAtomicU64,
     task_layout: Layout,
-    value_offset: usize,
-    future_offset: usize,
-    value_vtable: DynMetadata<dyn Erased>,
+    value_vtable: DynMetadata<dyn Any>,
     future_vtable: DynMetadata<dyn Future<Output = ()> + 'static>,
     sender: Option<Sender<Weak>>,
     event_fd: i32,
     ex: DanglingExecutor,
+}
+
+impl TaskHeader
+{
+    fn value_layout(&self) -> (Layout, usize)
+    {
+        Layout::new::<TaskHeader>().extend(self.value_vtable.layout())
+                                   .unwrap()
+    }
+    fn future_layout(&self) -> (Layout, usize)
+    {
+        self.value_layout()
+            .0
+            .extend(self.future_vtable.layout())
+            .unwrap()
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -117,9 +132,6 @@ struct Task
     phantom: PhantomData<dyn Future<Output = ()> + 'static>,
 }
 
-trait Erased {}
-impl<T> Erased for T {}
-
 impl Task
 {
     fn task_header(&self) -> &TaskHeader
@@ -129,7 +141,7 @@ impl Task
 
     fn get_future(&mut self) -> Pin<&mut (dyn Future<Output = ()> + 'static)>
     {
-        let offset = self.task_header().future_offset;
+        let offset = self.task_header().future_layout().1;
         let p = unsafe {
             std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(self.p
                                                                                   .as_ptr()
@@ -164,15 +176,14 @@ impl Drop for Task
             return;
         }
 
-        let future_offset = self.task_header().future_offset;
+        let future_offset = self.task_header().future_layout().1;
         let future = unsafe { self.p.add(future_offset).as_ptr() };
         let future =
             std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(future,
                                                                               self.task_header()
                                                                                   .future_vtable);
-        let value = unsafe { self.p.add(self.task_header().value_offset).as_ptr() };
-        let value =
-            std::ptr::from_raw_parts_mut::<dyn Erased>(value, self.task_header().value_vtable);
+        let value = unsafe { self.p.add(self.task_header().value_layout().1).as_ptr() };
+        let value = std::ptr::from_raw_parts_mut::<dyn Any>(value, self.task_header().value_vtable);
 
         unsafe { std::ptr::drop_in_place(value) };
         unsafe { std::ptr::drop_in_place(future) };
@@ -600,12 +611,12 @@ mod io_ops
 struct IoContextFrame
 {
     ioring: RefCell<io_uring>,
-    params: RefCell<io_uring_params>,
+    params: io_uring_params,
     available_fds: RefCell<VecDeque<u32>>,
     tasks: RefCell<HashSet<Task>>,
-    receiver: RefCell<Receiver<Weak>>,
-    sender: RefCell<Sender<Weak>>,
-    event_fd: RefCell<EventFd>,
+    receiver: Receiver<Weak>,
+    sender: Sender<Weak>,
+    event_fd: EventFd,
     buf_groups: RefCell<HashMap<u16, Box<UnsafeCell<BufGroup>>>>,
     runguard_blacklist: RefCell<HashSet<u64>>,
     local_task_queue: RefCell<VecDeque<Weak>>,
@@ -928,18 +939,17 @@ impl IoContext
 
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 
-        let ioc_frame =
-            IoContextFrame { params: RefCell::new(params),
-                             tasks: RefCell::new(HashSet::new()),
-                             available_fds: RefCell::new(VecDeque::new()),
-                             receiver: RefCell::new(rx),
-                             sender: RefCell::new(tx),
-                             ioring: RefCell::new(ioring),
-                             event_fd: RefCell::new(nix::sys::eventfd::EventFd::new().unwrap()),
-                             buf_groups: RefCell::new(HashMap::new()),
-                             runguard_blacklist: RefCell::new(HashSet::new()),
-                             local_task_queue: RefCell::new(VecDeque::new()),
-                             io_ops: RefCell::new(IoOpsMap::with_capacity(1024)) };
+        let ioc_frame = IoContextFrame { params,
+                                         tasks: RefCell::new(HashSet::new()),
+                                         available_fds: RefCell::new(VecDeque::new()),
+                                         receiver: rx,
+                                         sender: tx,
+                                         ioring: RefCell::new(ioring),
+                                         event_fd: nix::sys::eventfd::EventFd::new().unwrap(),
+                                         buf_groups: RefCell::new(HashMap::new()),
+                                         runguard_blacklist: RefCell::new(HashSet::new()),
+                                         local_task_queue: RefCell::new(VecDeque::new()),
+                                         io_ops: RefCell::new(IoOpsMap::with_capacity(1024)) };
 
         let p = Rc::new(ioc_frame);
 
@@ -982,7 +992,7 @@ impl IoContext
 
         let mut num_completed = 0;
 
-        let event_fd = self.p.event_fd.borrow().as_raw_fd();
+        let event_fd = self.p.event_fd.as_raw_fd();
         let mut event_count = 0_u64;
 
         let ex = self.get_executor();
@@ -995,8 +1005,8 @@ impl IoContext
                 break;
             }
 
-            let (local_task, task) = (self.p.local_task_queue.borrow_mut().pop_front(),
-                                      self.p.receiver.borrow_mut().try_recv());
+            let (local_task, task) =
+                (self.p.local_task_queue.borrow_mut().pop_front(), self.p.receiver.try_recv());
 
             match (local_task, task) {
                 (Some(weak1), Ok(weak2)) => {
@@ -1674,7 +1684,7 @@ impl<T> Future for SpawnFuture<T>
     {
         assert!(!self.done);
         let this = unsafe { self.get_unchecked_mut() };
-        let offset = this.task.as_ref().unwrap().task_header().value_offset;
+        let offset = this.task.as_ref().unwrap().task_header().value_layout().1;
         let spawn_value = unsafe {
             &mut *this.task
                       .as_ref()
@@ -1730,7 +1740,7 @@ impl Executor
     #[must_use]
     pub fn get_params(&self) -> IoContextParams
     {
-        let ring_params = &*self.p.params.borrow();
+        let ring_params = &self.p.params;
         let nr_files = self.p.available_fds.borrow().len() as u32;
         IoContextParams { sq_entries: ring_params.sq_entries,
                           cq_entries: ring_params.cq_entries,
@@ -1797,12 +1807,12 @@ impl Executor
 
     pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T>
     {
-        let sender = self.p.sender.borrow().clone();
-        let event_fd = self.p.event_fd.borrow().as_raw_fd();
+        let sender = self.p.sender.clone();
+        let event_fd = self.p.event_fd.as_raw_fd();
 
         let future_vtable =
             metadata::<dyn Future<Output = ()>>(std::ptr::null::<WrapperFuture<T, F>>());
-        let value_vtable = metadata::<dyn Erased>(std::ptr::null::<SpawnValue<T>>());
+        let value_vtable = metadata::<dyn Any>(std::ptr::null::<SpawnValue<T>>());
 
         let (layout, value_offset) = Layout::new::<TaskHeader>().extend(value_vtable.layout())
                                                                 .unwrap();
@@ -1811,13 +1821,11 @@ impl Executor
 
         let task_header = TaskHeader { strong: UnsafeCell::new(1),
                                        weak: AlignedAtomicU64(AtomicU64::new(1)),
-                                       value_offset,
-                                       future_offset,
                                        future_vtable,
                                        value_vtable,
                                        sender: Some(sender),
                                        event_fd,
-                                       ex: DanglingExecutor(Rc::into_raw(self.clone().p)),
+                                       ex: DanglingExecutor(Rc::into_raw(Rc::clone(&self.p))),
                                        task_layout: layout };
 
         let p = unsafe { std::alloc::alloc(layout) };
