@@ -240,8 +240,10 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                       let mut send_buf = Vec::with_capacity(16 * 1024);
                       for chunk in bytes {
                           send_buf.extend_from_slice(chunk);
-                          send_buf = client.send(send_buf).await.unwrap();
-                          assert!(send_buf.is_empty());
+                          let (num_sent, mut buf) = client.send(send_buf).await;
+                          assert_eq!(num_sent.unwrap(), buf.len());
+                          buf.clear();
+                          send_buf = buf;
                       }
 
                       while total_received < BUF_SIZE {
@@ -347,8 +349,10 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                                     let mut send_buf = Vec::with_capacity(16 * 1024);
                                     for chunk in bytes {
                                         send_buf.extend_from_slice(chunk);
-                                        send_buf = stream.send(send_buf).await.unwrap();
-                                        assert!(send_buf.is_empty());
+                                        let (num_sent, mut buf) = stream.send(send_buf).await;
+                                        assert_eq!(num_sent.unwrap(), buf.len());
+                                        buf.clear();
+                                        send_buf = buf;
                                     }
 
                                     unsafe { DURATION += start.elapsed() };

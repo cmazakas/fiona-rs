@@ -479,13 +479,15 @@ impl Stream
         let last_send = &raw mut stream_impl.last_send;
         let ref_count = &raw mut stream_impl.ref_count;
 
-        let key =
-            stream_impl.ex
-                       .p
-                       .io_ops
-                       .borrow_mut()
-                       .insert(make_io_uring_op(ref_count, OpType::TcpSend { buf, last_send }),
-                               &stream_impl.ex);
+        let key = stream_impl.ex
+                             .p
+                             .io_ops
+                             .borrow_mut()
+                             .insert(make_io_uring_op(ref_count,
+                                                      OpType::TcpSend { buf,
+                                                                        last_send,
+                                                                        num_sent: 0 }),
+                                     &stream_impl.ex);
 
         SendFuture { stream: self,
                      completed: false,
@@ -788,7 +790,7 @@ impl Client
         stream.set_timeout(dur);
     }
 
-    pub async fn send(&self, buf: Vec<u8>) -> Result<Vec<u8>>
+    pub async fn send(&self, buf: Vec<u8>) -> (Result<usize>, Vec<u8>)
     {
         let stream = self.as_stream();
         stream.send(buf).await
@@ -1126,7 +1128,7 @@ impl Drop for SendFuture<'_>
 
 impl Future for SendFuture<'_>
 {
-    type Output = Result<Vec<u8>>;
+    type Output = (Result<usize>, Vec<u8>);
 
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
             -> Poll<Self::Output>
@@ -1177,16 +1179,18 @@ impl Future for SendFuture<'_>
             (true, true) => {
                 self.completed = true;
 
-                let OpType::TcpSend { ref mut buf, .. } = op.op_type else {
+                let OpType::TcpSend { ref mut buf,
+                                      num_sent,
+                                      .. } = op.op_type
+                else {
                     unreachable!()
                 };
 
                 let res = op.res;
                 if res < 0 {
-                    Poll::Ready(Err(Errno::from_raw(-res)))
+                    Poll::Ready((Err(Errno::from_raw(-res)), std::mem::take(buf)))
                 } else {
-                    let b = std::mem::take(buf);
-                    Poll::Ready(Ok(b))
+                    Poll::Ready((Ok(num_sent), std::mem::take(buf)))
                 }
             }
         }

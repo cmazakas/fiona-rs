@@ -50,8 +50,9 @@ fn fiona_echo() -> Result<(), String>
                                         let buf = bufs.iter().next().unwrap();
                                         assert_eq!(buf, "hello, world!".as_bytes());
 
-                                        message.extend_from_slice(buf);
-                                        message = stream.send(message).await.unwrap();
+                                        let (n, msg) = stream.send(message).await;
+                                        assert!(n.is_ok());
+                                        message = msg;
                                         assert!(message.is_empty());
                                     }
 
@@ -78,8 +79,9 @@ fn fiona_echo() -> Result<(), String>
 
                           for _ in 0..NUM_MSGS {
                               message.extend_from_slice("hello, world!".as_bytes());
-                              message = client.send(message).await.unwrap();
-                              assert!(message.is_empty());
+                              let (n, msg) = client.send(message).await;
+                              assert!(n.is_ok());
+                              message = msg;
 
                               let bufs = client.recv().await.unwrap();
                               let buf = bufs.iter().next().unwrap();

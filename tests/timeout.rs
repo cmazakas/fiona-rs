@@ -39,16 +39,16 @@ fn tcp_recv_timeout()
 
             client.set_buf_group(bgid);
 
-            let msg = String::from("hello, world!");
-            let mut msg = client.send(msg.into_bytes()).await.unwrap();
-            assert!(msg.is_empty());
-            msg.extend_from_slice("hello, world!".as_bytes());
+            let mut msg = String::from("hello, world!").into_bytes();
+            let (num_sent, buf) = client.send(msg).await;
+            assert_eq!(num_sent.unwrap(), buf.len());
+            msg = buf;
 
             let timer = fiona::time::Timer::new(ex);
             timer.wait(Duration::from_millis(1000)).await.unwrap();
 
-            let msg = client.send(msg).await.unwrap();
-            assert!(msg.is_empty());
+            let (num_sent, buf) = client.send(msg).await;
+            assert_eq!(num_sent.unwrap(), buf.len());
 
             timer.wait(Duration::from_millis(750)).await.unwrap();
 
@@ -118,16 +118,16 @@ fn tcp_recv_timeout()
         let stream = acceptor.accept().await.unwrap();
         stream.set_buf_group(bgid);
 
-        let msg = String::from("wonderful day");
-        let mut msg = stream.send(msg.into_bytes()).await.unwrap();
-        assert!(msg.is_empty());
-        msg.extend_from_slice("wonderful day".as_bytes());
+        let mut msg = String::from("wonderful day").into_bytes();
+        let (num_sent, buf) = stream.send(msg).await;
+        assert_eq!(num_sent.unwrap(), buf.len());
+        msg = buf;
 
         let timer = fiona::time::Timer::new(ex);
         timer.wait(Duration::from_millis(750)).await.unwrap();
 
-        let msg = stream.send(msg).await.unwrap();
-        assert!(msg.is_empty());
+        let (num_sent, buf) = stream.send(msg).await;
+        assert_eq!(num_sent.unwrap(), buf.len());
 
         timer.wait(Duration::from_millis(750)).await.unwrap();
 

@@ -690,6 +690,7 @@ enum OpType
     },
     TcpSend
     {
+        num_sent: usize,
         buf: Vec<u8>,
         last_send: *mut Instant,
     },
@@ -1324,8 +1325,9 @@ fn on_tcp_send(ex: &Executor, cqe: &mut io_uring_cqe)
         return;
     }
 
-    let OpType::TcpSend { ref mut buf,
-                          last_send, } = op.op_type
+    let OpType::TcpSend { ref mut num_sent,
+                          last_send,
+                          .. } = op.op_type
     else {
         unreachable!()
     };
@@ -1333,15 +1335,20 @@ fn on_tcp_send(ex: &Executor, cqe: &mut io_uring_cqe)
     unsafe { *last_send = Instant::now() };
 
     if has_more_cqes {
-        op.res = cqe.res;
         if cqe.res >= 0 {
-            let n: usize = cqe.res.try_into().unwrap();
-            buf.drain(0..n);
+            *num_sent = cqe.res.try_into().unwrap();
+            op.res = cqe.res;
         }
+
+        if cqe.res < 0 {
+            op.res = cqe.res;
+        }
+
         return;
     }
 
     assert!(cqe.flags & IORING_CQE_F_NOTIF > 0);
+
     op.done = true;
 
     unsafe { release_op(op.ref_count) };

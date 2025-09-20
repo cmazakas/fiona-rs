@@ -182,8 +182,8 @@ fn tcp_send_hello_world()
           let stream = acceptor.accept().await.unwrap();
 
           let buf = String::from("hello, world!");
-          let buf = stream.send(buf.into_bytes()).await.unwrap();
-          assert!(buf.is_empty());
+          let (num_sent, buf) = stream.send(buf.into_bytes()).await;
+          assert_eq!(num_sent.unwrap(), buf.len());
 
           unsafe { NUM_RUNS += 1 };
       });
@@ -195,8 +195,8 @@ fn tcp_send_hello_world()
                         .unwrap();
 
                   let buf = String::from("i love io_uring");
-                  let buf = client.send(buf.into_bytes()).await.unwrap();
-                  assert!(buf.is_empty());
+                  let (num_sent, buf) = client.send(buf.into_bytes()).await;
+                  assert_eq!(num_sent.unwrap(), buf.len());
 
                   let timer = fiona::time::Timer::new(ex);
                   timer.wait(Duration::from_millis(250)).await.unwrap();
@@ -231,8 +231,8 @@ fn tcp_send_hello_world_throwing()
           let stream = acceptor.accept().await.unwrap();
 
           let buf = String::from("hello, world!");
-          let buf = stream.send(buf.into_bytes()).await.unwrap();
-          assert!(buf.is_empty());
+          let (num_sent, buf) = stream.send(buf.into_bytes()).await;
+          assert_eq!(num_sent.unwrap(), buf.len());
           panic!("rawr");
       });
 
@@ -311,11 +311,8 @@ fn test_accept_select_ready_always()
                          .unwrap();
 
                   let stream = acceptor.accept().await.unwrap();
-                  let buf = stream.send(String::from("rawr!").into_bytes())
-                                  .await
-                                  .unwrap();
-
-                  assert!(buf.is_empty());
+                  let (num_sent, buf) = stream.send(String::from("rawr!").into_bytes()).await;
+                  assert_eq!(num_sent.unwrap(), buf.len());
 
                   // Test the case where an accept() op completes, we see the CQE and the Future +
                   // task are still in scope so we still schedule resumption, but we never
@@ -414,7 +411,7 @@ fn tcp_send_recv_hello_world()
         assert_eq!(s, message);
 
         let msg = String::from(message).into_bytes();
-        let _msg = stream.send(msg).await.unwrap();
+        stream.send(msg).await.0.unwrap();
 
         unsafe { NUM_RUNS += 1 };
     }
@@ -429,7 +426,7 @@ fn tcp_send_recv_hello_world()
               .unwrap();
 
         let msg = String::from(message).into_bytes();
-        let _msg = client.send(msg).await.unwrap();
+        client.send(msg).await.0.unwrap();
 
         client.set_buf_group(bgid);
 
@@ -508,8 +505,7 @@ fn tcp_recv_buffer_replenishing()
 
                           acc_msg.extend_from_slice(&msg);
 
-                          let msg = stream.send(msg).await.unwrap();
-                          assert!(msg.is_empty());
+                          stream.send(msg).await.0.unwrap();
                       }
 
                       assert_eq!(acc_msg, message);
@@ -532,8 +528,7 @@ fn tcp_recv_buffer_replenishing()
 
                       for chunk in message.chunks(chunk_size) {
                           let msg = chunk.to_vec();
-                          let msg = client.send(msg).await.unwrap();
-                          assert!(msg.is_empty());
+                          client.send(msg).await.0.unwrap();
 
                           let bufs = client.recv().await.unwrap();
 
@@ -606,8 +601,7 @@ fn tcp_connection_stress_test_no_cq_overflow()
                   .unwrap();
 
             let msg_copy = message.clone();
-            let message = client.send(message).await.unwrap();
-            assert!(message.is_empty());
+            client.send(message).await.0.unwrap();
 
             client.set_buf_group(CLIENT_BGID);
 
@@ -674,12 +668,8 @@ fn tcp_connection_stress_test_no_cq_overflow()
             }
         }
 
-        let send_buf = buf;
-        assert!(!send_buf.is_empty());
-
-        let send_buf = stream.send(send_buf).await.unwrap();
-
-        assert!(send_buf.is_empty());
+        let (sent, _buf) = stream.send(buf).await;
+        assert_eq!(sent.unwrap(), MSG_LEN);
     }
 
     async fn server(ex: fiona::Executor, acceptor: fiona::tcp::Acceptor)
@@ -739,7 +729,7 @@ fn tcp_connection_stress_test_cq_overflow()
     {
         async fn client_task(ex: fiona::Executor, port: u16, idx: u32) -> u32
         {
-            let mut message = vec![0; MSG_LEN];
+            let mut message = vec![0_u8; MSG_LEN];
             {
                 let mut rng = rand::rngs::StdRng::from_os_rng();
                 rand::RngCore::fill_bytes(&mut rng, &mut message);
@@ -755,9 +745,8 @@ fn tcp_connection_stress_test_cq_overflow()
                   .await
                   .unwrap();
 
-            let msg_copy = message.clone();
-            let message = client.send(message).await.unwrap();
-            assert!(message.is_empty());
+            let (sent, message) = client.send(message).await;
+            assert_eq!(sent.unwrap(), message.len());
 
             client.set_buf_group(CLIENT_BGID);
 
@@ -776,8 +765,8 @@ fn tcp_connection_stress_test_cq_overflow()
                 }
             }
 
-            assert_eq!(buf.len(), msg_copy.len());
-            assert_eq!(buf, msg_copy);
+            assert_eq!(buf.len(), message.len());
+            assert_eq!(buf, message);
             idx
         }
 
@@ -824,12 +813,8 @@ fn tcp_connection_stress_test_cq_overflow()
             }
         }
 
-        let send_buf = buf;
-        assert!(!send_buf.is_empty());
-
-        let send_buf = stream.send(send_buf).await.unwrap();
-
-        assert!(send_buf.is_empty());
+        let (sent, _buf) = stream.send(buf).await;
+        assert_eq!(sent.unwrap(), MSG_LEN);
     }
 
     async fn server(ex: fiona::Executor, acceptor: fiona::tcp::Acceptor)
@@ -976,9 +961,11 @@ fn tcp_concurrent_send_recv()
     {
         let mut message = Vec::<u8>::with_capacity(4 * 1024);
         for buf in messages[message_idx].chunks_exact(4 * 1024) {
+            message.clear();
             message.extend_from_slice(buf);
-            message = stream.send(message).await.unwrap();
-            assert!(message.is_empty());
+            let (sent, sendbuf) = stream.send(message).await;
+            assert_eq!(sent.unwrap(), sendbuf.len());
+            message = sendbuf;
         }
     }
 
@@ -1034,6 +1021,9 @@ fn tcp_select_drop_ready_recv_future()
 {
     // Test that if we drop a recv future early and it's successfully read in a
     // buffer sequence, that we properly return the buffers back to the ring.
+    // We force a submit of the recv SQE and then drop the Future, eventually
+    // blocking on the timeouts. This ensures that we see the recv CQE when
+    // `op.eager_dropped` is true.
 
     let mut ioc = fiona::IoContext::new();
 
@@ -1096,15 +1086,12 @@ fn tcp_select_drop_ready_recv_future()
               .await
               .unwrap();
 
+        let (num_sent, msg) = client.send(String::from("hello, world!").into_bytes())
+                                    .await;
+
+        assert_eq!(num_sent.unwrap(), msg.len());
+
         let timer = fiona::time::Timer::new(ex);
-        // timer.wait(Duration::from_millis(100)).await.unwrap();
-
-        let msg = client.send(String::from("hello, world!").into_bytes())
-                        .await
-                        .unwrap();
-
-        assert!(msg.is_empty());
-
         timer.wait(Duration::from_millis(100)).await.unwrap();
     }
 
@@ -1134,7 +1121,7 @@ fn tcp_close()
         let r = stream.close().await;
         assert_eq!(r.unwrap_err(), Errno::EBADF);
 
-        let r = stream.send(vec![0, 1, 2, 3, 4]).await;
+        let (r, _) = stream.send(vec![0, 1, 2, 3, 4]).await;
         assert_eq!(r.unwrap_err(), Errno::EBADF);
     }
 
@@ -1152,7 +1139,7 @@ fn tcp_close()
         let r = stream.close().await;
         assert!(r.is_ok());
 
-        let r = stream.send(vec![0, 1, 2, 3, 4]).await;
+        let (r, _) = stream.send(vec![0, 1, 2, 3, 4]).await;
         assert_eq!(r.unwrap_err(), Errno::EBADF);
 
         let r = client.connect_ipv4(Ipv4Addr::LOCALHOST, port).await;
@@ -1238,7 +1225,7 @@ fn tcp_shutdown()
         let r = stream.shutdown(SHUT_RD).await;
         assert!(r.is_ok());
 
-        let r = stream.send(vec![0, 1, 2, 3, 4]).await;
+        let (r, _) = stream.send(vec![0, 1, 2, 3, 4]).await;
         assert_eq!(r.unwrap_err(), Errno::EPIPE);
 
         stream.set_buf_group(0);
@@ -1264,7 +1251,7 @@ fn tcp_shutdown()
         let r = stream.shutdown(SHUT_RDWR).await;
         assert!(r.is_ok());
 
-        let r = stream.send(vec![0, 1, 2, 3, 4]).await;
+        let (r, _) = stream.send(vec![0, 1, 2, 3, 4]).await;
         assert_eq!(r.unwrap_err(), Errno::EPIPE);
 
         stream.set_buf_group(0);
@@ -1385,6 +1372,7 @@ fn tcp_cancel()
 
         stream.send(String::from("hello, world!").into_bytes())
               .await
+              .0
               .unwrap();
 
         let r = stream.close().await;
@@ -1453,7 +1441,7 @@ fn tcp_eager_drop_send_ready()
 
         let stream = client.as_stream();
 
-        stream.send(vec![0, 1, 2, 3, 4]).await.unwrap();
+        stream.send(vec![0, 1, 2, 3, 4]).await.0.unwrap();
 
         let r = stream.close().await;
         assert!(r.is_ok());
