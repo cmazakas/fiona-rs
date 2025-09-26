@@ -358,6 +358,7 @@ pub(crate) struct StreamImpl
     buf_group: u16,
     recv_pending: bool,
     timeout_op: Option<u64>,
+    was_closed: bool,
 }
 
 impl Drop for StreamImpl
@@ -366,6 +367,11 @@ impl Drop for StreamImpl
     {
         if self.fd >= 0 {
             let fd = self.fd.try_into().unwrap();
+
+            if self.was_closed {
+                self.ex.reclaim_fd(fd);
+                return;
+            }
 
             let key =
                 self.ex
@@ -417,7 +423,8 @@ impl Stream
                                            last_send: Instant::now(),
                                            last_recv: Instant::now(),
                                            timeout_op: None,
-                                           recv_op: None };
+                                           recv_op: None,
+                                           was_closed: false };
 
             p = ptr.cast::<StreamImpl>();
             unsafe { std::ptr::write(p.as_ptr(), stream_impl) };
@@ -694,7 +701,8 @@ impl Client
                                   last_send: Instant::now(),
                                   last_recv: Instant::now(),
                                   timeout_op: None,
-                                  recv_op: None };
+                                  recv_op: None,
+                                  was_closed: false };
 
         let client_impl = ClientImpl { stream,
                                        connect_pending: false };
@@ -1254,6 +1262,7 @@ impl Future for CloseFuture<'_>
                 if res < 0 {
                     Poll::Ready(Err(Errno::from_raw(-res)))
                 } else {
+                    stream_impl.was_closed = true;
                     Poll::Ready(Ok(()))
                 }
             }

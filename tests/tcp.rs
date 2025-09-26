@@ -1127,23 +1127,30 @@ fn tcp_close()
 
     async fn client(ex: fiona::Executor, port: u16)
     {
-        let client = fiona::tcp::Client::new(ex.clone());
-        client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
-              .await
-              .unwrap();
+        let timer = fiona::time::Timer::new(ex.clone());
+        {
+            let client = fiona::tcp::Client::new(ex.clone());
+            client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                  .await
+                  .unwrap();
 
-        let timer = fiona::time::Timer::new(ex);
-        timer.wait(Duration::from_millis(100)).await.unwrap();
+            timer.wait(Duration::from_millis(100)).await.unwrap();
 
-        let stream = client.as_stream();
-        let r = stream.close().await;
-        assert!(r.is_ok());
+            let stream = client.as_stream();
+            let r = stream.close().await;
+            assert!(r.is_ok());
 
-        let (r, _) = stream.send(vec![0, 1, 2, 3, 4]).await;
-        assert_eq!(r.unwrap_err(), Errno::EBADF);
+            let (r, _) = stream.send(vec![0, 1, 2, 3, 4]).await;
+            assert_eq!(r.unwrap_err(), Errno::EBADF);
 
-        let r = client.connect_ipv4(Ipv4Addr::LOCALHOST, port).await;
-        assert_eq!(r.unwrap_err(), Errno::EBADF);
+            let r = client.connect_ipv4(Ipv4Addr::LOCALHOST, port).await;
+            assert_eq!(r.unwrap_err(), Errno::EBADF);
+        }
+        // Time-slice at the end here so we do a full CQE processing loop for the
+        // scheduled DropClose. Our RunGuard implementation will cleanup the CQEs fine,
+        // but it doesn't do any CQE processing so we lose coverage in our test without
+        // this.
+        timer.wait(Duration::from_millis(10)).await.unwrap();
     }
 
     ex.clone().spawn(server(acceptor));
