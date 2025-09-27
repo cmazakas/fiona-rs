@@ -12,10 +12,10 @@ use std::{
     sync::Arc,
     task::{LocalWaker, Poll, Waker},
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 
 struct YieldFuture<T: Unpin>
 {
@@ -771,4 +771,48 @@ fn await_local_waker_outlives()
     let local_waker = (*p).take().unwrap();
     local_waker.wake_by_ref();
     local_waker.wake();
+}
+
+#[test]
+fn await_futures_mpsc()
+{
+    let mut ioc = fiona::IoContext::new();
+
+    async fn receiver(mut rx: futures::channel::mpsc::Receiver<i32>)
+    {
+        let before = Instant::now();
+
+        let value = rx.next().await.unwrap();
+
+        let elapsed = Instant::now() - before;
+        assert!(elapsed >= Duration::from_millis(100));
+
+        assert_eq!(value, 1234);
+    }
+
+    async fn sender(_ex: fiona::Executor, mut tx: futures::channel::mpsc::Sender<i32>)
+    {
+        std::thread::sleep(Duration::from_millis(100));
+        tx.send(1234).await.unwrap();
+    }
+
+    let (tx, rx) = futures::channel::mpsc::channel::<i32>(1024);
+
+    let ex = ioc.get_executor();
+    ex.spawn(receiver(rx));
+
+    let thread = std::thread::spawn(move || {
+        let mut ioc = fiona::IoContext::new();
+        let ex = ioc.get_executor();
+
+        ex.clone().spawn(sender(ex.clone(), tx));
+
+        let n = ioc.run();
+        assert_eq!(n, 1);
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+
+    thread.join().unwrap();
 }
