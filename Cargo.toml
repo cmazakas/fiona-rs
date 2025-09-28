@@ -37,3 +37,7 @@ harness = false
 [[bench]]
 name = "echo2"
 harness = false
+
+[[bench]]
+name = "ring_msg"
+harness = false
