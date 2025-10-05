@@ -9,7 +9,7 @@ export LSAN_OPTIONS="suppressions=suppr.txt"
 
 clear
 
-CARGO_FLAGS=(--target x86_64-unknown-linux-gnu -Zbuild-std)
+CARGO_FLAGS=(--target x86_64-unknown-linux-gnu -Zbuild-std --tests)
 
 RUSTFLAGS='-Zsanitizer=address' cargo test "${CARGO_FLAGS[@]}" --profile=release-with-debug -- --test-threads=1 --nocapture
 RUSTFLAGS='-Zsanitizer=thread' cargo test "${CARGO_FLAGS[@]}" --profile=release-with-debug -- --test-threads=1 --nocapture
