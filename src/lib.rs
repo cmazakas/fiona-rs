@@ -127,7 +127,9 @@ impl Task
         unsafe { &*self.p.as_ptr().cast::<TaskHeader>() }
     }
 
-    fn get_future(&mut self) -> Pin<&mut (dyn Future<Output = ()> + 'static)>
+    // unsafe because of potential aliasing violations as Task implements Clone with
+    // Rc-like semantics
+    unsafe fn poll(&mut self, cx: &mut Context) -> Poll<()>
     {
         let offset = self.task_header().future_offset;
         let p = unsafe {
@@ -137,12 +139,8 @@ impl Task
                                                                               self.task_header()
                                                                                   .future_vtable)
         };
-        unsafe { Pin::new_unchecked(&mut *p) }
-    }
 
-    fn poll(&mut self, cx: &mut Context) -> Poll<()>
-    {
-        let future = self.get_future();
+        let future = unsafe { Pin::new_unchecked(&mut *p) };
         future.poll(cx)
     }
 
@@ -253,6 +251,7 @@ impl Weak
     {
         let c = unsafe { *self.task_header().strong.get() };
         if c == 0 {
+            println!("dead task");
             return None;
         }
         unsafe { *self.task_header().strong.get() += 1 };
@@ -1079,7 +1078,7 @@ fn on_work_item(weak: Weak, ex: &Executor) -> u64
 
             let mut cx = ContextBuilder::from_waker(&w).local_waker(&lw).build();
 
-            if let Poll::Ready(()) = task.poll(&mut cx) {
+            if let Poll::Ready(()) = unsafe { task.poll(&mut cx) } {
                 ex.p.tasks.borrow_mut().remove(&task);
                 1
             } else {
