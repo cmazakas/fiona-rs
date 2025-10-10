@@ -77,20 +77,6 @@ impl Future for WakerFuture
 
 //-----------------------------------------------------------------------------
 
-struct LocalWakerFuture;
-
-impl Future for LocalWakerFuture
-{
-    type Output = LocalWaker;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
-    {
-        Poll::Ready(cx.local_waker().clone())
-    }
-}
-
-//-----------------------------------------------------------------------------
-
 struct TimerFuture<T>
 {
     dur: Duration,
@@ -753,15 +739,21 @@ fn await_futures_unordered()
 fn await_local_waker_outlives()
 {
     let p = Rc::<RefCell<Option<LocalWaker>>>::new(RefCell::new(None));
+    let q = Rc::<RefCell<Option<Waker>>>::new(RefCell::new(None));
+
     {
         let mut ioc = fiona::IoContext::new();
         let ex = ioc.get_executor();
 
         {
             let p = p.clone();
+            let q = q.clone();
             ex.spawn(async move {
-                  let local_waker = LocalWakerFuture.await;
-                  *(*p).borrow_mut() = Some(local_waker);
+                  poll_fn(|cx| {
+                      *p.borrow_mut() = Some(cx.local_waker().clone());
+                      *q.borrow_mut() = Some(cx.waker().clone());
+                      Poll::Ready(())
+                  }).await;
               });
         }
 
@@ -771,6 +763,10 @@ fn await_local_waker_outlives()
     let local_waker = (*p).take().unwrap();
     local_waker.wake_by_ref();
     local_waker.wake();
+
+    let waker = (*q).take().unwrap();
+    waker.wake_by_ref();
+    waker.wake();
 }
 
 #[test]
