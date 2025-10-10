@@ -7,15 +7,17 @@
 use std::{
     cell::{Cell, RefCell},
     future::{Future, poll_fn},
+    hash::{DefaultHasher, Hasher},
     pin::Pin,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{LocalWaker, Poll, Waker},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, stream::FuturesUnordered};
+use rand::SeedableRng;
 
 struct YieldFuture<T: Unpin>
 {
@@ -766,7 +768,6 @@ fn await_local_waker_outlives()
 
     let waker = (*q).take().unwrap();
     waker.wake_by_ref();
-    waker.wake();
 }
 
 #[test]
@@ -811,4 +812,101 @@ fn await_futures_mpsc()
     assert_eq!(n, 1);
 
     thread.join().unwrap();
+}
+
+#[test]
+fn await_rayon_tasks()
+{
+    // Want to test that our IoContext can toss work onto a Rayon threadpool which
+    // we then await on in bulk.
+
+    fn make_bytes() -> Vec<u8>
+    {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1234);
+        let mut bytes = vec![0_u8; 16 * 1024 * 1024];
+        rand::RngCore::fill_bytes(&mut rng, &mut bytes);
+        bytes
+    }
+
+    struct RayonFuture
+    {
+        initiated: bool,
+        done: bool,
+        thread_pool: Rc<rayon::ThreadPool>,
+        value: Arc<Mutex<Option<u64>>>,
+    }
+
+    impl RayonFuture
+    {
+        fn new(thread_pool: Rc<rayon::ThreadPool>) -> RayonFuture
+        {
+            RayonFuture { initiated: false,
+                          done: false,
+                          thread_pool,
+                          value: Arc::new(Mutex::new(None)) }
+        }
+    }
+
+    impl Future for RayonFuture
+    {
+        type Output = u64;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
+        {
+            assert!(!self.done);
+
+            if self.initiated {
+                let mut guard = self.value.lock().unwrap();
+                if guard.is_none() {
+                    return Poll::Pending;
+                }
+
+                let value = guard.take().unwrap();
+                drop(guard);
+
+                self.done = true;
+                return Poll::Ready(value);
+            }
+
+            let value = self.value.clone();
+            let waker = cx.waker().clone();
+            self //
+                .thread_pool
+                .spawn(move || {
+                    let bytes = make_bytes();
+
+                    let mut h = DefaultHasher::new();
+
+                    h.write(&bytes);
+
+                    *value.lock().unwrap() = Some(h.finish());
+                    waker.wake();
+                });
+
+            self.initiated = true;
+
+            Poll::Pending
+        }
+    }
+
+    async fn fiona_task(thread_pool: Rc<rayon::ThreadPool>)
+    {
+        let mut tasks = FuturesUnordered::new();
+        for _ in 0..64 {
+            tasks.push(RayonFuture::new(thread_pool.clone()));
+        }
+
+        while let Some(h) = tasks.next().await {
+            assert_eq!(h, 17722614205829968049);
+        }
+    }
+
+    let thread_pool = Rc::new(rayon::ThreadPoolBuilder::new().num_threads(4)
+                                                             .build()
+                                                             .unwrap());
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+    ex.spawn(fiona_task(thread_pool));
+    let _n = ioc.run();
 }
