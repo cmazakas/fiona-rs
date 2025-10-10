@@ -251,7 +251,6 @@ impl Weak
     {
         let c = unsafe { *self.task_header().strong.get() };
         if c == 0 {
-            println!("dead task");
             return None;
         }
         unsafe { *self.task_header().strong.get() += 1 };
@@ -301,8 +300,9 @@ unsafe fn task_waker_clone(p: *const ()) -> RawWaker
 unsafe fn task_wake(p: *const ())
 {
     let weak = unsafe { Weak::from_raw(p) };
-    if let Some(sender) = weak.task_header().sender.as_ref() {
-        sender.send(weak.clone()).unwrap();
+    if let Some(sender) = weak.task_header().sender.as_ref()
+       && sender.send(weak.clone()).is_ok()
+    {
         let buf = &0x01_u64.to_ne_bytes();
         unsafe {
             nix::libc::write(weak.task_header().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
@@ -313,8 +313,9 @@ unsafe fn task_wake(p: *const ())
 unsafe fn task_wake_by_ref(p: *const ())
 {
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
-    if let Some(sender) = weak.task_header().sender.as_ref() {
-        sender.send(ManuallyDrop::into_inner(weak.clone())).unwrap();
+    if let Some(sender) = weak.task_header().sender.as_ref()
+       && sender.send(ManuallyDrop::into_inner(weak.clone())).is_ok()
+    {
         let buf = &0x01_u64.to_ne_bytes();
         unsafe {
             nix::libc::write(weak.task_header().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
