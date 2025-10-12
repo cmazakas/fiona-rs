@@ -828,28 +828,33 @@ fn await_rayon_tasks()
         bytes
     }
 
-    struct RayonFuture
+    trait RayonSafe: Unpin + Send + 'static {}
+    impl<T: Unpin + Send + 'static> RayonSafe for T {}
+
+    struct RayonFuture<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe>
     {
         initiated: bool,
         done: bool,
         thread_pool: Rc<rayon::ThreadPool>,
-        value: Arc<Mutex<Option<u64>>>,
+        f: Option<F>,
+        value: Arc<Mutex<Option<T>>>,
     }
 
-    impl RayonFuture
+    impl<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> RayonFuture<T, F>
     {
-        fn new(thread_pool: Rc<rayon::ThreadPool>) -> RayonFuture
+        fn new(thread_pool: Rc<rayon::ThreadPool>, f: F) -> Self
         {
             RayonFuture { initiated: false,
                           done: false,
                           thread_pool,
-                          value: Arc::new(Mutex::new(None)) }
+                          value: Arc::new(Mutex::new(None)),
+                          f: Some(f) }
         }
     }
 
-    impl Future for RayonFuture
+    impl<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> Future for RayonFuture<T, F>
     {
-        type Output = u64;
+        type Output = T;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
         {
@@ -870,16 +875,11 @@ fn await_rayon_tasks()
 
             let value = self.value.clone();
             let waker = cx.waker().clone();
+            let f = self.f.take().unwrap();
             self //
                 .thread_pool
                 .spawn(move || {
-                    let bytes = make_bytes();
-
-                    let mut h = DefaultHasher::new();
-
-                    h.write(&bytes);
-
-                    *value.lock().unwrap() = Some(h.finish());
+                    *value.lock().unwrap() = Some(f());
                     waker.wake();
                 });
 
@@ -893,15 +893,22 @@ fn await_rayon_tasks()
     {
         let mut tasks = FuturesUnordered::new();
         for _ in 0..64 {
-            tasks.push(RayonFuture::new(thread_pool.clone()));
+            tasks.push(RayonFuture::new(thread_pool.clone(), || {
+                           let bytes = make_bytes();
+                           let mut h = DefaultHasher::new();
+                           for _ in 0..8 {
+                               h.write(&bytes);
+                           }
+                           h.finish()
+                       }));
         }
 
         while let Some(h) = tasks.next().await {
-            assert_eq!(h, 17722614205829968049);
+            assert_eq!(h, 7087969665942182409);
         }
     }
 
-    let thread_pool = Rc::new(rayon::ThreadPoolBuilder::new().num_threads(4)
+    let thread_pool = Rc::new(rayon::ThreadPoolBuilder::new().num_threads(32)
                                                              .build()
                                                              .unwrap());
 
