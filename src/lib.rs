@@ -28,7 +28,6 @@ use std::{
     marker::PhantomData,
     mem::ManuallyDrop,
     ops::Deref,
-    os::fd::AsRawFd,
     pin::Pin,
     ptr::{self, DynMetadata, NonNull, metadata},
     rc::Rc,
@@ -45,11 +44,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nix::{
-    errno::Errno,
-    libc::{ETIME, c_void},
-    sys::{eventfd::EventFd, socket::SockaddrStorage},
-};
+use nix::{errno::Errno, libc::ETIME, sys::socket::SockaddrStorage};
 
 use liburing_rs::{
     __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
@@ -58,11 +53,11 @@ use liburing_rs::{
     io_uring_buf_ring, io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask,
     io_uring_cq_advance, io_uring_cqe, io_uring_cqe_seen, io_uring_for_each_cqe,
     io_uring_free_buf_ring, io_uring_get_events, io_uring_get_sqe, io_uring_params,
-    io_uring_peek_cqe, io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_read,
+    io_uring_peek_cqe, io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_msg_ring,
     io_uring_queue_exit, io_uring_queue_init_params, io_uring_register_files_sparse,
-    io_uring_register_ring_fd, io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe,
-    io_uring_sqe_set_data64, io_uring_sqe_set_flags, io_uring_submit_and_get_events,
-    io_uring_submit_and_wait, io_uring_unregister_buf_ring,
+    io_uring_register_ring_fd, io_uring_register_sync_msg, io_uring_setup_buf_ring,
+    io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    io_uring_submit_and_get_events, io_uring_submit_and_wait, io_uring_unregister_buf_ring,
 };
 
 pub mod tcp;
@@ -119,7 +114,7 @@ struct TaskHeader
     value_vtable: DynMetadata<dyn Erased>,
     future_vtable: DynMetadata<dyn Future<Output = ()> + 'static>,
     sender: Option<Sender<Weak>>,
-    event_fd: i32,
+    ring_fd: i32,
     ex: DanglingExecutor,
     needs_wake: Arc<AlignedAtomicBool>,
     done: UnsafeCell<bool>,
@@ -326,10 +321,10 @@ unsafe fn task_wake(p: *const ())
     }
 
     if weak.task_header().needs_wake.swap(false, AcqRel) {
-        let buf = &0x01_u64.to_ne_bytes();
-        unsafe {
-            nix::libc::write(weak.task_header().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
-        }
+        let ring_fd = weak.task_header().ring_fd;
+        let mut sqe = unsafe { std::mem::zeroed::<io_uring_sqe>() };
+        unsafe { io_uring_prep_msg_ring(&raw mut sqe, ring_fd, 0, 0, 0) };
+        unsafe { io_uring_register_sync_msg(&raw mut sqe) };
     }
 }
 
@@ -346,10 +341,10 @@ unsafe fn task_wake_by_ref(p: *const ())
     }
 
     if weak.task_header().needs_wake.swap(false, AcqRel) {
-        let buf = &0x01_u64.to_ne_bytes();
-        unsafe {
-            nix::libc::write(weak.task_header().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
-        }
+        let ring_fd = weak.task_header().ring_fd;
+        let mut sqe = unsafe { std::mem::zeroed::<io_uring_sqe>() };
+        unsafe { io_uring_prep_msg_ring(&raw mut sqe, ring_fd, 0, 0, 0) };
+        unsafe { io_uring_register_sync_msg(&raw mut sqe) };
     }
 }
 
@@ -635,7 +630,6 @@ struct IoContextFrame
     tasks: RefCell<HashSet<Task>>,
     receiver: RefCell<Receiver<Weak>>,
     sender: RefCell<Sender<Weak>>,
-    event_fd: RefCell<EventFd>,
     buf_groups: RefCell<HashMap<u16, Box<UnsafeCell<BufGroup>>>>,
     runguard_blacklist: RefCell<HashSet<u64>>,
     local_task_queue: RefCell<VecDeque<Weak>>,
@@ -959,19 +953,18 @@ impl IoContext
 
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 
-        let ioc_frame =
-            IoContextFrame { params: RefCell::new(params),
-                             tasks: RefCell::new(HashSet::new()),
-                             available_fds: RefCell::new(VecDeque::new()),
-                             receiver: RefCell::new(rx),
-                             sender: RefCell::new(tx),
-                             ioring: RefCell::new(ioring),
-                             event_fd: RefCell::new(nix::sys::eventfd::EventFd::new().unwrap()),
-                             buf_groups: RefCell::new(HashMap::new()),
-                             runguard_blacklist: RefCell::new(HashSet::new()),
-                             local_task_queue: RefCell::new(VecDeque::new()),
-                             io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
-                             needs_wake: Arc::new(AlignedAtomicBool(AtomicBool::new(true))) };
+        let ioc_frame = IoContextFrame { params: RefCell::new(params),
+                                         tasks: RefCell::new(HashSet::new()),
+                                         available_fds: RefCell::new(VecDeque::new()),
+                                         receiver: RefCell::new(rx),
+                                         sender: RefCell::new(tx),
+                                         ioring: RefCell::new(ioring),
+                                         buf_groups: RefCell::new(HashMap::new()),
+                                         runguard_blacklist: RefCell::new(HashSet::new()),
+                                         local_task_queue: RefCell::new(VecDeque::new()),
+                                         io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
+                                         needs_wake:
+                                             Arc::new(AlignedAtomicBool(AtomicBool::new(true))) };
 
         let p = Rc::new(ioc_frame);
 
@@ -1044,26 +1037,12 @@ impl IoContext
 
         let mut num_completed = 0;
 
-        let event_fd = self.p.event_fd.borrow().as_raw_fd();
-        let mut event_count = 0_u64;
-
         let ex = self.get_executor();
         let ring = ex.ring();
-
-        let mut need_eventfd_read = true;
 
         loop {
             if self.process_task_queues(&mut num_completed) {
                 break;
-            }
-
-            if need_eventfd_read {
-                let eventfd_sqe = get_sqe(&ex);
-                let sqe = unsafe { &mut *eventfd_sqe };
-                let p = std::ptr::from_mut(&mut event_count).cast::<c_void>();
-                unsafe { io_uring_prep_read(sqe, event_fd, p, 8, 0) };
-                unsafe { io_uring_sqe_set_data64(sqe, 0x01) };
-                need_eventfd_read = false;
             }
 
             self.p.needs_wake.store(true, Release);
@@ -1078,7 +1057,7 @@ impl IoContext
             let mut guard = CQEAdvanceGuard { ring, n: 0 };
 
             let f = |cqe: *mut io_uring_cqe| {
-                unsafe { on_cqe(&ex, cqe, &mut guard, &mut need_eventfd_read) };
+                unsafe { on_cqe(&ex, cqe, &mut guard) };
             };
 
             unsafe { io_uring_for_each_cqe(ring, f) };
@@ -1088,19 +1067,13 @@ impl IoContext
     }
 }
 
-unsafe fn on_cqe(ex: &Executor, cqe: *mut io_uring_cqe, guard: &mut CQEAdvanceGuard,
-                 need_eventfd_read: &mut bool)
+unsafe fn on_cqe(ex: &Executor, cqe: *mut io_uring_cqe, guard: &mut CQEAdvanceGuard)
 {
     let _g = IncrGuard { n: &mut guard.n };
 
     let cqe = unsafe { &mut *cqe };
 
     if cqe.user_data == 0 {
-        return;
-    }
-
-    if cqe.user_data == 1 {
-        *need_eventfd_read = true;
         return;
     }
 
@@ -1852,7 +1825,6 @@ impl Executor
     pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T>
     {
         let sender = self.p.sender.borrow().clone();
-        let event_fd = self.p.event_fd.borrow().as_raw_fd();
 
         let future_vtable =
             metadata::<dyn Future<Output = ()>>(std::ptr::null::<WrapperFuture<T, F>>());
@@ -1863,6 +1835,8 @@ impl Executor
         let (layout, future_offset) = layout.extend(future_vtable.layout()).unwrap();
         let layout = layout.pad_to_align();
 
+        let ring_fd = self.p.ioring.borrow().ring_fd;
+
         let task_header = TaskHeader { strong: UnsafeCell::new(1),
                                        weak: AlignedAtomicU64(AtomicU64::new(1)),
                                        value_offset,
@@ -1870,7 +1844,7 @@ impl Executor
                                        future_vtable,
                                        value_vtable,
                                        sender: Some(sender),
-                                       event_fd,
+                                       ring_fd,
                                        ex: DanglingExecutor(Rc::into_raw(self.clone().p)),
                                        task_layout: layout,
                                        needs_wake: self.p.needs_wake.clone(),
