@@ -130,6 +130,79 @@ fn wait_for<T>(dur: Duration, t: T) -> TimerFuture<T>
 
 //-----------------------------------------------------------------------------
 
+trait RayonSafe: Unpin + Send + 'static {}
+impl<T: Unpin + Send + 'static> RayonSafe for T {}
+
+struct RayonFuture<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe>
+{
+    initiated: bool,
+    done: bool,
+    thread_pool: Rc<rayon::ThreadPool>,
+    f: Option<F>,
+    value: Arc<Mutex<Option<T>>>,
+}
+
+impl<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> RayonFuture<T, F>
+{
+    fn new(thread_pool: Rc<rayon::ThreadPool>, f: F) -> Self
+    {
+        RayonFuture { initiated: false,
+                      done: false,
+                      thread_pool,
+                      value: Arc::new(Mutex::new(None)),
+                      f: Some(f) }
+    }
+}
+
+impl<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> Future for RayonFuture<T, F>
+{
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
+    {
+        assert!(!self.done);
+
+        if self.initiated {
+            let mut guard = self.value.lock().unwrap();
+            if guard.is_none() {
+                return Poll::Pending;
+            }
+
+            let value = guard.take().unwrap();
+            drop(guard);
+
+            self.done = true;
+            return Poll::Ready(value);
+        }
+
+        let value = self.value.clone();
+        let waker = cx.waker().clone();
+        let f = self.f.take().unwrap();
+        self //
+            .thread_pool
+            .spawn(move || {
+                *value.lock().unwrap() = Some(f());
+                waker.wake();
+            });
+
+        self.initiated = true;
+
+        Poll::Pending
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+fn make_bytes(n: usize) -> Vec<u8>
+{
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1234);
+    let mut bytes = vec![0_u8; n];
+    rand::RngCore::fill_bytes(&mut rng, &mut bytes);
+    bytes
+}
+
+//-----------------------------------------------------------------------------
+
 #[test]
 fn await_simple()
 {
@@ -188,9 +261,10 @@ fn await_forgotten()
     let c = Rc::new(RefCell::new(0));
     {
         let c2 = c.clone();
-        let ex2 = ex.clone();
-        ex.spawn(async move {
-              let h = ex2.spawn(make_vec());
+        ex //
+          .clone()
+          .spawn(async move {
+              let h = ex.spawn(make_vec());
               *c2.borrow_mut() = 4321;
               unsafe {
                   P_FUTURE = Box::leak(Box::new(h));
@@ -444,10 +518,13 @@ fn await_from_main()
 #[test]
 fn await_stress_test()
 {
+    static mut NUM_RUNS: u64 = 0;
+
     async fn task(x: i32)
     {
         let x2 = yield_now(x).await;
         assert_eq!(x2, x);
+        unsafe { NUM_RUNS += 1 };
     }
 
     let mut ioc = fiona::IoContext::new();
@@ -458,6 +535,7 @@ fn await_stress_test()
 
     let n = ioc.run();
     assert_eq!(n, 100_000);
+    assert_eq!(unsafe { NUM_RUNS }, n);
 }
 
 #[test]
@@ -820,81 +898,12 @@ fn await_rayon_tasks()
     // Want to test that our IoContext can toss work onto a Rayon threadpool which
     // we then await on in bulk.
 
-    fn make_bytes() -> Vec<u8>
-    {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(1234);
-        let mut bytes = vec![0_u8; 16 * 1024 * 1024];
-        rand::RngCore::fill_bytes(&mut rng, &mut bytes);
-        bytes
-    }
-
-    trait RayonSafe: Unpin + Send + 'static {}
-    impl<T: Unpin + Send + 'static> RayonSafe for T {}
-
-    struct RayonFuture<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe>
-    {
-        initiated: bool,
-        done: bool,
-        thread_pool: Rc<rayon::ThreadPool>,
-        f: Option<F>,
-        value: Arc<Mutex<Option<T>>>,
-    }
-
-    impl<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> RayonFuture<T, F>
-    {
-        fn new(thread_pool: Rc<rayon::ThreadPool>, f: F) -> Self
-        {
-            RayonFuture { initiated: false,
-                          done: false,
-                          thread_pool,
-                          value: Arc::new(Mutex::new(None)),
-                          f: Some(f) }
-        }
-    }
-
-    impl<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> Future for RayonFuture<T, F>
-    {
-        type Output = T;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
-        {
-            assert!(!self.done);
-
-            if self.initiated {
-                let mut guard = self.value.lock().unwrap();
-                if guard.is_none() {
-                    return Poll::Pending;
-                }
-
-                let value = guard.take().unwrap();
-                drop(guard);
-
-                self.done = true;
-                return Poll::Ready(value);
-            }
-
-            let value = self.value.clone();
-            let waker = cx.waker().clone();
-            let f = self.f.take().unwrap();
-            self //
-                .thread_pool
-                .spawn(move || {
-                    *value.lock().unwrap() = Some(f());
-                    waker.wake();
-                });
-
-            self.initiated = true;
-
-            Poll::Pending
-        }
-    }
-
     async fn fiona_task(thread_pool: Rc<rayon::ThreadPool>)
     {
         let mut tasks = FuturesUnordered::new();
         for _ in 0..64 {
             tasks.push(RayonFuture::new(thread_pool.clone(), || {
-                           let bytes = make_bytes();
+                           let bytes = make_bytes(16 * 1024 * 1024);
                            let mut h = DefaultHasher::new();
                            for _ in 0..8 {
                                h.write(&bytes);
@@ -915,5 +924,79 @@ fn await_rayon_tasks()
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
     ex.spawn(fiona_task(thread_pool));
+    let _n = ioc.run();
+}
+
+#[test]
+fn await_rayon_stress_test()
+{
+    async fn fiona_task(thread_pool: Rc<rayon::ThreadPool>)
+    {
+        let hash = RayonFuture::new(thread_pool.clone(), || {
+                       let bytes = make_bytes(64 * 1024);
+                       let mut h = DefaultHasher::new();
+                       h.write(&bytes);
+                       h.finish()
+                   }).await;
+
+        assert_eq!(hash, 18184493139860282385);
+    }
+
+    async fn timer_task(ex: fiona::Executor)
+    {
+        let timer = fiona::time::Timer::new(ex);
+        for _ in 0..50_000 {
+            timer.wait(Duration::from_micros(10)).await.unwrap();
+        }
+    }
+
+    let thread_pool = Rc::new(rayon::ThreadPoolBuilder::new().num_threads(32)
+                                                             .build()
+                                                             .unwrap());
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+    ex.clone().spawn(timer_task(ex.clone()));
+    for _ in 0..100_000 {
+        ex.clone().spawn(fiona_task(thread_pool.clone()));
+    }
+    let n = ioc.run();
+    assert_eq!(n, 100_000 + 1);
+}
+
+#[test]
+fn await_double_wake()
+{
+    // Because our runtime now uses an amortized wakeup mechanism (i.e eventfd write
+    // or ring message), we need to test the case where the main thread running the
+    // ring is preempted before it can set the atomic flag to true, which means that
+    // threads running the Waker won't trigger the necessary wake-up mechanism
+    // causing a deadlock. It's the event loop's responsibility to check the task
+    // queue one more time before blocking on io_uring_submit_and_wait(), after it's
+    // set the atomic flag to true.
+
+    async fn timer_task()
+    {
+        wait_for(Duration::from_micros(10), ()).await;
+    }
+
+    async fn double_wake_task(ex: fiona::Executor)
+    {
+        for _ in 0..25_000 {
+            let h1 = ex.clone().spawn(timer_task());
+            let h2 = ex.clone().spawn(timer_task());
+            let h3 = ex.clone().spawn(async {
+                                   yield_now(()).await;
+                               });
+
+            h3.await;
+            h2.await;
+            h1.await;
+        }
+    }
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+    ex.clone().spawn(double_wake_task(ex));
     let _n = ioc.run();
 }

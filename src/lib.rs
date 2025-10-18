@@ -34,9 +34,10 @@ use std::{
     rc::Rc,
     slice,
     sync::{
+        Arc,
         atomic::{
-            AtomicU64,
-            Ordering::{Acquire, Relaxed, Release},
+            AtomicBool, AtomicU64,
+            Ordering::{AcqRel, Acquire, Relaxed, Release},
         },
         mpsc::{Receiver, Sender},
     },
@@ -107,6 +108,7 @@ struct TaskHeader
     sender: Option<Sender<Weak>>,
     event_fd: i32,
     ex: DanglingExecutor,
+    needs_wake: Arc<AtomicBool>,
 }
 
 //-----------------------------------------------------------------------------
@@ -300,9 +302,16 @@ unsafe fn task_waker_clone(p: *const ()) -> RawWaker
 unsafe fn task_wake(p: *const ())
 {
     let weak = unsafe { Weak::from_raw(p) };
-    if let Some(sender) = weak.task_header().sender.as_ref()
-       && sender.send(weak.clone()).is_ok()
-    {
+
+    let Some(sender) = weak.task_header().sender.as_ref() else {
+        return;
+    };
+
+    if sender.send(weak.clone()).is_err() {
+        return;
+    }
+
+    if weak.task_header().needs_wake.swap(false, AcqRel) {
         let buf = &0x01_u64.to_ne_bytes();
         unsafe {
             nix::libc::write(weak.task_header().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
@@ -313,9 +322,16 @@ unsafe fn task_wake(p: *const ())
 unsafe fn task_wake_by_ref(p: *const ())
 {
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
-    if let Some(sender) = weak.task_header().sender.as_ref()
-       && sender.send(ManuallyDrop::into_inner(weak.clone())).is_ok()
-    {
+
+    let Some(sender) = weak.task_header().sender.as_ref() else {
+        return;
+    };
+
+    if sender.send(ManuallyDrop::into_inner(weak.clone())).is_err() {
+        return;
+    }
+
+    if weak.task_header().needs_wake.swap(false, AcqRel) {
         let buf = &0x01_u64.to_ne_bytes();
         unsafe {
             nix::libc::write(weak.task_header().event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
@@ -610,6 +626,7 @@ struct IoContextFrame
     runguard_blacklist: RefCell<HashSet<u64>>,
     local_task_queue: RefCell<VecDeque<Weak>>,
     io_ops: RefCell<IoOpsMap>,
+    needs_wake: Arc<AtomicBool>,
 }
 
 //-----------------------------------------------------------------------------
@@ -939,7 +956,8 @@ impl IoContext
                              buf_groups: RefCell::new(HashMap::new()),
                              runguard_blacklist: RefCell::new(HashSet::new()),
                              local_task_queue: RefCell::new(VecDeque::new()),
-                             io_ops: RefCell::new(IoOpsMap::with_capacity(1024)) };
+                             io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
+                             needs_wake: Arc::new(AtomicBool::new(true)) };
 
         let p = Rc::new(ioc_frame);
 
@@ -976,6 +994,36 @@ impl IoContext
         &raw mut *self.p.ioring.borrow_mut()
     }
 
+    fn process_task_queues(&mut self, num_completed: &mut u64) -> bool
+    {
+        let ex = self.get_executor();
+
+        loop {
+            if self.p.tasks.borrow().is_empty() {
+                return true;
+            }
+
+            let (local_task, task) = (self.p.local_task_queue.borrow_mut().pop_front(),
+                                      self.p.receiver.borrow_mut().try_recv());
+
+            match (local_task, task) {
+                (Some(weak1), Ok(weak2)) => {
+                    *num_completed += on_work_item(weak1, &ex);
+                    *num_completed += on_work_item(weak2, &ex);
+                }
+                (Some(weak1), Err(_)) => {
+                    *num_completed += on_work_item(weak1, &ex);
+                }
+                (None, Ok(weak2)) => {
+                    *num_completed += on_work_item(weak2, &ex);
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+    }
+
     pub fn run(&mut self) -> u64
     {
         let _guard = RunGuard { p: self.p.clone() };
@@ -991,28 +1039,8 @@ impl IoContext
         let mut need_eventfd_read = true;
 
         loop {
-            if self.p.tasks.borrow().is_empty() {
+            if self.process_task_queues(&mut num_completed) {
                 break;
-            }
-
-            let (local_task, task) = (self.p.local_task_queue.borrow_mut().pop_front(),
-                                      self.p.receiver.borrow_mut().try_recv());
-
-            match (local_task, task) {
-                (Some(weak1), Ok(weak2)) => {
-                    num_completed += on_work_item(weak1, &ex);
-                    num_completed += on_work_item(weak2, &ex);
-                    continue;
-                }
-                (Some(weak1), Err(_)) => {
-                    num_completed += on_work_item(weak1, &ex);
-                    continue;
-                }
-                (None, Ok(weak2)) => {
-                    num_completed += on_work_item(weak2, &ex);
-                    continue;
-                }
-                _ => {}
             }
 
             if need_eventfd_read {
@@ -1022,6 +1050,12 @@ impl IoContext
                 unsafe { io_uring_prep_read(sqe, event_fd, p, 8, 0) };
                 unsafe { io_uring_sqe_set_data64(sqe, 0x01) };
                 need_eventfd_read = false;
+            }
+
+            self.p.needs_wake.store(true, Release);
+
+            if self.process_task_queues(&mut num_completed) {
+                break;
             }
 
             let ret = unsafe { io_uring_submit_and_wait(ring, 1) };
@@ -1818,7 +1852,8 @@ impl Executor
                                        sender: Some(sender),
                                        event_fd,
                                        ex: DanglingExecutor(Rc::into_raw(self.clone().p)),
-                                       task_layout: layout };
+                                       task_layout: layout,
+                                       needs_wake: self.p.needs_wake.clone() };
 
         let p = unsafe { std::alloc::alloc(layout) };
         assert!(!p.is_null());
