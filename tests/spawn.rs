@@ -312,10 +312,12 @@ fn await_forgotten_recursive()
         unsafe {
             P_FUTURE = Box::into_raw(Box::new(h));
         }
+
+        ex.spawn(async {});
     }
     ex.spawn(f(ex.clone(), c2));
 
-    assert_eq!(ioc.run(), 2);
+    assert_eq!(ioc.run(), 3);
     assert_eq!(*c.borrow(), 4321);
 
     assert!(unsafe { !P_FUTURE.is_null() });

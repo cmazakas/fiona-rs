@@ -109,6 +109,7 @@ struct TaskHeader
     event_fd: i32,
     ex: DanglingExecutor,
     needs_wake: Arc<AtomicBool>,
+    done: UnsafeCell<bool>,
 }
 
 //-----------------------------------------------------------------------------
@@ -1108,6 +1109,11 @@ fn on_work_item(weak: Weak, ex: &Executor) -> u64
     match unsafe { weak.upgrade() } {
         None => 0,
         Some(mut task) => {
+            let done = unsafe { &mut *task.task_header().done.get() };
+            if *done {
+                return 0;
+            }
+
             let w = make_waker(weak.clone());
             let lw = make_local_waker(weak);
 
@@ -1115,6 +1121,7 @@ fn on_work_item(weak: Weak, ex: &Executor) -> u64
 
             if let Poll::Ready(()) = unsafe { task.poll(&mut cx) } {
                 ex.p.tasks.borrow_mut().remove(&task);
+                *done = true;
                 1
             } else {
                 0
@@ -1853,7 +1860,8 @@ impl Executor
                                        event_fd,
                                        ex: DanglingExecutor(Rc::into_raw(self.clone().p)),
                                        task_layout: layout,
-                                       needs_wake: self.p.needs_wake.clone() };
+                                       needs_wake: self.p.needs_wake.clone(),
+                                       done: UnsafeCell::new(false) };
 
         let p = unsafe { std::alloc::alloc(layout) };
         assert!(!p.is_null());
