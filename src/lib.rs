@@ -89,6 +89,19 @@ impl Deref for AlignedAtomicU64
     }
 }
 
+#[repr(C, align(64))]
+struct AlignedAtomicBool(AtomicBool);
+
+impl Deref for AlignedAtomicBool
+{
+    type Target = AtomicBool;
+
+    fn deref(&self) -> &Self::Target
+    {
+        &self.0
+    }
+}
+
 //-----------------------------------------------------------------------------
 
 struct DanglingExecutor(*const IoContextFrame);
@@ -108,7 +121,7 @@ struct TaskHeader
     sender: Option<Sender<Weak>>,
     event_fd: i32,
     ex: DanglingExecutor,
-    needs_wake: Arc<AtomicBool>,
+    needs_wake: Arc<AlignedAtomicBool>,
     done: UnsafeCell<bool>,
 }
 
@@ -627,7 +640,7 @@ struct IoContextFrame
     runguard_blacklist: RefCell<HashSet<u64>>,
     local_task_queue: RefCell<VecDeque<Weak>>,
     io_ops: RefCell<IoOpsMap>,
-    needs_wake: Arc<AtomicBool>,
+    needs_wake: Arc<AlignedAtomicBool>,
 }
 
 //-----------------------------------------------------------------------------
@@ -958,7 +971,7 @@ impl IoContext
                              runguard_blacklist: RefCell::new(HashSet::new()),
                              local_task_queue: RefCell::new(VecDeque::new()),
                              io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
-                             needs_wake: Arc::new(AtomicBool::new(true)) };
+                             needs_wake: Arc::new(AlignedAtomicBool(AtomicBool::new(true))) };
 
         let p = Rc::new(ioc_frame);
 
