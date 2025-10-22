@@ -20,13 +20,13 @@ extern crate nix;
 
 use std::{
     alloc::Layout,
-    cell::{RefCell, UnsafeCell},
+    cell::{Cell, RefCell, UnsafeCell},
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
     future::Future,
     hash::Hash,
     marker::PhantomData,
-    mem::ManuallyDrop,
+    mem::{ManuallyDrop, forget},
     ops::Deref,
     pin::Pin,
     ptr::{self, DynMetadata, NonNull, metadata},
@@ -102,6 +102,54 @@ impl Deref for AlignedAtomicBool
 struct DanglingExecutor(*const IoContextFrame);
 unsafe impl Send for DanglingExecutor {}
 
+#[derive(Clone, PartialEq, Eq)]
+struct DanglingTask(Cell<*mut TaskHeader>);
+
+unsafe impl Send for DanglingTask {}
+
+impl DanglingTask
+{
+    fn new(task_header: &TaskHeader) -> Self
+    {
+        Self(Cell::new(ptr::from_ref(task_header).cast_mut()))
+    }
+
+    unsafe fn task_header<'a>(&self) -> &'a TaskHeader
+    {
+        unsafe { &*self.0.get() }
+    }
+
+    fn is_null(&self) -> bool
+    {
+        self.0.get().is_null()
+    }
+
+    fn set_inner(&self, t: &DanglingTask)
+    {
+        self.0.set(t.0.get());
+    }
+
+    unsafe fn set_next(&self, t: &DanglingTask)
+    {
+        unsafe { self.task_header().next.set_inner(t) };
+    }
+
+    unsafe fn set_prev(&self, t: &DanglingTask)
+    {
+        unsafe { self.task_header().prev.set_inner(t) };
+    }
+
+    unsafe fn get_next(&self) -> DanglingTask
+    {
+        unsafe { self.task_header().next.clone() }
+    }
+
+    unsafe fn _get_prev(&self) -> DanglingTask
+    {
+        unsafe { self.task_header().prev.clone() }
+    }
+}
+
 //-----------------------------------------------------------------------------
 
 struct TaskHeader
@@ -118,6 +166,8 @@ struct TaskHeader
     ex: DanglingExecutor,
     needs_wake: Arc<AlignedAtomicBool>,
     done: UnsafeCell<bool>,
+    next: DanglingTask,
+    prev: DanglingTask,
 }
 
 //-----------------------------------------------------------------------------
@@ -160,6 +210,19 @@ impl Task
     {
         this.task_header().weak.fetch_add(1, Relaxed);
         Weak { p: this.p,
+               phantom: PhantomData }
+    }
+
+    fn into_raw(this: Self) -> *mut TaskHeader
+    {
+        let p = this.p.as_ptr();
+        forget(this);
+        p.cast::<TaskHeader>()
+    }
+
+    unsafe fn from_raw(p: *mut TaskHeader) -> Task
+    {
+        Task { p: NonNull::new(p.cast()).unwrap(),
                phantom: PhantomData }
     }
 }
@@ -627,7 +690,6 @@ struct IoContextFrame
     ioring: RefCell<io_uring>,
     params: RefCell<io_uring_params>,
     available_fds: RefCell<VecDeque<u32>>,
-    tasks: RefCell<HashSet<Task>>,
     receiver: RefCell<Receiver<Weak>>,
     sender: RefCell<Sender<Weak>>,
     buf_groups: RefCell<HashMap<u16, Box<UnsafeCell<BufGroup>>>>,
@@ -635,6 +697,8 @@ struct IoContextFrame
     local_task_queue: RefCell<VecDeque<Weak>>,
     io_ops: RefCell<IoOpsMap>,
     needs_wake: Arc<AlignedAtomicBool>,
+    head: DanglingTask,
+    tail: DanglingTask,
 }
 
 //-----------------------------------------------------------------------------
@@ -876,9 +940,7 @@ impl Drop for RunGuard
     fn drop(&mut self)
     {
         {
-            let tasks = &mut *self.p.tasks.borrow_mut();
             let local_tasks = &mut *self.p.local_task_queue.borrow_mut();
-            tasks.clear();
             local_tasks.clear();
         }
 
@@ -954,7 +1016,6 @@ impl IoContext
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 
         let ioc_frame = IoContextFrame { params: RefCell::new(params),
-                                         tasks: RefCell::new(HashSet::new()),
                                          available_fds: RefCell::new(VecDeque::new()),
                                          receiver: RefCell::new(rx),
                                          sender: RefCell::new(tx),
@@ -964,7 +1025,9 @@ impl IoContext
                                          local_task_queue: RefCell::new(VecDeque::new()),
                                          io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
                                          needs_wake:
-                                             Arc::new(AlignedAtomicBool(AtomicBool::new(true))) };
+                                             Arc::new(AlignedAtomicBool(AtomicBool::new(true))),
+                                         head: DanglingTask(Cell::new(ptr::null_mut())),
+                                         tail: DanglingTask(Cell::new(ptr::null_mut())) };
 
         let p = Rc::new(ioc_frame);
 
@@ -987,7 +1050,9 @@ impl IoContext
             }
         }
 
-        Self { p }
+        let ioc = Self { p };
+        ioc.init_task_list();
+        ioc
     }
 
     #[must_use]
@@ -1003,10 +1068,8 @@ impl IoContext
 
     fn process_task_queues(&mut self, num_completed: &mut u64) -> bool
     {
-        let ex = self.get_executor();
-
         loop {
-            if self.p.tasks.borrow().is_empty() {
+            if unsafe { self.p.head.get_next() } == self.p.tail {
                 return true;
             }
 
@@ -1015,20 +1078,45 @@ impl IoContext
 
             match (local_task, task) {
                 (Some(weak1), Ok(weak2)) => {
-                    *num_completed += on_work_item(weak1, &ex);
-                    *num_completed += on_work_item(weak2, &ex);
+                    *num_completed += on_work_item(weak1);
+                    *num_completed += on_work_item(weak2);
                 }
                 (Some(weak1), Err(_)) => {
-                    *num_completed += on_work_item(weak1, &ex);
+                    *num_completed += on_work_item(weak1);
                 }
                 (None, Ok(weak2)) => {
-                    *num_completed += on_work_item(weak2, &ex);
+                    *num_completed += on_work_item(weak2);
                 }
                 _ => {
                     return false;
                 }
             }
         }
+    }
+
+    fn init_task_list(&self)
+    {
+        #[allow(clippy::unused_async)]
+        async fn empty()
+        {
+            unreachable!()
+        }
+
+        let head = &self.p.head;
+        let tail = &self.p.tail;
+
+        if !head.is_null() {
+            assert!(!tail.is_null());
+            return;
+        }
+
+        let ex = self.get_executor();
+
+        head.set_inner(&DanglingTask(Cell::new(Task::into_raw(ex.spawn_impl_helper(empty())))));
+        tail.set_inner(&DanglingTask(Cell::new(Task::into_raw(ex.spawn_impl_helper(empty())))));
+
+        unsafe { head.set_next(tail) };
+        unsafe { tail.set_prev(head) };
     }
 
     pub fn run(&mut self) -> u64
@@ -1051,8 +1139,7 @@ impl IoContext
                 break;
             }
 
-            let ret = unsafe { io_uring_submit_and_wait(ring, 1) };
-            debug_assert!(ret >= 0);
+            unsafe { io_uring_submit_and_wait(ring, 1) };
 
             let mut guard = CQEAdvanceGuard { ring, n: 0 };
 
@@ -1090,7 +1177,7 @@ unsafe fn on_cqe(ex: &Executor, cqe: *mut io_uring_cqe, guard: &mut CQEAdvanceGu
     (cqe_handler)(ex, cqe);
 }
 
-fn on_work_item(weak: Weak, ex: &Executor) -> u64
+fn on_work_item(weak: Weak) -> u64
 {
     match unsafe { weak.upgrade() } {
         None => 0,
@@ -1106,8 +1193,16 @@ fn on_work_item(weak: Weak, ex: &Executor) -> u64
             let mut cx = ContextBuilder::from_waker(&w).local_waker(&lw).build();
 
             if let Poll::Ready(()) = unsafe { task.poll(&mut cx) } {
-                ex.p.tasks.borrow_mut().remove(&task);
                 *done = true;
+
+                let prev_task = task.task_header().prev.clone();
+                let next_task = task.task_header().next.clone();
+
+                unsafe { prev_task.set_next(&next_task) };
+                unsafe { next_task.set_prev(&prev_task) };
+
+                drop(unsafe { Task::from_raw(task.p.as_ptr().cast()) });
+
                 1
             } else {
                 0
@@ -1619,6 +1714,13 @@ impl Drop for IoContext
 {
     fn drop(&mut self)
     {
+        let mut curr = self.p.head.clone();
+        while !curr.is_null() {
+            let next = unsafe { curr.get_next() };
+            drop(unsafe { Task::from_raw(curr.0.get()) });
+            curr = next;
+        }
+
         drop(RunGuard { p: self.p.clone() });
 
         let buf_groups = &mut *self.p.buf_groups.borrow_mut();
@@ -1822,7 +1924,7 @@ impl Executor
         Ok(())
     }
 
-    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T>
+    fn spawn_impl_helper<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> Task
     {
         let sender = self.p.sender.borrow().clone();
 
@@ -1848,7 +1950,9 @@ impl Executor
                                        ex: DanglingExecutor(Rc::into_raw(self.clone().p)),
                                        task_layout: layout,
                                        needs_wake: self.p.needs_wake.clone(),
-                                       done: UnsafeCell::new(false) };
+                                       done: UnsafeCell::new(false),
+                                       next: DanglingTask(Cell::new(ptr::null_mut())),
+                                       prev: DanglingTask(Cell::new(ptr::null_mut())) };
 
         let p = unsafe { std::alloc::alloc(layout) };
         assert!(!p.is_null());
@@ -1863,13 +1967,29 @@ impl Executor
         unsafe { std::ptr::write(p.add(value_offset).cast::<SpawnValue<T>>(), value) };
         unsafe { std::ptr::write(p.add(future_offset).cast::<WrapperFuture<T, F>>(), wrapped) };
 
-        let task = Task { p: NonNull::new(p).unwrap(),
-                          phantom: PhantomData };
+        Task { p: NonNull::new(p).unwrap(),
+               phantom: PhantomData }
+    }
 
-        let weak = Task::downgrade(&task);
+    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T>
+    {
+        let task = self.spawn_impl_helper(f);
 
-        self.p.tasks.borrow_mut().insert(task.clone());
-        self.p.local_task_queue.borrow_mut().push_back(weak.clone());
+        let header = task.task_header();
+
+        unsafe { header.next.set_inner(&self.p.head.get_next()) };
+        header.prev.set_inner(&self.p.head.clone());
+
+        unsafe { self.p.head.get_next().set_prev(&DanglingTask::new(header)) };
+        unsafe { self.p.head.set_next(&DanglingTask::new(header)) };
+
+        forget(task.clone());
+
+        self.p
+            .local_task_queue
+            .borrow_mut()
+            .push_back(Task::downgrade(&task));
+
         SpawnFuture::<T> { task: Some(task),
                            done: false,
                            _marker: PhantomData }

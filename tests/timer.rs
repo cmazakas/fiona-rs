@@ -1,14 +1,20 @@
-// Copyright 2024 Christian Mazakas
+// Copyright 2024-2025 Christian Mazakas
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
+extern crate rand;
+
 use std::{
+    cell::RefCell,
     future::Future,
+    rc::Rc,
     task::Poll,
     time::{Duration, Instant},
 };
 
+use fiona::time::Timer;
 use futures::{FutureExt, StreamExt};
+use rand::Rng;
 
 //-----------------------------------------------------------------------------
 
@@ -407,4 +413,28 @@ fn timer_futures_select()
 
     let n = ioc.run();
     assert_eq!(n, 6);
+}
+
+#[test]
+fn timer_random()
+{
+    // Test random destruction order of tasks in the runtime.
+
+    async fn timer_task(ex: fiona::Executor, rng: Rc<RefCell<rand::rngs::ThreadRng>>)
+    {
+        let dur = Duration::from_millis(rng.borrow_mut().random_range(100..=500));
+        Timer::new(ex).wait(dur).await.unwrap();
+    }
+
+    let rng = Rc::new(RefCell::new(rand::rng()));
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    for _ in 0..10_000 {
+        ex.clone().spawn(timer_task(ex.clone(), rng.clone()));
+    }
+
+    let n = ioc.run();
+    assert_eq!(n, 10_000);
 }
