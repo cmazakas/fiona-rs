@@ -2,7 +2,11 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-#![feature(ptr_metadata, box_as_ptr, vec_into_raw_parts, local_waker)]
+#![feature(ptr_metadata,
+           box_as_ptr,
+           vec_into_raw_parts,
+           local_waker,
+           sync_unsafe_cell)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::mutable_key_type,
          clippy::missing_panics_doc,
@@ -20,7 +24,7 @@ extern crate nix;
 
 use std::{
     alloc::Layout,
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{RefCell, SyncUnsafeCell, UnsafeCell},
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
     future::Future,
@@ -101,32 +105,43 @@ impl Deref for AlignedAtomicBool
 
 struct DanglingExecutor(*const IoContextFrame);
 unsafe impl Send for DanglingExecutor {}
+unsafe impl Sync for DanglingExecutor {}
 
-#[derive(Clone, PartialEq, Eq)]
-struct DanglingTask(Cell<*mut TaskHeader>);
+struct DanglingTask(SyncUnsafeCell<*mut TaskHeader>);
 
 unsafe impl Send for DanglingTask {}
+unsafe impl Sync for DanglingTask {}
 
 impl DanglingTask
 {
     fn new(task_header: &TaskHeader) -> Self
     {
-        Self(Cell::new(ptr::from_ref(task_header).cast_mut()))
+        Self(SyncUnsafeCell::new(ptr::from_ref(task_header).cast_mut()))
+    }
+
+    unsafe fn unsafe_clone(&self) -> DanglingTask
+    {
+        unsafe { DanglingTask(SyncUnsafeCell::new(*self.0.get())) }
     }
 
     unsafe fn task_header<'a>(&self) -> &'a TaskHeader
     {
-        unsafe { &*self.0.get() }
+        unsafe { &**self.0.get() }
     }
 
-    fn is_null(&self) -> bool
+    unsafe fn is_null(&self) -> bool
     {
-        self.0.get().is_null()
+        unsafe { (*self.0.get()).is_null() }
     }
 
-    fn set_inner(&self, t: &DanglingTask)
+    unsafe fn get_inner(&self) -> *mut TaskHeader
     {
-        self.0.set(t.0.get());
+        unsafe { *self.0.get() }
+    }
+
+    unsafe fn set_inner(&self, t: &DanglingTask)
+    {
+        unsafe { *self.0.get() = *t.0.get() };
     }
 
     unsafe fn set_next(&self, t: &DanglingTask)
@@ -141,12 +156,12 @@ impl DanglingTask
 
     unsafe fn get_next(&self) -> DanglingTask
     {
-        unsafe { self.task_header().next.clone() }
+        unsafe { self.task_header().next.unsafe_clone() }
     }
 
     unsafe fn _get_prev(&self) -> DanglingTask
     {
-        unsafe { self.task_header().prev.clone() }
+        unsafe { self.task_header().prev.unsafe_clone() }
     }
 }
 
@@ -154,7 +169,7 @@ impl DanglingTask
 
 struct TaskHeader
 {
-    strong: UnsafeCell<u64>,
+    strong: SyncUnsafeCell<u64>,
     weak: AlignedAtomicU64,
     task_layout: Layout,
     value_offset: usize,
@@ -165,7 +180,7 @@ struct TaskHeader
     ring_fd: i32,
     ex: DanglingExecutor,
     needs_wake: Arc<AlignedAtomicBool>,
-    done: UnsafeCell<bool>,
+    done: SyncUnsafeCell<bool>,
     next: DanglingTask,
     prev: DanglingTask,
 }
@@ -1026,8 +1041,8 @@ impl IoContext
                                          io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
                                          needs_wake:
                                              Arc::new(AlignedAtomicBool(AtomicBool::new(true))),
-                                         head: DanglingTask(Cell::new(ptr::null_mut())),
-                                         tail: DanglingTask(Cell::new(ptr::null_mut())) };
+                                         head: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
+                                         tail: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())) };
 
         let p = Rc::new(ioc_frame);
 
@@ -1069,7 +1084,9 @@ impl IoContext
     fn process_task_queues(&mut self, num_completed: &mut u64) -> bool
     {
         loop {
-            if unsafe { self.p.head.get_next() } == self.p.tail {
+            let next = unsafe { self.p.head.get_next().get_inner() };
+            let tail = unsafe { self.p.tail.get_inner() };
+            if next == tail {
                 return true;
             }
 
@@ -1105,15 +1122,20 @@ impl IoContext
         let head = &self.p.head;
         let tail = &self.p.tail;
 
-        if !head.is_null() {
-            assert!(!tail.is_null());
+        if !unsafe { head.is_null() } {
+            assert!(unsafe { !tail.is_null() });
             return;
         }
 
         let ex = self.get_executor();
 
-        head.set_inner(&DanglingTask(Cell::new(Task::into_raw(ex.spawn_impl_helper(empty())))));
-        tail.set_inner(&DanglingTask(Cell::new(Task::into_raw(ex.spawn_impl_helper(empty())))));
+        let dummy_task_head =
+            DanglingTask(SyncUnsafeCell::new(Task::into_raw(ex.spawn_impl_helper(empty()))));
+        let dummy_task_tail =
+            DanglingTask(SyncUnsafeCell::new(Task::into_raw(ex.spawn_impl_helper(empty()))));
+
+        unsafe { head.set_inner(&dummy_task_head) };
+        unsafe { tail.set_inner(&dummy_task_tail) };
 
         unsafe { head.set_next(tail) };
         unsafe { tail.set_prev(head) };
@@ -1195,8 +1217,8 @@ fn on_work_item(weak: Weak) -> u64
             if let Poll::Ready(()) = unsafe { task.poll(&mut cx) } {
                 *done = true;
 
-                let prev_task = task.task_header().prev.clone();
-                let next_task = task.task_header().next.clone();
+                let prev_task = unsafe { task.task_header().prev.unsafe_clone() };
+                let next_task = unsafe { task.task_header().next.unsafe_clone() };
 
                 unsafe { prev_task.set_next(&next_task) };
                 unsafe { next_task.set_prev(&prev_task) };
@@ -1714,10 +1736,10 @@ impl Drop for IoContext
 {
     fn drop(&mut self)
     {
-        let mut curr = self.p.head.clone();
-        while !curr.is_null() {
+        let mut curr = unsafe { self.p.head.unsafe_clone() };
+        while unsafe { !curr.is_null() } {
             let next = unsafe { curr.get_next() };
-            drop(unsafe { Task::from_raw(curr.0.get()) });
+            drop(unsafe { Task::from_raw(*curr.0.get()) });
             curr = next;
         }
 
@@ -1939,7 +1961,7 @@ impl Executor
 
         let ring_fd = self.p.ioring.borrow().ring_fd;
 
-        let task_header = TaskHeader { strong: UnsafeCell::new(1),
+        let task_header = TaskHeader { strong: SyncUnsafeCell::new(1),
                                        weak: AlignedAtomicU64(AtomicU64::new(1)),
                                        value_offset,
                                        future_offset,
@@ -1950,9 +1972,9 @@ impl Executor
                                        ex: DanglingExecutor(Rc::into_raw(self.clone().p)),
                                        task_layout: layout,
                                        needs_wake: self.p.needs_wake.clone(),
-                                       done: UnsafeCell::new(false),
-                                       next: DanglingTask(Cell::new(ptr::null_mut())),
-                                       prev: DanglingTask(Cell::new(ptr::null_mut())) };
+                                       done: SyncUnsafeCell::new(false),
+                                       next: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
+                                       prev: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())) };
 
         let p = unsafe { std::alloc::alloc(layout) };
         assert!(!p.is_null());
@@ -1978,7 +2000,7 @@ impl Executor
         let header = task.task_header();
 
         unsafe { header.next.set_inner(&self.p.head.get_next()) };
-        header.prev.set_inner(&self.p.head.clone());
+        unsafe { header.prev.set_inner(&self.p.head.unsafe_clone()) };
 
         unsafe { self.p.head.get_next().set_prev(&DanglingTask::new(header)) };
         unsafe { self.p.head.set_next(&DanglingTask::new(header)) };
@@ -2014,11 +2036,13 @@ mod test
     use crate::TaskHeader;
 
     fn send_only<T: Send>() {}
+    fn sync_only<T: Sync>() {}
 
     #[test]
     fn is_task_header_send()
     {
         send_only::<TaskHeader>();
+        sync_only::<TaskHeader>();
     }
 
     #[test]
