@@ -952,6 +952,16 @@ fn await_rayon_stress_test()
         }
     }
 
+    async fn async_main(ex: fiona::Executor, thread_pool: Rc<rayon::ThreadPool>)
+    {
+        let mut tasks = FuturesUnordered::new();
+        for _ in 0..100_000 {
+            tasks.push(ex.spawn(fiona_task(thread_pool.clone())));
+        }
+
+        while (tasks.next().await).is_some() {}
+    }
+
     let thread_pool = Rc::new(rayon::ThreadPoolBuilder::new().num_threads(32)
                                                              .build()
                                                              .unwrap());
@@ -959,11 +969,10 @@ fn await_rayon_stress_test()
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
     ex.clone().spawn(timer_task(ex.clone()));
-    for _ in 0..100_000 {
-        ex.clone().spawn(fiona_task(thread_pool.clone()));
-    }
+    ex.clone()
+      .spawn(async_main(ex.clone(), thread_pool.clone()));
     let n = ioc.run();
-    assert_eq!(n, 100_000 + 1);
+    assert_eq!(n, 100_000 + 2);
 }
 
 #[test]
