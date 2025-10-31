@@ -1,7 +1,7 @@
 use core::str;
 use std::{
     future::Future,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, Ipv6Addr},
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     rc::Rc,
@@ -1510,4 +1510,36 @@ fn tcp_eager_drop_connect_ready()
         let stream = acceptor.accept().await.unwrap();
         let _ = stream;
     }
+}
+
+#[test]
+fn tcp_connect_ipv6()
+{
+    static mut NUM_RUNS: u64 = 0;
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    assert!(acceptor.port() != 0);
+
+    let port = acceptor.port();
+
+    ex.spawn(async move {
+          let _stream = acceptor.accept().await.unwrap();
+          unsafe { NUM_RUNS += 1 };
+      });
+
+    let client = fiona::tcp::Client::new(ex.clone());
+    ex.spawn(async move {
+          client.connect_ipv6(Ipv6Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+          unsafe { NUM_RUNS += 1 };
+      });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+    assert_eq!(unsafe { NUM_RUNS }, n);
 }

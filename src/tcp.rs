@@ -24,8 +24,8 @@ use nix::{
     errno::Errno,
     libc::{AF_INET, AF_INET6, ENFILE, IPPROTO_TCP, SOCK_STREAM},
     sys::socket::{
-        AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrStorage,
-        bind, getsockname, listen, setsockopt, socket, sockopt::ReuseAddr,
+        AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrIn6,
+        SockaddrStorage, bind, getsockname, listen, setsockopt, socket, sockopt::ReuseAddr,
     },
 };
 use slotmap::{DefaultKey, Key, KeyData};
@@ -33,7 +33,7 @@ use std::{
     alloc::Layout,
     future::Future,
     mem,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     os::fd::AsRawFd,
     ptr::{self, NonNull},
     task::Poll,
@@ -91,6 +91,58 @@ impl Acceptor
                                            addr:
                                                SockaddrStorage::from(SocketAddrV4::new(addr.ip(),
                                                                                        addr.port())),
+                                           accept_pending: false };
+
+        let p = p.cast::<AcceptorImpl>();
+        unsafe { std::ptr::write(p.as_ptr(), acceptor_impl) };
+
+        Ok(Acceptor { p })
+    }
+
+    pub fn bind_ipv6(ex: Executor, ipv4_addr: Ipv6Addr, port: u16) -> Result<Acceptor>
+    {
+        let Some(offset) = ex.get_available_fd() else {
+            return Err(Errno::from_raw(ENFILE));
+        };
+
+        let socket =
+            socket(AddressFamily::Inet6, SockType::Stream, SockFlag::empty(), SockProtocol::Tcp)?;
+
+        setsockopt(&socket, ReuseAddr, &true).unwrap();
+
+        let addr = SockaddrIn6::from(SocketAddrV6::new(ipv4_addr, port, 0, 0));
+        bind(socket.as_raw_fd(), &addr)?;
+        listen(&socket, Backlog::new(2048).unwrap())?;
+
+        {
+            let ring = ex.ring();
+            let fd = socket.as_raw_fd();
+            let ret = unsafe { io_uring_register_files_update(ring, offset, &raw const fd, 1) };
+            if ret < 0 {
+                return Err(Errno::from_raw(-ret));
+            }
+            assert_eq!(ret, 1);
+        }
+
+        let layout = Layout::new::<AcceptorImpl>();
+        let p = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
+
+        let ref_count = RefCount { obj_count: 1,
+                                   op_count: 0,
+                                   release_impl: release_impl::<AcceptorImpl>,
+                                   obj: p.as_ptr() };
+
+        // we need to do this for when `port == 0` (the wildcard port)
+        let addr = getsockname::<SockaddrIn6>(socket.as_raw_fd())?;
+
+        let acceptor_impl = AcceptorImpl { ref_count,
+                                           ex,
+                                           fd: offset.try_into().unwrap(),
+                                           addr:
+                                               SockaddrStorage::from(SocketAddrV6::new(addr.ip(),
+                                                                                       addr.port(),
+                                                                                       0,
+                                                                                       0)),
                                            accept_pending: false };
 
         let p = p.cast::<AcceptorImpl>();
@@ -745,6 +797,37 @@ impl Client
 
         let ref_count = &raw mut client_impl.stream.ref_count;
         let addr = SocketAddrV4::new(addr, port);
+
+        let op = make_io_uring_op(ref_count,
+                                  OpType::TcpConnect { addr: SockaddrStorage::from(addr),
+                                                       _port: port,
+                                                       ts: client_impl.stream.ts,
+                                                       needs_socket: false,
+                                                       got_socket: false,
+                                                       fd: -1 });
+
+        let key = client_impl.stream
+                             .ex
+                             .p
+                             .io_ops
+                             .borrow_mut()
+                             .insert(op, &client_impl.stream.ex);
+
+        ConnectFuture { client: self,
+                        completed: false,
+                        op: Some(key.data().as_ffi()) }
+    }
+
+    #[must_use]
+    pub fn connect_ipv6(&self, addr: Ipv6Addr, port: u16) -> ConnectFuture<'_>
+    {
+        assert!(unsafe { !(*self.p.as_ptr()).connect_pending });
+
+        let client_impl = unsafe { &mut *self.p.as_ptr() };
+        client_impl.connect_pending = true;
+
+        let ref_count = &raw mut client_impl.stream.ref_count;
+        let addr = SocketAddrV6::new(addr, port, 0, 0);
 
         let op = make_io_uring_op(ref_count,
                                   OpType::TcpConnect { addr: SockaddrStorage::from(addr),
