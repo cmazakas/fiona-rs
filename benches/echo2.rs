@@ -304,7 +304,7 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     let mut ioc = make_io_context(nr_files);
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::tcp::Acceptor::new(ex.clone(), ipv4_addr, port).unwrap();
+    let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), ipv4_addr, port).unwrap();
 
     ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)
       .unwrap();

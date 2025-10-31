@@ -49,7 +49,7 @@ pub struct Acceptor
 
 impl Acceptor
 {
-    pub fn new(ex: Executor, ipv4_addr: Ipv4Addr, port: u16) -> Result<Acceptor>
+    pub fn bind_ipv4(ex: Executor, ipv4_addr: Ipv4Addr, port: u16) -> Result<Acceptor>
     {
         let Some(offset) = ex.get_available_fd() else {
             return Err(Errno::from_raw(ENFILE));

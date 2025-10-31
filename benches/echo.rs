@@ -32,7 +32,7 @@ fn fiona_echo() -> Result<(), String>
     let ex = ioc.get_executor();
 
     let acceptor =
-        fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::new(192, 168, 1, 79), 0).unwrap();
+        fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::new(192, 168, 1, 79), 0).unwrap();
     let port = acceptor.port();
 
     ex.register_buf_group(SERVER_BGID, 16 * 1024, 1024).unwrap();

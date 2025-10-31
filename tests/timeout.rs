@@ -19,7 +19,7 @@ fn tcp_recv_timeout()
 
     async fn server_timeout(ex: fiona::Executor)
     {
-        let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+        let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
         let port = acceptor.port();
 
         let bgid = 0;
@@ -83,7 +83,7 @@ fn tcp_recv_timeout()
 
     async fn client_timeout(ex: fiona::Executor)
     {
-        let acceptor = fiona::tcp::Acceptor::new(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+        let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
         let port = acceptor.port();
 
         let bgid = 1;
