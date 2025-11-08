@@ -25,7 +25,8 @@ use nix::{
     libc::{AF_INET, AF_INET6, ENFILE, IPPROTO_TCP, SOCK_STREAM},
     sys::socket::{
         AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrIn6,
-        SockaddrStorage, bind, getsockname, listen, setsockopt, socket, sockopt::ReuseAddr,
+        SockaddrLike, SockaddrStorage, bind, getsockname, listen, setsockopt, socket,
+        sockopt::{ReuseAddr, ReusePort},
     },
 };
 use slotmap::{DefaultKey, Key, KeyData};
@@ -42,6 +43,25 @@ use std::{
 
 //-----------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptorOpts
+{
+    pub reuse_addr: bool,
+    pub reuse_port: bool,
+}
+
+impl Default for AcceptorOpts
+{
+    fn default() -> Self
+    {
+        Self { reuse_addr: true,
+               reuse_port: false }
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+#[derive(Debug)]
 pub struct Acceptor
 {
     p: NonNull<AcceptorImpl>,
@@ -49,20 +69,28 @@ pub struct Acceptor
 
 impl Acceptor
 {
-    pub fn bind_ipv4(ex: Executor, ipv4_addr: Ipv4Addr, port: u16) -> Result<Acceptor>
+    const DEFAULT_BACKLOG: i32 = 2 * 1024;
+
+    fn bind_ip_impl(ex: Executor, ip_addr: &dyn SockaddrLike, opts: &AcceptorOpts,
+                    af: AddressFamily)
+                    -> Result<Acceptor>
     {
         let Some(offset) = ex.get_available_fd() else {
             return Err(Errno::from_raw(ENFILE));
         };
 
-        let socket =
-            socket(AddressFamily::Inet, SockType::Stream, SockFlag::empty(), SockProtocol::Tcp)?;
+        let socket = socket(af, SockType::Stream, SockFlag::empty(), SockProtocol::Tcp)?;
 
-        setsockopt(&socket, ReuseAddr, &true).unwrap();
+        if opts.reuse_addr {
+            setsockopt(&socket, ReuseAddr, &true)?;
+        }
 
-        let addr = SockaddrIn::from(SocketAddrV4::new(ipv4_addr, port));
-        bind(socket.as_raw_fd(), &addr)?;
-        listen(&socket, Backlog::new(2048).unwrap())?;
+        if opts.reuse_port {
+            setsockopt(&socket, ReusePort, &true)?;
+        }
+
+        bind(socket.as_raw_fd(), ip_addr)?;
+        listen(&socket, Backlog::new(Self::DEFAULT_BACKLOG).unwrap())?;
 
         {
             let ring = ex.ring();
@@ -83,14 +111,12 @@ impl Acceptor
                                    obj: p.as_ptr() };
 
         // we need to do this for when `port == 0` (the wildcard port)
-        let addr = getsockname::<SockaddrIn>(socket.as_raw_fd())?;
+        let addr = getsockname::<SockaddrStorage>(socket.as_raw_fd())?;
 
         let acceptor_impl = AcceptorImpl { ref_count,
                                            ex,
                                            fd: offset.try_into().unwrap(),
-                                           addr:
-                                               SockaddrStorage::from(SocketAddrV4::new(addr.ip(),
-                                                                                       addr.port())),
+                                           addr,
                                            accept_pending: false };
 
         let p = p.cast::<AcceptorImpl>();
@@ -99,56 +125,30 @@ impl Acceptor
         Ok(Acceptor { p })
     }
 
-    pub fn bind_ipv6(ex: Executor, ipv4_addr: Ipv6Addr, port: u16) -> Result<Acceptor>
+    pub fn bind_ipv4_with_params(ex: Executor, ipv4_addr: Ipv4Addr, port: u16, opts: &AcceptorOpts)
+                                 -> Result<Acceptor>
     {
-        let Some(offset) = ex.get_available_fd() else {
-            return Err(Errno::from_raw(ENFILE));
-        };
+        let addr = SockaddrIn::from(SocketAddrV4::new(ipv4_addr, port));
+        Self::bind_ip_impl(ex, &addr, opts, AddressFamily::Inet)
+    }
 
-        let socket =
-            socket(AddressFamily::Inet6, SockType::Stream, SockFlag::empty(), SockProtocol::Tcp)?;
+    pub fn bind_ipv4(ex: Executor, ipv4_addr: Ipv4Addr, port: u16) -> Result<Acceptor>
+    {
+        let addr = SockaddrIn::from(SocketAddrV4::new(ipv4_addr, port));
+        Self::bind_ip_impl(ex, &addr, &AcceptorOpts::default(), AddressFamily::Inet)
+    }
 
-        setsockopt(&socket, ReuseAddr, &true).unwrap();
+    pub fn bind_ipv6(ex: Executor, ipv6_addr: Ipv6Addr, port: u16) -> Result<Acceptor>
+    {
+        let addr = SockaddrIn6::from(SocketAddrV6::new(ipv6_addr, port, 0, 0));
+        Self::bind_ip_impl(ex, &addr, &AcceptorOpts::default(), AddressFamily::Inet6)
+    }
 
-        let addr = SockaddrIn6::from(SocketAddrV6::new(ipv4_addr, port, 0, 0));
-        bind(socket.as_raw_fd(), &addr)?;
-        listen(&socket, Backlog::new(2048).unwrap())?;
-
-        {
-            let ring = ex.ring();
-            let fd = socket.as_raw_fd();
-            let ret = unsafe { io_uring_register_files_update(ring, offset, &raw const fd, 1) };
-            if ret < 0 {
-                return Err(Errno::from_raw(-ret));
-            }
-            assert_eq!(ret, 1);
-        }
-
-        let layout = Layout::new::<AcceptorImpl>();
-        let p = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
-
-        let ref_count = RefCount { obj_count: 1,
-                                   op_count: 0,
-                                   release_impl: release_impl::<AcceptorImpl>,
-                                   obj: p.as_ptr() };
-
-        // we need to do this for when `port == 0` (the wildcard port)
-        let addr = getsockname::<SockaddrIn6>(socket.as_raw_fd())?;
-
-        let acceptor_impl = AcceptorImpl { ref_count,
-                                           ex,
-                                           fd: offset.try_into().unwrap(),
-                                           addr:
-                                               SockaddrStorage::from(SocketAddrV6::new(addr.ip(),
-                                                                                       addr.port(),
-                                                                                       0,
-                                                                                       0)),
-                                           accept_pending: false };
-
-        let p = p.cast::<AcceptorImpl>();
-        unsafe { std::ptr::write(p.as_ptr(), acceptor_impl) };
-
-        Ok(Acceptor { p })
+    pub fn bind_ipv6_with_params(ex: Executor, ipv6_addr: Ipv6Addr, port: u16, opts: &AcceptorOpts)
+                                 -> Result<Acceptor>
+    {
+        let addr = SockaddrIn6::from(SocketAddrV6::new(ipv6_addr, port, 0, 0));
+        Self::bind_ip_impl(ex, &addr, opts, AddressFamily::Inet6)
     }
 
     #[must_use]

@@ -5,6 +5,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
     task::Poll,
     time::Duration,
 };
@@ -1542,4 +1543,148 @@ fn tcp_connect_ipv6()
     let n = ioc.run();
     assert_eq!(n, 2);
     assert_eq!(unsafe { NUM_RUNS }, n);
+}
+
+#[test]
+fn tcp_reuse_port_ipv4()
+{
+    static NUM_RUNS: AtomicU64 = AtomicU64::new(0);
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let opts = &fiona::tcp::AcceptorOpts { reuse_addr: true,
+                                           reuse_port: true };
+    let acceptor = fiona::tcp::Acceptor::bind_ipv4_with_params(ex.clone(),
+                                                               Ipv4Addr::LOCALHOST,
+                                                               0,
+                                                               opts).unwrap();
+    let port = acceptor.port();
+
+    let failed = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, port);
+    assert_eq!(failed.unwrap_err(), Errno::EADDRINUSE);
+
+    let t = std::thread::spawn(move || {
+        let mut ioc = fiona::IoContext::new();
+        let ex = ioc.get_executor();
+
+        ex.register_buf_group(1, 128, 64).unwrap();
+
+        let opts = &fiona::tcp::AcceptorOpts { reuse_addr: true,
+                                               reuse_port: true };
+        let acceptor = fiona::tcp::Acceptor::bind_ipv4_with_params(ex.clone(),
+                                                                   Ipv4Addr::LOCALHOST,
+                                                                   port,
+                                                                   opts).unwrap();
+
+        ex.spawn(async move {
+              let s = acceptor.accept().await.unwrap();
+              let _ = s.close().await;
+
+              NUM_RUNS.fetch_add(1, Ordering::Relaxed);
+          });
+
+        ioc.run();
+    });
+
+    ex.register_buf_group(0, 128, 64).unwrap();
+
+    ex.clone().spawn(async move {
+                  let s = acceptor.accept().await.unwrap();
+                  let _ = s.close().await;
+
+                  NUM_RUNS.fetch_add(1, Ordering::Relaxed);
+              });
+
+    let client_op = async |ex: fiona::Executor, port: u16| {
+        let client = fiona::tcp::Client::new(ex.clone());
+        let r = client.connect_ipv4(Ipv4Addr::LOCALHOST, port).await;
+        if r.is_err() {
+            return;
+        }
+
+        let s = client.as_stream();
+        let _ = s.close().await;
+    };
+
+    for _ in 0..16 {
+        ex.clone().spawn(client_op(ex.clone(), port));
+    }
+
+    std::thread::sleep(Duration::from_millis(250));
+    ioc.run();
+    t.join().unwrap();
+    assert_eq!(NUM_RUNS.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn tcp_reuse_port_ipv6()
+{
+    static NUM_RUNS: AtomicU64 = AtomicU64::new(0);
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let opts = &fiona::tcp::AcceptorOpts { reuse_addr: true,
+                                           reuse_port: true };
+    let acceptor = fiona::tcp::Acceptor::bind_ipv6_with_params(ex.clone(),
+                                                               Ipv6Addr::LOCALHOST,
+                                                               0,
+                                                               opts).unwrap();
+    let port = acceptor.port();
+
+    let failed = fiona::tcp::Acceptor::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, port);
+    assert_eq!(failed.unwrap_err(), Errno::EADDRINUSE);
+
+    let t = std::thread::spawn(move || {
+        let mut ioc = fiona::IoContext::new();
+        let ex = ioc.get_executor();
+
+        ex.register_buf_group(1, 128, 64).unwrap();
+
+        let opts = &fiona::tcp::AcceptorOpts { reuse_addr: true,
+                                               reuse_port: true };
+        let acceptor = fiona::tcp::Acceptor::bind_ipv6_with_params(ex.clone(),
+                                                                   Ipv6Addr::LOCALHOST,
+                                                                   port,
+                                                                   opts).unwrap();
+
+        ex.spawn(async move {
+              let s = acceptor.accept().await.unwrap();
+              let _ = s.close().await;
+
+              NUM_RUNS.fetch_add(1, Ordering::Relaxed);
+          });
+
+        ioc.run();
+    });
+
+    ex.register_buf_group(0, 128, 64).unwrap();
+
+    ex.clone().spawn(async move {
+                  let s = acceptor.accept().await.unwrap();
+                  let _ = s.close().await;
+
+                  NUM_RUNS.fetch_add(1, Ordering::Relaxed);
+              });
+
+    let client_op = async |ex: fiona::Executor, port: u16| {
+        let client = fiona::tcp::Client::new(ex.clone());
+        let r = client.connect_ipv6(Ipv6Addr::LOCALHOST, port).await;
+        if r.is_err() {
+            return;
+        }
+
+        let s = client.as_stream();
+        let _ = s.close().await;
+    };
+
+    for _ in 0..16 {
+        ex.clone().spawn(client_op(ex.clone(), port));
+    }
+
+    std::thread::sleep(Duration::from_millis(250));
+    ioc.run();
+    t.join().unwrap();
+    assert_eq!(NUM_RUNS.load(Ordering::Relaxed), 2);
 }
