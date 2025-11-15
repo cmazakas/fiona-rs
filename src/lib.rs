@@ -949,6 +949,24 @@ impl Drop for IncrGuard<'_>
     }
 }
 
+unsafe fn clear_task_list(p: &Rc<IoContextFrame>)
+{
+    let mut curr = unsafe { p.head.unsafe_clone() };
+    while unsafe { !curr.is_null() } {
+        let next = unsafe { curr.get_next() };
+        drop(unsafe { Task::from_raw(*curr.0.get()) });
+        curr = next;
+    }
+
+    unsafe {
+        p.head
+         .set_inner(&DanglingTask(SyncUnsafeCell::new(ptr::null_mut())));
+
+        p.tail
+         .set_inner(&DanglingTask(SyncUnsafeCell::new(ptr::null_mut())));
+    }
+}
+
 impl Drop for RunGuard
 {
     #![allow(clippy::redundant_closure_call)]
@@ -957,6 +975,12 @@ impl Drop for RunGuard
         {
             let local_tasks = &mut *self.p.local_task_queue.borrow_mut();
             local_tasks.clear();
+
+            while let Ok(task) = self.p.receiver.borrow_mut().try_recv() {
+                drop(task);
+            }
+
+            unsafe { clear_task_list(&self.p) };
         }
 
         let ring = (|| &raw mut *self.p.ioring.borrow_mut())();
@@ -987,7 +1011,8 @@ impl Drop for RunGuard
                         continue;
                     }
 
-                    unsafe { release_op(op.ref_count) };
+                    let rc = op.ref_count;
+                    unsafe { release_op(rc) };
                 }
             }
 
@@ -1736,13 +1761,6 @@ impl Drop for IoContext
 {
     fn drop(&mut self)
     {
-        let mut curr = unsafe { self.p.head.unsafe_clone() };
-        while unsafe { !curr.is_null() } {
-            let next = unsafe { curr.get_next() };
-            drop(unsafe { Task::from_raw(*curr.0.get()) });
-            curr = next;
-        }
-
         drop(RunGuard { p: self.p.clone() });
 
         let buf_groups = &mut *self.p.buf_groups.borrow_mut();
