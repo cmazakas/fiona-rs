@@ -1676,7 +1676,7 @@ fn on_timeout_multishot(ex: &Executor, cqe: &mut io_uring_cqe)
 
     if recv_expired || send_expired {
         let sqe = get_sqe(ex);
-        let fd = stream_impl.fd;
+        let fd = stream_impl.fd_impl.fd;
         let flags = IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED;
         unsafe { io_uring_prep_cancel_fd(sqe, fd, flags) };
         unsafe { io_uring_sqe_set_data64(sqe, 0) };

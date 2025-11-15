@@ -1688,3 +1688,54 @@ fn tcp_reuse_port_ipv6()
     t.join().unwrap();
     assert_eq!(NUM_RUNS.load(Ordering::Relaxed), 2);
 }
+
+#[test]
+#[allow(clippy::redundant_closure_call)]
+fn tcp_acceptor_cancel()
+{
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    ex.clone().spawn((async |acceptor: fiona::tcp::Acceptor| {
+                         match acceptor.accept().await {
+                             Err(Errno::ECANCELED) => return,
+                             _ => unreachable!(),
+                         };
+                     })(acceptor.clone()));
+
+    ex.clone().spawn((async |acceptor: fiona::tcp::Acceptor| {
+                         acceptor.cancel().await.unwrap();
+                     })(acceptor.clone()));
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+}
+
+#[test]
+#[allow(clippy::redundant_closure_call)]
+fn tcp_acceptor_close()
+{
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    ex.clone().spawn((async |acceptor: fiona::tcp::Acceptor| {
+                         match acceptor.accept().await {
+                             Err(Errno::ECANCELED) => return,
+                             _ => unreachable!(),
+                         };
+                     })(acceptor.clone()));
+
+    ex.clone().spawn((async |acceptor: fiona::tcp::Acceptor| {
+                         acceptor.cancel().await.unwrap();
+                         acceptor.close().await.unwrap();
+                         match acceptor.cancel().await {
+                             Err(Errno::EBADF) => {}
+                             _ => unreachable!(),
+                         }
+                     })(acceptor.clone()));
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+}

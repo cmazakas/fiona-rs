@@ -33,6 +33,7 @@ use slotmap::{DefaultKey, Key, KeyData};
 use std::{
     alloc::Layout,
     future::Future,
+    marker::PhantomData,
     mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     os::fd::AsRawFd,
@@ -113,9 +114,12 @@ impl Acceptor
         // we need to do this for when `port == 0` (the wildcard port)
         let addr = getsockname::<SockaddrStorage>(socket.as_raw_fd())?;
 
-        let acceptor_impl = AcceptorImpl { ref_count,
-                                           ex,
-                                           fd: offset.try_into().unwrap(),
+        let acceptor_impl = AcceptorImpl { fd_impl: FdImpl { ref_count,
+                                                             ex,
+                                                             fd: offset.try_into().unwrap(),
+                                                             cancel_pending: false,
+                                                             close_pending: false,
+                                                             was_closed: false },
                                            addr,
                                            accept_pending: false };
 
@@ -174,14 +178,15 @@ impl Acceptor
         let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
         acceptor_impl.accept_pending = true;
 
-        let ref_count = &raw mut acceptor_impl.ref_count;
+        let ref_count = &raw mut acceptor_impl.fd_impl.ref_count;
 
-        let key = acceptor_impl.ex
+        let key = acceptor_impl.fd_impl
+                               .ex
                                .p
                                .io_ops
                                .borrow_mut()
                                .insert(make_io_uring_op(ref_count, OpType::TcpAccept { fd: -1 }),
-                                       &acceptor_impl.ex);
+                                       &acceptor_impl.fd_impl.ex);
 
         AcceptFuture { acceptor: self,
                        completed: false,
@@ -192,7 +197,63 @@ impl Acceptor
     pub fn get_executor(&self) -> Executor
     {
         let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
-        acceptor_impl.ex.clone()
+        acceptor_impl.fd_impl.ex.clone()
+    }
+
+    #[must_use]
+    pub fn cancel(&self) -> CancelFuture<'_>
+    {
+        assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
+
+        let acceptor = unsafe { &mut *self.p.as_ptr() };
+        acceptor.fd_impl.cancel_pending = true;
+
+        let ref_count = &raw mut acceptor.fd_impl.ref_count;
+        let key =
+            acceptor.fd_impl
+                    .ex
+                    .p
+                    .io_ops
+                    .borrow_mut()
+                    .insert(make_io_uring_op(ref_count, OpType::TcpCancel), &acceptor.fd_impl.ex);
+
+        CancelFuture { fd_impl: &raw mut acceptor.fd_impl,
+                       completed: false,
+                       op: Some(key.data().as_ffi()),
+                       _m: PhantomData }
+    }
+
+    #[must_use]
+    pub fn close(&self) -> CloseFuture<'_>
+    {
+        assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
+
+        let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
+        acceptor_impl.fd_impl.close_pending = true;
+
+        let ref_count = &raw mut acceptor_impl.fd_impl.ref_count;
+        let key = acceptor_impl.fd_impl
+                               .ex
+                               .p
+                               .io_ops
+                               .borrow_mut()
+                               .insert(make_io_uring_op(ref_count, OpType::TcpClose),
+                                       &acceptor_impl.fd_impl.ex);
+
+        CloseFuture { fd_impl: &raw mut acceptor_impl.fd_impl,
+                      completed: false,
+                      op: Some(key.data().as_ffi()),
+                      _m: PhantomData }
+    }
+}
+
+impl Clone for Acceptor
+{
+    fn clone(&self) -> Self
+    {
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
+        unsafe { add_obj_ref(rc) };
+        Self { p: self.p }
     }
 }
 
@@ -200,18 +261,28 @@ impl Drop for Acceptor
 {
     fn drop(&mut self)
     {
-        let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
         unsafe { release_obj(rc) };
     }
 }
 
 //-----------------------------------------------------------------------------
 
-struct AcceptorImpl
+pub(crate) struct FdImpl
 {
     ref_count: RefCount,
     ex: Executor,
-    fd: i32,
+    pub(crate) fd: i32,
+    pub(crate) close_pending: bool,
+    pub(crate) cancel_pending: bool,
+    was_closed: bool,
+}
+
+//-----------------------------------------------------------------------------
+
+struct AcceptorImpl
+{
+    fd_impl: FdImpl,
     addr: SockaddrStorage,
     accept_pending: bool,
 }
@@ -220,17 +291,23 @@ impl Drop for AcceptorImpl
 {
     fn drop(&mut self)
     {
-        if self.fd >= 0 {
-            let fd = self.fd.try_into().unwrap();
+        if self.fd_impl.fd >= 0 {
+            let fd = self.fd_impl.fd.try_into().unwrap();
 
-            let key =
-                self.ex
-                    .p
-                    .io_ops
-                    .borrow_mut()
-                    .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), &self.ex);
+            if self.fd_impl.was_closed {
+                self.fd_impl.ex.reclaim_fd(fd);
+                return;
+            }
 
-            let sqe = get_sqe(&self.ex);
+            let key = self.fd_impl
+                          .ex
+                          .p
+                          .io_ops
+                          .borrow_mut()
+                          .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }),
+                                  &self.fd_impl.ex);
+
+            let sqe = get_sqe(&self.fd_impl.ex);
             unsafe { io_uring_prep_close_direct(sqe, fd) };
             unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
         }
@@ -260,7 +337,7 @@ impl Future for AcceptFuture<'_>
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
 
-        let mut borrow_guard = acceptor_impl.ex.p.io_ops.borrow_mut();
+        let mut borrow_guard = acceptor_impl.fd_impl.ex.p.io_ops.borrow_mut();
         let io_ops = &mut *borrow_guard;
         let op = io_ops.get_mut(key).unwrap();
 
@@ -271,7 +348,7 @@ impl Future for AcceptFuture<'_>
             }
             (false, true) => unreachable!(),
             (false, false) => {
-                let Some(file_index) = acceptor_impl.ex.get_available_fd() else {
+                let Some(file_index) = acceptor_impl.fd_impl.ex.get_available_fd() else {
                     self.completed = true;
                     return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                 };
@@ -284,11 +361,11 @@ impl Future for AcceptFuture<'_>
                     *fd = file_index.try_into().unwrap();
                 }
 
-                let sqe = get_sqe(&acceptor_impl.ex);
+                let sqe = get_sqe(&acceptor_impl.fd_impl.ex);
 
                 unsafe {
                     io_uring_prep_accept_direct(sqe,
-                                                acceptor_impl.fd,
+                                                acceptor_impl.fd_impl.fd,
                                                 std::ptr::null_mut(),
                                                 std::ptr::null_mut(),
                                                 0,
@@ -297,7 +374,7 @@ impl Future for AcceptFuture<'_>
                 unsafe { io_uring_sqe_set_data64(sqe, key_data) };
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) };
 
-                unsafe { add_op_ref(&raw mut acceptor_impl.ref_count) };
+                unsafe { add_op_ref(&raw mut acceptor_impl.fd_impl.ref_count) };
                 op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
                 Poll::Pending
@@ -316,7 +393,7 @@ impl Future for AcceptFuture<'_>
                     };
 
                     drop(borrow_guard);
-                    Poll::Ready(Ok(Stream::new(acceptor_impl.ex.clone(), fd)))
+                    Poll::Ready(Ok(Stream::new(acceptor_impl.fd_impl.ex.clone(), fd)))
                 }
             }
         }
@@ -333,7 +410,7 @@ impl Drop for AcceptFuture<'_>
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
 
-        let mut borrow_guard = acceptor_impl.ex.p.io_ops.borrow_mut();
+        let mut borrow_guard = acceptor_impl.fd_impl.ex.p.io_ops.borrow_mut();
         let io_ops = &mut *borrow_guard;
         let op = io_ops.get_mut(key).unwrap();
 
@@ -345,16 +422,16 @@ impl Drop for AcceptFuture<'_>
             op.eager_dropped = true;
             op.local_waker = None;
 
-            let ref_count = &raw mut acceptor_impl.ref_count;
-            let key =
-                io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel), &acceptor_impl.ex);
+            let ref_count = &raw mut acceptor_impl.fd_impl.ref_count;
+            let key = io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel),
+                                    &acceptor_impl.fd_impl.ex);
 
             unsafe { add_op_ref(ref_count) };
 
-            let sqe = get_sqe(&acceptor_impl.ex);
+            let sqe = get_sqe(&acceptor_impl.fd_impl.ex);
             unsafe {
                 io_uring_prep_cancel_fd(sqe,
-                                        acceptor_impl.fd,
+                                        acceptor_impl.fd_impl.fd,
                                         IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED);
             }
             unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
@@ -376,7 +453,7 @@ impl Drop for AcceptFuture<'_>
             io_ops.remove(key).unwrap();
             drop(borrow_guard);
 
-            let ex = &acceptor_impl.ex;
+            let ex = &acceptor_impl.fd_impl.ex;
             let key = ex.p
                         .io_ops
                         .borrow_mut()
@@ -396,43 +473,39 @@ impl Drop for AcceptFuture<'_>
 
 pub(crate) struct StreamImpl
 {
-    pub(crate) fd: i32,
+    pub(crate) fd_impl: FdImpl,
     pub(crate) send_pending: bool,
     pub(crate) shutdown_pending: bool,
-    pub(crate) close_pending: bool,
-    pub(crate) cancel_pending: bool,
     pub(crate) recv_op: Option<u64>,
     pub(crate) last_send: Instant,
     pub(crate) last_recv: Instant,
-    ref_count: RefCount,
-    ex: Executor,
     ts: __kernel_timespec,
     buf_group: u16,
     recv_pending: bool,
     timeout_op: Option<u64>,
-    was_closed: bool,
 }
 
 impl Drop for StreamImpl
 {
     fn drop(&mut self)
     {
-        if self.fd >= 0 {
-            let fd = self.fd.try_into().unwrap();
+        if self.fd_impl.fd >= 0 {
+            let fd = self.fd_impl.fd.try_into().unwrap();
 
-            if self.was_closed {
-                self.ex.reclaim_fd(fd);
+            if self.fd_impl.was_closed {
+                self.fd_impl.ex.reclaim_fd(fd);
                 return;
             }
 
-            let key =
-                self.ex
-                    .p
-                    .io_ops
-                    .borrow_mut()
-                    .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), &self.ex);
+            let key = self.fd_impl
+                          .ex
+                          .p
+                          .io_ops
+                          .borrow_mut()
+                          .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }),
+                                  &self.fd_impl.ex);
 
-            let sqe = get_sqe(&self.ex);
+            let sqe = get_sqe(&self.fd_impl.ex);
             unsafe { io_uring_prep_close_direct(sqe, fd) };
             unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
         }
@@ -462,34 +535,34 @@ impl Stream
                                        release_impl: release_impl::<StreamImpl>,
                                        obj: ptr.as_ptr() };
 
-            let stream_impl = StreamImpl { ref_count,
-                                           ex,
-                                           fd,
+            let stream_impl = StreamImpl { fd_impl: FdImpl { ref_count,
+                                                             ex,
+                                                             fd,
+                                                             close_pending: false,
+                                                             cancel_pending: false,
+                                                             was_closed: false },
                                            ts: Duration::from_secs(3).into(),
                                            buf_group: u16::MAX,
                                            send_pending: false,
                                            recv_pending: false,
                                            shutdown_pending: false,
-                                           close_pending: false,
-                                           cancel_pending: false,
                                            last_send: Instant::now(),
                                            last_recv: Instant::now(),
                                            timeout_op: None,
-                                           recv_op: None,
-                                           was_closed: false };
+                                           recv_op: None };
 
             p = ptr.cast::<StreamImpl>();
             unsafe { std::ptr::write(p.as_ptr(), stream_impl) };
         }
 
         let stream_impl = unsafe { &mut *p.as_ptr() };
-        let ref_count = &raw mut stream_impl.ref_count;
+        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
 
-        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
         let key = io_ops.insert(make_io_uring_op(ref_count,
                                                  OpType::MultishotTimeout { ts: stream_impl.ts,
                                                                             stream: p.as_ptr() }),
-                                &stream_impl.ex);
+                                &stream_impl.fd_impl.ex);
 
         let op = io_ops.get_mut(key).unwrap();
         let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
@@ -499,7 +572,7 @@ impl Stream
         let ts = ptr::from_mut(ts).cast();
         let user_data = key.data().as_ffi();
 
-        let sqe = get_sqe(&stream_impl.ex);
+        let sqe = get_sqe(&stream_impl.fd_impl.ex);
         unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
         unsafe { io_uring_sqe_set_data64(sqe, user_data) };
 
@@ -513,7 +586,7 @@ impl Stream
     pub fn get_executor(&self) -> Executor
     {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
-        stream_impl.ex.clone()
+        stream_impl.fd_impl.ex.clone()
     }
 
     pub fn set_buf_group(&self, bgid: u16)
@@ -536,9 +609,10 @@ impl Stream
         stream_impl.last_send = Instant::now();
 
         let last_send = &raw mut stream_impl.last_send;
-        let ref_count = &raw mut stream_impl.ref_count;
+        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
 
-        let key = stream_impl.ex
+        let key = stream_impl.fd_impl
+                             .ex
                              .p
                              .io_ops
                              .borrow_mut()
@@ -546,7 +620,7 @@ impl Stream
                                                       OpType::TcpSend { buf,
                                                                         last_send,
                                                                         num_sent: 0 }),
-                                     &stream_impl.ex);
+                                     &stream_impl.fd_impl.ex);
 
         SendFuture { stream: self,
                      completed: false,
@@ -572,13 +646,14 @@ impl Stream
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.shutdown_pending = true;
 
-        let ref_count = &raw mut stream_impl.ref_count;
-        let key =
-            stream_impl.ex
-                       .p
-                       .io_ops
-                       .borrow_mut()
-                       .insert(make_io_uring_op(ref_count, OpType::TcpShutdown), &stream_impl.ex);
+        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
+        let key = stream_impl.fd_impl
+                             .ex
+                             .p
+                             .io_ops
+                             .borrow_mut()
+                             .insert(make_io_uring_op(ref_count, OpType::TcpShutdown),
+                                     &stream_impl.fd_impl.ex);
 
         ShutdownFuture { stream: self,
                          completed: false,
@@ -589,43 +664,49 @@ impl Stream
     #[must_use]
     pub fn close(&self) -> CloseFuture<'_>
     {
-        assert!(unsafe { !(*self.p.as_ptr()).close_pending });
+        assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
-        stream_impl.close_pending = true;
+        stream_impl.fd_impl.close_pending = true;
 
-        let ref_count = &raw mut stream_impl.ref_count;
+        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
         let key =
-            stream_impl.ex
+            stream_impl.fd_impl
+                       .ex
                        .p
                        .io_ops
                        .borrow_mut()
-                       .insert(make_io_uring_op(ref_count, OpType::TcpClose), &stream_impl.ex);
+                       .insert(make_io_uring_op(ref_count, OpType::TcpClose),
+                               &stream_impl.fd_impl.ex);
 
-        CloseFuture { stream: self,
+        CloseFuture { fd_impl: &raw mut stream_impl.fd_impl,
                       completed: false,
-                      op: Some(key.data().as_ffi()) }
+                      op: Some(key.data().as_ffi()),
+                      _m: PhantomData }
     }
 
     #[must_use]
     pub fn cancel(&self) -> CancelFuture<'_>
     {
-        assert!(unsafe { !(*self.p.as_ptr()).cancel_pending });
+        assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
-        stream_impl.cancel_pending = true;
+        stream_impl.fd_impl.cancel_pending = true;
 
-        let ref_count = &raw mut stream_impl.ref_count;
+        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
         let key =
-            stream_impl.ex
+            stream_impl.fd_impl
+                       .ex
                        .p
                        .io_ops
                        .borrow_mut()
-                       .insert(make_io_uring_op(ref_count, OpType::TcpCancel), &stream_impl.ex);
+                       .insert(make_io_uring_op(ref_count, OpType::TcpCancel),
+                               &stream_impl.fd_impl.ex);
 
-        CancelFuture { stream: self,
-                       completed: false,
-                       op: Some(key.data().as_ffi()) }
+        CancelFuture { completed: false,
+                       op: Some(key.data().as_ffi()),
+                       fd_impl: &raw mut stream_impl.fd_impl,
+                       _m: PhantomData }
     }
 
     pub fn set_timeout(&self, dur: Duration)
@@ -634,9 +715,9 @@ impl Stream
         stream_impl.ts = dur.into();
 
         if let Some(timeout_op) = stream_impl.timeout_op {
-            let sqe = get_sqe(&stream_impl.ex);
+            let sqe = get_sqe(&stream_impl.fd_impl.ex);
 
-            let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+            let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
             let op = io_ops.get_mut(DefaultKey::from(KeyData::from_ffi(timeout_op)))
                            .unwrap();
 
@@ -660,7 +741,7 @@ impl Drop for Stream
 {
     fn drop(&mut self)
     {
-        let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
         if unsafe { (*rc).obj_count } == 1 {
             let stream_impl = unsafe { &mut *self.p.as_ptr() };
 
@@ -668,14 +749,14 @@ impl Drop for Stream
                 let key_data = stream_impl.timeout_op.take().unwrap();
                 let key = DefaultKey::from(KeyData::from_ffi(key_data));
 
-                let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+                let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
                 let op = io_ops.get_mut(key).unwrap();
 
                 let user_data = key_data;
                 // makes sure this gets cleaned up, not really an eager-dropped operation
                 op.eager_dropped = true;
 
-                let sqe = get_sqe(&stream_impl.ex);
+                let sqe = get_sqe(&stream_impl.fd_impl.ex);
                 unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
                 unsafe { io_uring_sqe_set_data64(sqe, 0) };
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
@@ -686,7 +767,7 @@ impl Drop for Stream
             if stream_impl.recv_op.is_some() {
                 let key_data = stream_impl.recv_op.take().unwrap();
                 let key = DefaultKey::from(KeyData::from_ffi(key_data));
-                let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+                let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
                 let op = io_ops.get_mut(key).unwrap();
 
                 stream_impl.recv_op = None;
@@ -698,7 +779,7 @@ impl Drop for Stream
                     // makes sure this gets cleaned up, not really an eager-dropped operation
                     op.eager_dropped = true;
 
-                    let sqe = get_sqe(&stream_impl.ex);
+                    let sqe = get_sqe(&stream_impl.fd_impl.ex);
                     unsafe { io_uring_prep_cancel64(sqe, user_data, 0) };
                     unsafe { io_uring_sqe_set_data64(sqe, 0) };
                     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
@@ -714,7 +795,7 @@ impl Clone for Stream
 {
     fn clone(&self) -> Self
     {
-        let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
         unsafe { add_obj_ref(rc) };
         Self { p: self.p }
     }
@@ -740,21 +821,21 @@ impl Client
                                    release_impl: release_impl::<ClientImpl>,
                                    obj: p.as_ptr() };
 
-        let stream = StreamImpl { ref_count,
-                                  ex,
-                                  fd: -1,
+        let stream = StreamImpl { fd_impl: FdImpl { ref_count,
+                                                    ex,
+                                                    fd: -1,
+                                                    close_pending: false,
+                                                    cancel_pending: false,
+                                                    was_closed: false },
                                   ts: Duration::from_secs(3).into(),
                                   buf_group: u16::MAX,
                                   send_pending: false,
                                   recv_pending: false,
                                   shutdown_pending: false,
-                                  close_pending: false,
-                                  cancel_pending: false,
                                   last_send: Instant::now(),
                                   last_recv: Instant::now(),
                                   timeout_op: None,
-                                  recv_op: None,
-                                  was_closed: false };
+                                  recv_op: None };
 
         let client_impl = ClientImpl { stream,
                                        connect_pending: false };
@@ -763,20 +844,20 @@ impl Client
         unsafe { std::ptr::write(p.as_ptr(), client_impl) };
 
         let stream_impl = unsafe { &mut (*p.as_ptr()).stream };
-        let ref_count = &raw mut stream_impl.ref_count;
+        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
 
         let io_op = make_io_uring_op(ref_count,
                                      OpType::MultishotTimeout { ts: stream_impl.ts,
                                                                 stream: &raw mut *stream_impl });
-        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
-        let key = io_ops.insert(io_op, &stream_impl.ex);
+        let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
+        let key = io_ops.insert(io_op, &stream_impl.fd_impl.ex);
 
         let op = io_ops.get_mut(key).unwrap();
         let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
             unreachable!()
         };
 
-        let sqe = get_sqe(&stream_impl.ex);
+        let sqe = get_sqe(&stream_impl.fd_impl.ex);
         let user_data = key.data().as_ffi();
         unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
         unsafe { io_uring_sqe_set_data64(sqe, user_data) };
@@ -795,7 +876,7 @@ impl Client
         let client_impl = unsafe { &mut *self.p.as_ptr() };
         client_impl.connect_pending = true;
 
-        let ref_count = &raw mut client_impl.stream.ref_count;
+        let ref_count = &raw mut client_impl.stream.fd_impl.ref_count;
         let addr = SocketAddrV4::new(addr, port);
 
         let op = make_io_uring_op(ref_count,
@@ -807,11 +888,12 @@ impl Client
                                                        fd: -1 });
 
         let key = client_impl.stream
+                             .fd_impl
                              .ex
                              .p
                              .io_ops
                              .borrow_mut()
-                             .insert(op, &client_impl.stream.ex);
+                             .insert(op, &client_impl.stream.fd_impl.ex);
 
         ConnectFuture { client: self,
                         completed: false,
@@ -826,7 +908,7 @@ impl Client
         let client_impl = unsafe { &mut *self.p.as_ptr() };
         client_impl.connect_pending = true;
 
-        let ref_count = &raw mut client_impl.stream.ref_count;
+        let ref_count = &raw mut client_impl.stream.fd_impl.ref_count;
         let addr = SocketAddrV6::new(addr, port, 0, 0);
 
         let op = make_io_uring_op(ref_count,
@@ -838,11 +920,12 @@ impl Client
                                                        fd: -1 });
 
         let key = client_impl.stream
+                             .fd_impl
                              .ex
                              .p
                              .io_ops
                              .borrow_mut()
-                             .insert(op, &client_impl.stream.ex);
+                             .insert(op, &client_impl.stream.fd_impl.ex);
 
         ConnectFuture { client: self,
                         completed: false,
@@ -855,7 +938,7 @@ impl Client
         // we know this function is sound because of:
         // https://play.rust-lang.org/?version=stable&mode=debug&edition=2024&gist=7a39da0d1b4c9d22b23ef0ffec238050
 
-        let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.ref_count };
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.fd_impl.ref_count };
         unsafe { add_obj_ref(rc) };
 
         let p = unsafe { &raw mut (*self.p.as_ptr()).stream };
@@ -866,7 +949,7 @@ impl Client
     pub fn get_executor(&self) -> Executor
     {
         let client_impl = unsafe { &mut *self.p.as_ptr() };
-        client_impl.stream.ex.clone()
+        client_impl.stream.fd_impl.ex.clone()
     }
 
     pub fn set_buf_group(&self, bgid: u16)
@@ -898,7 +981,7 @@ impl Clone for Client
 {
     fn clone(&self) -> Self
     {
-        let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.ref_count };
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.fd_impl.ref_count };
         unsafe { add_obj_ref(rc) };
         Self { p: self.p }
     }
@@ -908,7 +991,7 @@ impl Drop for Client
 {
     fn drop(&mut self)
     {
-        let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.ref_count };
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.fd_impl.ref_count };
         if unsafe { (*rc).obj_count } == 1 {
             let stream_impl = unsafe { &mut (*self.p.as_ptr()).stream };
 
@@ -916,7 +999,7 @@ impl Drop for Client
                 let key_data = stream_impl.timeout_op.take().unwrap();
                 let key = DefaultKey::from(KeyData::from_ffi(key_data));
 
-                let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+                let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
                 let op = io_ops.get_mut(key).unwrap();
 
                 let user_data = key_data;
@@ -924,7 +1007,7 @@ impl Drop for Client
                 // makes sure this gets cleaned up, not really an eager-dropped operation
                 op.eager_dropped = true;
 
-                let sqe = get_sqe(&stream_impl.ex);
+                let sqe = get_sqe(&stream_impl.fd_impl.ex);
                 unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
                 unsafe { io_uring_sqe_set_data64(sqe, 0) };
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
@@ -933,7 +1016,7 @@ impl Drop for Client
             if stream_impl.recv_op.is_some() {
                 let key_data = stream_impl.recv_op.take().unwrap();
                 let key = DefaultKey::from(KeyData::from_ffi(key_data));
-                let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+                let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
                 let op = io_ops.get_mut(key).unwrap();
 
                 stream_impl.recv_op = None;
@@ -944,7 +1027,7 @@ impl Drop for Client
                     // makes sure this gets cleaned up, not really an eager-dropped operation
                     op.eager_dropped = true;
 
-                    let sqe = get_sqe(&stream_impl.ex);
+                    let sqe = get_sqe(&stream_impl.fd_impl.ex);
                     unsafe { io_uring_prep_cancel64(sqe, user_data, 0) };
                     unsafe { io_uring_sqe_set_data64(sqe, 0) };
                     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
@@ -986,7 +1069,7 @@ impl Future for ConnectFuture<'_>
 
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let io_ops = &mut *client_impl.stream.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *client_impl.stream.fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         match (op.initiated, op.done) {
@@ -996,7 +1079,7 @@ impl Future for ConnectFuture<'_>
                 Poll::Pending
             }
             (false, false) => {
-                let ring = client_impl.stream.ex.ring();
+                let ring = client_impl.stream.fd_impl.ex.ring();
 
                 let user_data = key_data;
 
@@ -1021,10 +1104,10 @@ impl Future for ConnectFuture<'_>
 
                 let file_index;
 
-                *needs_socket = client_impl.stream.fd < 0;
+                *needs_socket = client_impl.stream.fd_impl.fd < 0;
 
                 if *needs_socket {
-                    let mfile_index = client_impl.stream.ex.get_available_fd();
+                    let mfile_index = client_impl.stream.fd_impl.ex.get_available_fd();
                     let Some(file_idx) = mfile_index else {
                         return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                     };
@@ -1032,7 +1115,7 @@ impl Future for ConnectFuture<'_>
                     *fd = file_idx.try_into().unwrap();
                     file_index = file_idx;
                 } else {
-                    file_index = client_impl.stream.fd.try_into().unwrap();
+                    file_index = client_impl.stream.fd_impl.fd.try_into().unwrap();
                 }
 
                 unsafe { reserve_sqes(ring, if *needs_socket { 3 } else { 2 }) };
@@ -1071,7 +1154,7 @@ impl Future for ConnectFuture<'_>
                     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
                 }
 
-                unsafe { add_op_ref(&raw mut client_impl.stream.ref_count) };
+                unsafe { add_op_ref(&raw mut client_impl.stream.fd_impl.ref_count) };
 
                 op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
@@ -1089,8 +1172,8 @@ impl Future for ConnectFuture<'_>
                 };
 
                 if needs_socket && got_socket && op.res >= 0 {
-                    assert!(client_impl.stream.fd < 0);
-                    client_impl.stream.fd = fd;
+                    assert!(client_impl.stream.fd_impl.fd < 0);
+                    client_impl.stream.fd_impl.fd = fd;
                 }
 
                 let res = op.res;
@@ -1114,7 +1197,7 @@ impl Drop for ConnectFuture<'_>
         let op_cancel_key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(op_cancel_key_data));
 
-        let mut borrow_guard = client_impl.stream.ex.p.io_ops.borrow_mut();
+        let mut borrow_guard = client_impl.stream.fd_impl.ex.p.io_ops.borrow_mut();
         let io_ops = &mut *borrow_guard;
         let op = io_ops.get_mut(key).unwrap();
 
@@ -1124,13 +1207,13 @@ impl Drop for ConnectFuture<'_>
 
             let user_data = op_cancel_key_data;
 
-            let ref_count = &raw mut client_impl.stream.ref_count;
+            let ref_count = &raw mut client_impl.stream.fd_impl.ref_count;
             let key = io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel),
-                                    &client_impl.stream.ex);
+                                    &client_impl.stream.fd_impl.ex);
 
             unsafe { add_op_ref(ref_count) };
 
-            let sqe = get_sqe(&client_impl.stream.ex);
+            let sqe = get_sqe(&client_impl.stream.fd_impl.ex);
 
             unsafe { io_uring_prep_cancel64(sqe, user_data, IORING_ASYNC_CANCEL_ALL as i32) };
             unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
@@ -1156,7 +1239,7 @@ impl Drop for ConnectFuture<'_>
             io_ops.remove(key).unwrap();
             drop(borrow_guard);
 
-            let ex = &client_impl.stream.ex;
+            let ex = &client_impl.stream.fd_impl.ex;
             let key = ex.p
                         .io_ops
                         .borrow_mut()
@@ -1193,20 +1276,20 @@ impl Drop for SendFuture<'_>
 
         let op_cancel_key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(op_cancel_key_data));
-        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         if op.initiated && !op.done {
             op.eager_dropped = true;
             op.local_waker = None;
 
-            let ref_count = &raw mut stream_impl.ref_count;
-            let key =
-                io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel), &stream_impl.ex);
+            let ref_count = &raw mut stream_impl.fd_impl.ref_count;
+            let key = io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel),
+                                    &stream_impl.fd_impl.ex);
 
             unsafe { add_op_ref(ref_count) };
 
-            let sqe = get_sqe(&stream_impl.ex);
+            let sqe = get_sqe(&stream_impl.fd_impl.ex);
             unsafe { io_uring_prep_cancel64(sqe, op_cancel_key_data, 0) };
             unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
 
@@ -1230,7 +1313,7 @@ impl Future for SendFuture<'_>
 
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         let user_data = key_data;
@@ -1247,10 +1330,10 @@ impl Future for SendFuture<'_>
                 };
 
                 {
-                    let sqe = get_sqe(&stream_impl.ex);
+                    let sqe = get_sqe(&stream_impl.fd_impl.ex);
                     unsafe {
                         io_uring_prep_send_zc(sqe,
-                                              stream_impl.fd,
+                                              stream_impl.fd_impl.fd,
                                               buf.as_ptr().cast(),
                                               buf.len(),
                                               0,
@@ -1261,7 +1344,7 @@ impl Future for SendFuture<'_>
                     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) }
                 }
 
-                unsafe { add_op_ref(&raw mut stream_impl.ref_count) };
+                unsafe { add_op_ref(&raw mut stream_impl.fd_impl.ref_count) };
 
                 op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
@@ -1292,9 +1375,10 @@ impl Future for SendFuture<'_>
 
 pub struct CloseFuture<'a>
 {
-    stream: &'a Stream,
+    fd_impl: *mut FdImpl,
     completed: bool,
     op: Option<u64>,
+    _m: PhantomData<&'a FdImpl>,
 }
 
 impl Future for CloseFuture<'_>
@@ -1304,11 +1388,11 @@ impl Future for CloseFuture<'_>
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
             -> Poll<Self::Output>
     {
-        let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
+        let fd_impl = unsafe { &mut *self.fd_impl };
 
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         let user_data = key_data;
@@ -1324,11 +1408,12 @@ impl Future for CloseFuture<'_>
                     unreachable!()
                 };
 
-                let sqe = get_sqe(&stream_impl.ex);
-                let fd = stream_impl.fd as u32;
+                let sqe = get_sqe(&fd_impl.ex);
+                let fd = fd_impl.fd as u32;
+
                 unsafe { io_uring_prep_close_direct(sqe, fd) };
                 unsafe { io_uring_sqe_set_data64(sqe, user_data) };
-                unsafe { add_op_ref(&raw mut stream_impl.ref_count) };
+                unsafe { add_op_ref(&raw mut fd_impl.ref_count) };
 
                 op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
@@ -1345,7 +1430,7 @@ impl Future for CloseFuture<'_>
                 if res < 0 {
                     Poll::Ready(Err(Errno::from_raw(-res)))
                 } else {
-                    stream_impl.was_closed = true;
+                    fd_impl.was_closed = true;
                     Poll::Ready(Ok(()))
                 }
             }
@@ -1357,25 +1442,24 @@ impl Drop for CloseFuture<'_>
 {
     fn drop(&mut self)
     {
-        let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
-        stream_impl.close_pending = false;
+        let fd_impl = unsafe { &mut *self.fd_impl };
+        fd_impl.close_pending = false;
 
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         if op.initiated && !op.done {
             op.eager_dropped = true;
             op.local_waker = None;
 
-            let ref_count = &raw mut stream_impl.ref_count;
-            let key =
-                io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel), &stream_impl.ex);
+            let ref_count = &raw mut fd_impl.ref_count;
+            let key = io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel), &fd_impl.ex);
 
             unsafe { add_op_ref(ref_count) };
 
-            let sqe = get_sqe(&stream_impl.ex);
+            let sqe = get_sqe(&fd_impl.ex);
             let user_data = key.data().as_ffi();
             unsafe { io_uring_prep_cancel64(sqe, key_data, 0) };
             unsafe { io_uring_sqe_set_data64(sqe, user_data) };
@@ -1406,7 +1490,7 @@ impl Future for ShutdownFuture<'_>
 
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         let user_data = key_data;
@@ -1422,13 +1506,13 @@ impl Future for ShutdownFuture<'_>
                     unreachable!()
                 };
 
-                let sqe = get_sqe(&stream_impl.ex);
-                let fd = stream_impl.fd;
+                let sqe = get_sqe(&stream_impl.fd_impl.ex);
+                let fd = stream_impl.fd_impl.fd;
                 unsafe { io_uring_prep_shutdown(sqe, fd, self.how) };
                 unsafe { io_uring_sqe_set_data64(sqe, user_data) };
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) };
 
-                unsafe { add_op_ref(&raw mut stream_impl.ref_count) };
+                unsafe { add_op_ref(&raw mut stream_impl.fd_impl.ref_count) };
 
                 op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
@@ -1461,19 +1545,19 @@ impl Drop for ShutdownFuture<'_>
 
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         if op.initiated && !op.done {
             op.eager_dropped = true;
             op.local_waker = None;
 
-            let ref_count = &raw mut stream_impl.ref_count;
-            let key =
-                io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel), &stream_impl.ex);
+            let ref_count = &raw mut stream_impl.fd_impl.ref_count;
+            let key = io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel),
+                                    &stream_impl.fd_impl.ex);
             unsafe { add_op_ref(ref_count) };
 
-            let sqe = get_sqe(&stream_impl.ex);
+            let sqe = get_sqe(&stream_impl.fd_impl.ex);
             let user_data = key.data().as_ffi();
             unsafe { io_uring_prep_cancel64(sqe, key_data, 0) };
             unsafe { io_uring_sqe_set_data64(sqe, user_data) };
@@ -1487,9 +1571,10 @@ impl Drop for ShutdownFuture<'_>
 
 pub struct CancelFuture<'a>
 {
-    stream: &'a Stream,
+    fd_impl: *mut FdImpl,
     completed: bool,
     op: Option<u64>,
+    _m: PhantomData<&'a FdImpl>,
 }
 
 impl Future for CancelFuture<'_>
@@ -1499,11 +1584,11 @@ impl Future for CancelFuture<'_>
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
             -> Poll<Self::Output>
     {
-        let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
-
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+
+        let fd_impl = unsafe { &mut *self.fd_impl };
+        let mut io_ops = fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         let user_data = key_data;
@@ -1519,27 +1604,29 @@ impl Future for CancelFuture<'_>
                     unreachable!()
                 };
 
-                let sqe = get_sqe(&stream_impl.ex);
-                let fd = stream_impl.fd;
+                let sqe = get_sqe(&fd_impl.ex);
+                let fd = fd_impl.fd;
                 let flags = IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED;
 
                 unsafe { io_uring_prep_cancel_fd(sqe, fd, flags) };
                 unsafe { io_uring_sqe_set_data64(sqe, user_data) };
 
-                unsafe { add_op_ref(&raw mut stream_impl.ref_count) };
+                unsafe { add_op_ref(&raw mut fd_impl.ref_count) };
 
                 op.local_waker = Some(cx.local_waker().clone());
                 op.initiated = true;
                 Poll::Pending
             }
             (true, true) => {
-                self.completed = true;
-
+                let res = op.res;
                 let OpType::TcpCancel = op.op_type else {
                     unreachable!()
                 };
 
-                let res = op.res;
+                drop(io_ops);
+
+                self.completed = true;
+
                 if res < 0 {
                     Poll::Ready(Err(Errno::from_raw(-res)))
                 } else {
@@ -1554,12 +1641,12 @@ impl Drop for CancelFuture<'_>
 {
     fn drop(&mut self)
     {
-        let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
-        stream_impl.shutdown_pending = false;
+        let fd_impl = unsafe { &mut *self.fd_impl };
+        fd_impl.cancel_pending = false;
 
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         if op.initiated && !op.done {
@@ -1598,14 +1685,14 @@ impl Future for RecvFuture<'_>
         assert!(!self.completed);
 
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
-        let ex = stream_impl.ex.clone();
+        let ex = stream_impl.fd_impl.ex.clone();
 
         match stream_impl.recv_op {
             None => {
                 let ioprio =
                     u16::try_from(IORING_RECVSEND_POLL_FIRST | IORING_RECVSEND_BUNDLE).unwrap();
 
-                let ref_count = &raw mut stream_impl.ref_count;
+                let ref_count = &raw mut stream_impl.fd_impl.ref_count;
 
                 let bgid = stream_impl.buf_group;
 
@@ -1620,19 +1707,19 @@ impl Future for RecvFuture<'_>
                 stream_impl.last_recv = Instant::now();
                 let last_recv: *mut Instant = &raw mut stream_impl.last_recv;
 
-                let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+                let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
                 let key = io_ops.insert(make_io_uring_op(ref_count,
                                               OpType::MultishotTcpRecv { bufs:
                                                                              BorrowedBufs::new(ex.clone(), buf_group),
                                                                          buf_group,
-                                                                         last_recv }), &stream_impl.ex);
+                                                                         last_recv }), &stream_impl.fd_impl.ex);
 
                 let op = io_ops.get_mut(key).unwrap();
 
                 let user_data = key.data().as_ffi();
                 let sqe = get_sqe(&ex);
 
-                let sockfd = stream_impl.fd;
+                let sockfd = stream_impl.fd_impl.fd;
                 let flags = IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT;
 
                 unsafe { io_uring_prep_recv_multishot(sqe, sockfd, ptr::null_mut(), 0, 0) };
@@ -1651,7 +1738,7 @@ impl Future for RecvFuture<'_>
             }
             Some(key_data) => {
                 let key = KeyData::from_ffi(key_data).into();
-                let io_ops = &mut *stream_impl.ex.p.io_ops.borrow_mut();
+                let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
                 let op = io_ops.get_mut(key).unwrap();
 
                 let OpType::MultishotTcpRecv { ref mut bufs,
