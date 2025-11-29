@@ -20,8 +20,11 @@ use rand::SeedableRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BUF_SIZE: usize = 256 * 1024;
-const RECV_BUF_SIZE: usize = 8 * 1024;
-const NUM_BUFS: u32 = 32 * 1024;
+const RECV_BUF_SIZE: usize = 32 * 1024;
+const SEND_BUF_SIZE: usize = 32 * 1024;
+const NUM_BUFS: u32 = 16 * 1024;
+
+const SEED: u64 = 1234;
 
 static mut DURATION: Duration = Duration::new(0, 0);
 
@@ -31,6 +34,24 @@ fn make_bytes() -> Vec<u8>
     let mut bytes = vec![0_u8; BUF_SIZE];
     rand::RngCore::fill_bytes(&mut rng, &mut bytes);
     bytes
+}
+
+struct ByteGen
+{
+    rng: rand::rngs::StdRng,
+}
+
+impl ByteGen
+{
+    fn new() -> Self
+    {
+        Self { rng: rand::rngs::StdRng::seed_from_u64(SEED) }
+    }
+
+    fn write(&mut self, bytes: &mut [u8; SEND_BUF_SIZE])
+    {
+        rand::RngCore::fill_bytes(&mut self.rng, bytes);
+    }
 }
 
 fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
@@ -51,6 +72,8 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
               join_set.spawn(async move {
                           let start = Instant::now();
 
+                          let mut generator = ByteGen::new();
+
                           let socket = tokio::net::TcpSocket::new_v4().unwrap();
                           let mut client = socket.connect(SocketAddr::new(IpAddr::V4(ipv4_addr),
                                                                           port))
@@ -59,16 +82,16 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 
                           let mut buf = [0; RECV_BUF_SIZE];
 
-                          let bytes = make_bytes();
-                          let bytes = bytes.chunks_exact(16 * 1024);
-
                           let mut total_received = 0;
                           let mut h = DefaultHasher::new();
 
-                          let mut send_buf = Vec::<u8>::with_capacity(16 * 1024);
+                          let mut total_sent = 0;
+                          let mut send_buf = Vec::<u8>::with_capacity(SEND_BUF_SIZE);
 
-                          for chunk in bytes {
-                              send_buf.extend_from_slice(chunk);
+                          while total_sent < BUF_SIZE {
+                              let mut chunk = [0_u8; SEND_BUF_SIZE];
+                              generator.write(&mut chunk);
+                              send_buf.extend_from_slice(&chunk);
                               while !send_buf.is_empty() {
                                   let n = tokio::time::timeout(Duration::from_secs(120),
                                                                client.write(&send_buf)).await
@@ -76,8 +99,8 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                                                                                        .unwrap();
 
                                   assert!(n > 0);
-
                                   drop(send_buf.drain(0..n));
+                                  total_sent += n;
                               }
                           }
 
@@ -144,15 +167,12 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
               join_set.spawn(async move {
                           let start = Instant::now();
 
-                          let mut buf = [0; RECV_BUF_SIZE];
+                          let mut generator = ByteGen::new();
 
-                          let bytes = make_bytes();
-                          let bytes = bytes.chunks_exact(16 * 1024);
+                          let mut buf = [0; RECV_BUF_SIZE];
 
                           let mut total_received = 0;
                           let mut h = DefaultHasher::new();
-
-                          let mut send_buf = Vec::<u8>::with_capacity(16 * 1024);
 
                           while total_received < BUF_SIZE {
                               let n = tokio::time::timeout(Duration::from_secs(120),
@@ -167,8 +187,13 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                           let digest = h.finish();
                           assert_eq!(digest, 5326650159322985034);
 
-                          for chunk in bytes {
-                              send_buf.extend_from_slice(chunk);
+                          let mut total_sent = 0;
+                          let mut send_buf = Vec::<u8>::with_capacity(SEND_BUF_SIZE);
+
+                          while total_sent < BUF_SIZE {
+                              let mut chunk = [0_u8; SEND_BUF_SIZE];
+                              generator.write(&mut chunk);
+                              send_buf.extend_from_slice(&chunk);
                               while !send_buf.is_empty() {
                                   let n = tokio::time::timeout(Duration::from_secs(120),
                                                                stream.write(&send_buf)).await
@@ -176,8 +201,8 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                                                                                        .unwrap();
 
                                   assert!(n > 0);
-
                                   drop(send_buf.drain(0..n));
+                                  total_sent += n;
                               }
                           }
 
@@ -225,8 +250,7 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
         ex.clone().spawn(async move {
                       let start = Instant::now();
 
-                      let bytes = make_bytes();
-                      let bytes = bytes.chunks_exact(16 * 1024);
+                      let mut generator = ByteGen::new();
 
                       let mut total_received = 0;
                       let mut h = DefaultHasher::new();
@@ -237,13 +261,17 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 
                       client.set_buf_group(CLIENT_BGID);
 
-                      let mut send_buf = Vec::with_capacity(16 * 1024);
-                      for chunk in bytes {
-                          send_buf.extend_from_slice(chunk);
+                      let mut total_sent = 0;
+                      let mut send_buf = Vec::with_capacity(SEND_BUF_SIZE);
+                      while total_sent < BUF_SIZE {
+                          let mut chunk = [0_u8; SEND_BUF_SIZE];
+                          generator.write(&mut chunk);
+                          send_buf.extend_from_slice(&chunk);
                           let (num_sent, mut buf) = client.send(send_buf).await;
                           assert_eq!(num_sent.unwrap(), buf.len());
                           buf.clear();
                           send_buf = buf;
+                          total_sent += num_sent.unwrap();
                       }
 
                       while total_received < BUF_SIZE {
@@ -315,11 +343,10 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                       ex.clone().spawn(async move {
                                     let start = Instant::now();
 
+                                    let mut generator = ByteGen::new();
+
                                     stream.set_timeout(Duration::from_secs(120));
                                     stream.set_buf_group(SERVER_BGID);
-
-                                    let bytes = make_bytes();
-                                    let bytes = bytes.chunks_exact(16 * 1024);
 
                                     let mut total_received = 0;
                                     let mut h = DefaultHasher::new();
@@ -346,13 +373,20 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                                     let digest = h.finish();
                                     assert_eq!(digest, 5326650159322985034);
 
-                                    let mut send_buf = Vec::with_capacity(16 * 1024);
-                                    for chunk in bytes {
-                                        send_buf.extend_from_slice(chunk);
+                                    let mut total_sent = 0;
+                                    let mut send_buf = Vec::<u8>::with_capacity(SEND_BUF_SIZE);
+
+                                    while total_sent < BUF_SIZE {
+                                        let mut chunk = [0_u8; SEND_BUF_SIZE];
+                                        generator.write(&mut chunk);
+                                        send_buf.extend_from_slice(&chunk);
+
                                         let (num_sent, mut buf) = stream.send(send_buf).await;
                                         assert_eq!(num_sent.unwrap(), buf.len());
                                         buf.clear();
                                         send_buf = buf;
+
+                                        total_sent += num_sent.unwrap();
                                     }
 
                                     unsafe { DURATION += start.elapsed() };
