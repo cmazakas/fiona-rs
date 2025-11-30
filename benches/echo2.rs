@@ -268,11 +268,14 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                           let mut chunk = [0_u8; SEND_BUF_SIZE];
                           generator.write(&mut chunk);
                           send_buf.extend_from_slice(&chunk);
-                          let (num_sent, mut buf) = client.send(send_buf).await;
-                          assert_eq!(num_sent.unwrap(), buf.len());
-                          buf.clear();
-                          send_buf = buf;
-                          total_sent += num_sent.unwrap();
+                          while !send_buf.is_empty() {
+                              let (num_sent, buf) = client.send(send_buf).await;
+                              send_buf = buf;
+                              let num_sent = num_sent.unwrap();
+                              assert!(num_sent > 0);
+                              drop(send_buf.drain(0..num_sent));
+                              total_sent += num_sent;
+                          }
                       }
 
                       while total_received < BUF_SIZE {
@@ -375,19 +378,19 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                                     assert_eq!(digest, EXPECTED_HASH);
 
                                     let mut total_sent = 0;
-                                    let mut send_buf = Vec::<u8>::with_capacity(SEND_BUF_SIZE);
-
+                                    let mut send_buf = Vec::with_capacity(SEND_BUF_SIZE);
                                     while total_sent < BUF_SIZE {
                                         let mut chunk = [0_u8; SEND_BUF_SIZE];
                                         generator.write(&mut chunk);
                                         send_buf.extend_from_slice(&chunk);
-
-                                        let (num_sent, mut buf) = stream.send(send_buf).await;
-                                        assert_eq!(num_sent.unwrap(), buf.len());
-                                        buf.clear();
-                                        send_buf = buf;
-
-                                        total_sent += num_sent.unwrap();
+                                        while !send_buf.is_empty() {
+                                            let (num_sent, buf) = stream.send(send_buf).await;
+                                            send_buf = buf;
+                                            let num_sent = num_sent.unwrap();
+                                            assert!(num_sent > 0);
+                                            drop(send_buf.drain(0..num_sent));
+                                            total_sent += num_sent;
+                                        }
                                     }
 
                                     unsafe { DURATION += start.elapsed() };
