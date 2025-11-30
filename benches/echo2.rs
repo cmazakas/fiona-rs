@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 #![allow(static_mut_refs)]
 
 extern crate clap;
@@ -19,18 +18,20 @@ use nix::{errno::Errno, libc::ENOBUFS};
 use rand::SeedableRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const BUF_SIZE: usize = 256 * 1024;
-const RECV_BUF_SIZE: usize = 32 * 1024;
-const SEND_BUF_SIZE: usize = 32 * 1024;
+const BUF_SIZE: usize = 4 * 1024 * 1024;
+const RECV_BUF_SIZE: usize = 64 * 1024;
+const SEND_BUF_SIZE: usize = 256 * 1024;
 const NUM_BUFS: u32 = 16 * 1024;
 
 const SEED: u64 = 1234;
 
 static mut DURATION: Duration = Duration::new(0, 0);
 
+const EXPECTED_HASH: u64 = 18157012549364724277;
+
 fn make_bytes() -> Vec<u8>
 {
-    let mut rng = rand::rngs::StdRng::seed_from_u64(1234);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
     let mut bytes = vec![0_u8; BUF_SIZE];
     rand::RngCore::fill_bytes(&mut rng, &mut bytes);
     bytes
@@ -115,7 +116,7 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                           }
 
                           let digest = h.finish();
-                          assert_eq!(digest, 5326650159322985034);
+                          assert_eq!(digest, EXPECTED_HASH);
 
                           unsafe { DURATION += start.elapsed() };
                           unsafe {
@@ -185,7 +186,7 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                           }
 
                           let digest = h.finish();
-                          assert_eq!(digest, 5326650159322985034);
+                          assert_eq!(digest, EXPECTED_HASH);
 
                           let mut total_sent = 0;
                           let mut send_buf = Vec::<u8>::with_capacity(SEND_BUF_SIZE);
@@ -295,7 +296,7 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                       }
 
                       let digest = h.finish();
-                      assert_eq!(digest, 5326650159322985034);
+                      assert_eq!(digest, EXPECTED_HASH);
 
                       unsafe { DURATION += start.elapsed() };
                       unsafe {
@@ -371,7 +372,7 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                                     }
 
                                     let digest = h.finish();
-                                    assert_eq!(digest, 5326650159322985034);
+                                    assert_eq!(digest, EXPECTED_HASH);
 
                                     let mut total_sent = 0;
                                     let mut send_buf = Vec::<u8>::with_capacity(SEND_BUF_SIZE);
@@ -447,7 +448,7 @@ fn main()
         h.write(&bytes);
         let digest = h.finish();
 
-        assert_eq!(digest, 5326650159322985034);
+        assert_eq!(digest, EXPECTED_HASH);
     }
 
     if args.tokio {
