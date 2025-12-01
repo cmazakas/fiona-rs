@@ -18,7 +18,7 @@ use nix::{errno::Errno, libc::ENOBUFS};
 use rand::SeedableRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const BUF_SIZE: usize = 4 * 1024 * 1024;
+const BUF_SIZE: usize = 1024 * 1024;
 const RECV_BUF_SIZE: usize = 64 * 1024;
 const SEND_BUF_SIZE: usize = 256 * 1024;
 const NUM_BUFS: u32 = 16 * 1024;
@@ -27,7 +27,7 @@ const SEED: u64 = 1234;
 
 static mut DURATION: Duration = Duration::new(0, 0);
 
-const EXPECTED_HASH: u64 = 18157012549364724277;
+const EXPECTED_HASH: u64 = 12384031092717933349;
 
 fn make_bytes() -> Vec<u8>
 {
