@@ -28,6 +28,7 @@ use std::{
     marker::PhantomData,
     mem::{ManuallyDrop, forget},
     ops::Deref,
+    ops::Range,
     pin::Pin,
     ptr::{self, DynMetadata, NonNull, metadata},
     rc::Rc,
@@ -791,6 +792,7 @@ enum OpType
     TcpSend
     {
         num_sent: usize,
+        subspan: Range<usize>,
         buf: Vec<u8>,
         last_send: *mut Instant,
     },

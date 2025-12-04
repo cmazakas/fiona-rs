@@ -36,6 +36,7 @@ use std::{
     marker::PhantomData,
     mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+    ops::Range,
     os::fd::AsRawFd,
     ptr::{self, NonNull},
     task::Poll,
@@ -602,7 +603,14 @@ impl Stream
     #[must_use]
     pub fn send(&self, buf: Vec<u8>) -> SendFuture<'_>
     {
+        self.send_subspan(0..buf.len(), buf)
+    }
+
+    #[must_use]
+    pub fn send_subspan(&self, subspan: Range<usize>, buf: Vec<u8>) -> SendFuture<'_>
+    {
         assert!(unsafe { !(*self.p.as_ptr()).send_pending });
+        assert!(!subspan.is_empty());
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.send_pending = true;
@@ -1319,13 +1327,16 @@ impl Future for SendFuture<'_>
         let user_data = key_data;
 
         match (op.initiated, op.done) {
-            (false, true) => panic!(),
+            (false, true) => unreachable!(),
             (true, false) => {
                 op.local_waker = Some(cx.local_waker().clone());
                 Poll::Pending
             }
             (false, false) => {
-                let OpType::TcpSend { ref buf, .. } = op.op_type else {
+                let OpType::TcpSend { ref buf,
+                                      ref subspan,
+                                      .. } = op.op_type
+                else {
                     unreachable!()
                 };
 
@@ -1334,8 +1345,8 @@ impl Future for SendFuture<'_>
                     unsafe {
                         io_uring_prep_send_zc(sqe,
                                               stream_impl.fd_impl.fd,
-                                              buf.as_ptr().cast(),
-                                              buf.len(),
+                                              buf.as_ptr().add(subspan.start).cast(),
+                                              subspan.end - subspan.start,
                                               0,
                                               0);
                     }

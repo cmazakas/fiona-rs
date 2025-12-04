@@ -1739,3 +1739,57 @@ fn tcp_acceptor_close()
     let n = ioc.run();
     assert_eq!(n, 2);
 }
+
+#[test]
+#[allow(clippy::redundant_closure_call)]
+fn tcp_send_subspan()
+{
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+
+    async fn task(ex: fiona::Executor)
+    {
+        let acceptor = fiona::tcp::Acceptor::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+        let port = acceptor.port();
+
+        let h = ex.spawn((async |port: u16, ex: fiona::Executor| {
+                             let client = fiona::tcp::Client::new(ex);
+                             client.connect_ipv6(Ipv6Addr::LOCALHOST, port)
+                                   .await
+                                   .unwrap();
+                             client
+                         })(port, ex.clone()));
+
+        let stream = acceptor.accept().await.unwrap();
+        let client = h.await;
+
+        ex.register_buf_group(0, 128, 16).unwrap();
+
+        let msg = b"hello, world!".to_vec();
+        let (n, msg) = stream.send_subspan(0..3, msg).await;
+        assert_eq!(n.unwrap(), 3);
+
+        client.set_buf_group(0);
+        let bufs = client.recv().await.unwrap();
+        let mut acc = Vec::new();
+        for buf in bufs.iter() {
+            acc.extend_from_slice(buf);
+        }
+        assert_eq!(msg[0..3], acc);
+
+        let (n, msg) = stream.send_subspan(3..msg.len(), msg).await;
+        assert_eq!(n.unwrap(), msg.len() - 3);
+
+        let bufs = client.recv().await.unwrap();
+        for buf in bufs.iter() {
+            acc.extend_from_slice(buf);
+        }
+        assert_eq!(msg, acc);
+    }
+
+    ex.clone().spawn(task(ex.clone()));
+
+    let n = ioc.run();
+    assert!(n > 0);
+}
