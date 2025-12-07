@@ -627,7 +627,8 @@ impl Stream
                              .insert(make_io_uring_op(ref_count,
                                                       OpType::TcpSend { buf,
                                                                         last_send,
-                                                                        num_sent: 0 }),
+                                                                        num_sent: 0,
+                                                                        subspan }),
                                      &stream_impl.fd_impl.ex);
 
         SendFuture { stream: self,
