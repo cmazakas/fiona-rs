@@ -1,5 +1,6 @@
 #![allow(static_mut_refs)]
 
+extern crate blake2;
 extern crate clap;
 extern crate rand;
 extern crate tokio;
@@ -7,27 +8,34 @@ extern crate tokio;
 mod utils;
 
 use std::{
-    hash::{DefaultHasher, Hasher},
     hint::black_box,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::{Duration, Instant},
 };
 
+use blake2::Digest;
 use clap::Parser;
 use nix::{errno::Errno, libc::ENOBUFS};
 use rand::SeedableRng;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 const BUF_SIZE: usize = 1024 * 1024;
 const RECV_BUF_SIZE: usize = 64 * 1024;
 const SEND_BUF_SIZE: usize = 256 * 1024;
 const NUM_BUFS: u32 = 16 * 1024;
-
+const CQ_ENTRIES: u32 = 64 * 1024;
 const SEED: u64 = 1234;
 
-static mut DURATION: Duration = Duration::new(0, 0);
+const EXPECTED_HASH: &[u8] = &[162, 235, 8, 253, 143, 97, 130, 112, 211, 231, 203, 40, 111, 223,
+                               250, 216, 32, 207, 52, 92, 230, 249, 226, 171, 109, 167, 186, 135,
+                               68, 179, 92, 185, 104, 208, 197, 220, 235, 16, 132, 188, 195, 142,
+                               53, 212, 207, 81, 192, 105, 109, 102, 169, 224, 46, 22, 187, 175,
+                               107, 189, 182, 22, 35, 25, 231, 51];
 
-const EXPECTED_HASH: u64 = 12384031092717933349;
+static mut DURATION: Duration = Duration::new(0, 0);
 
 fn make_bytes() -> Vec<u8>
 {
@@ -49,9 +57,46 @@ impl ByteGen
         Self { rng: rand::rngs::StdRng::seed_from_u64(SEED) }
     }
 
-    fn write(&mut self, bytes: &mut [u8; SEND_BUF_SIZE])
+    fn write(&mut self, bytes: &mut [u8])
     {
         rand::RngCore::fill_bytes(&mut self.rng, bytes);
+    }
+}
+
+async fn tokio_send(generator: &mut ByteGen, stream: &mut TcpStream)
+{
+    let mut total_sent = 0;
+    let mut send_buf = vec![0_u8; SEND_BUF_SIZE];
+
+    while total_sent < BUF_SIZE {
+        generator.write(send_buf.as_mut_slice());
+
+        let mut n = 0;
+        while n < SEND_BUF_SIZE {
+            let sent = tokio::time::timeout(Duration::from_secs(120),
+                               stream.write(&send_buf[n..])).await
+                                                                                        .unwrap()
+                                                                                        .unwrap();
+
+            assert!(sent > 0);
+            n += sent;
+            total_sent += sent;
+        }
+    }
+}
+
+async fn tokio_recv(h: &mut blake2::Blake2b512, stream: &mut TcpStream)
+{
+    let mut buf = [0; RECV_BUF_SIZE];
+
+    let mut total_received = 0;
+    while total_received < BUF_SIZE {
+        let n = tokio::time::timeout(Duration::from_secs(120), stream.read(&mut buf)).await
+                                                                                     .unwrap()
+                                                                                     .unwrap();
+
+        h.update(&buf[0..n]);
+        total_received += n;
     }
 }
 
@@ -73,6 +118,7 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
               join_set.spawn(async move {
                           let start = Instant::now();
 
+                          let mut h = blake2::Blake2b512::new();
                           let mut generator = ByteGen::new();
 
                           let socket = tokio::net::TcpSocket::new_v4().unwrap();
@@ -81,42 +127,11 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                                                  .await
                                                  .unwrap();
 
-                          let mut buf = [0; RECV_BUF_SIZE];
+                          tokio_send(&mut generator, &mut client).await;
 
-                          let mut total_received = 0;
-                          let mut h = DefaultHasher::new();
-
-                          let mut total_sent = 0;
-                          let mut send_buf = Vec::<u8>::with_capacity(SEND_BUF_SIZE);
-
-                          while total_sent < BUF_SIZE {
-                              let mut chunk = [0_u8; SEND_BUF_SIZE];
-                              generator.write(&mut chunk);
-                              send_buf.extend_from_slice(&chunk);
-                              while !send_buf.is_empty() {
-                                  let n = tokio::time::timeout(Duration::from_secs(120),
-                                                               client.write(&send_buf)).await
-                                                                                       .unwrap()
-                                                                                       .unwrap();
-
-                                  assert!(n > 0);
-                                  drop(send_buf.drain(0..n));
-                                  total_sent += n;
-                              }
-                          }
-
-                          while total_received < BUF_SIZE {
-                              let n = tokio::time::timeout(Duration::from_secs(120),
-                                                           client.read(&mut buf)).await
-                                                                                 .unwrap()
-                                                                                 .unwrap();
-
-                              h.write(&buf[0..n]);
-                              total_received += n;
-                          }
-
-                          let digest = h.finish();
-                          assert_eq!(digest, EXPECTED_HASH);
+                          tokio_recv(&mut h, &mut client).await;
+                          let digest = h.finalize();
+                          assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
                           unsafe { DURATION += start.elapsed() };
                           unsafe {
@@ -168,44 +183,14 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
               join_set.spawn(async move {
                           let start = Instant::now();
 
+                          let mut h = blake2::Blake2b512::new();
                           let mut generator = ByteGen::new();
 
-                          let mut buf = [0; RECV_BUF_SIZE];
+                          tokio_recv(&mut h, &mut stream).await;
+                          let digest = h.finalize();
+                          assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
-                          let mut total_received = 0;
-                          let mut h = DefaultHasher::new();
-
-                          while total_received < BUF_SIZE {
-                              let n = tokio::time::timeout(Duration::from_secs(120),
-                                                           stream.read(&mut buf)).await
-                                                                                 .unwrap()
-                                                                                 .unwrap();
-
-                              h.write(&buf[0..n]);
-                              total_received += n;
-                          }
-
-                          let digest = h.finish();
-                          assert_eq!(digest, EXPECTED_HASH);
-
-                          let mut total_sent = 0;
-                          let mut send_buf = Vec::<u8>::with_capacity(SEND_BUF_SIZE);
-
-                          while total_sent < BUF_SIZE {
-                              let mut chunk = [0_u8; SEND_BUF_SIZE];
-                              generator.write(&mut chunk);
-                              send_buf.extend_from_slice(&chunk);
-                              while !send_buf.is_empty() {
-                                  let n = tokio::time::timeout(Duration::from_secs(120),
-                                                               stream.write(&send_buf)).await
-                                                                                       .unwrap()
-                                                                                       .unwrap();
-
-                                  assert!(n > 0);
-                                  drop(send_buf.drain(0..n));
-                                  total_sent += n;
-                              }
-                          }
+                          tokio_send(&mut generator, &mut stream).await;
 
                           unsafe { DURATION += start.elapsed() };
                       });
@@ -220,8 +205,6 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     Ok(())
 }
 
-const CQ_ENTRIES: u32 = 64 * 1024;
-
 fn make_io_context(nr_files: u32) -> fiona::IoContext
 {
     let params = &fiona::IoContextParams { sq_entries: 256,
@@ -229,6 +212,51 @@ fn make_io_context(nr_files: u32) -> fiona::IoContext
                                            nr_files: 2 * nr_files };
 
     fiona::IoContext::with_params(params)
+}
+
+async fn fiona_send(generator: &mut ByteGen, stream: fiona::tcp::Stream)
+{
+    let mut total_sent = 0;
+    let mut send_buf = vec![0_u8; SEND_BUF_SIZE];
+    while total_sent < BUF_SIZE {
+        generator.write(send_buf.as_mut_slice());
+
+        let mut n = 0;
+        while n < SEND_BUF_SIZE {
+            let (num_sent, buf) = stream.send_subspan(n..send_buf.len(), send_buf).await;
+            let num_sent = num_sent.unwrap();
+            assert!(num_sent > 0);
+
+            n += num_sent;
+            total_sent += num_sent;
+
+            send_buf = buf;
+        }
+    }
+}
+
+async fn fiona_recv(h: &mut blake2::Blake2b512, stream: fiona::tcp::Stream)
+{
+    let mut total_received = 0;
+    while total_received < BUF_SIZE {
+        let mbufs = stream.recv().await;
+        match mbufs {
+            Ok(bufs) => {
+                for buf in &bufs {
+                    if buf.is_empty() {
+                        assert_eq!(total_received, BUF_SIZE);
+                    } else {
+                        h.update(buf);
+                        total_received += buf.len();
+                    }
+                }
+            }
+            Err(x) if x == Errno::from_raw(ENOBUFS) => {
+                continue;
+            }
+            Err(err) => panic!("{err:?}"),
+        }
+    }
 }
 
 fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
@@ -253,53 +281,18 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 
                       let mut generator = ByteGen::new();
 
-                      let mut total_received = 0;
-                      let mut h = DefaultHasher::new();
+                      let mut h = blake2::Blake2b512::new();
 
                       let client = fiona::tcp::Client::new(ex2);
+                      client.set_buf_group(CLIENT_BGID);
                       client.set_timeout(Duration::from_secs(120));
                       client.connect_ipv4(ipv4_addr, port).await.unwrap();
 
-                      client.set_buf_group(CLIENT_BGID);
+                      fiona_send(&mut generator, client.as_stream()).await;
+                      fiona_recv(&mut h, client.as_stream()).await;
 
-                      let mut total_sent = 0;
-                      let mut send_buf = Vec::with_capacity(SEND_BUF_SIZE);
-                      while total_sent < BUF_SIZE {
-                          let mut chunk = [0_u8; SEND_BUF_SIZE];
-                          generator.write(&mut chunk);
-                          send_buf.extend_from_slice(&chunk);
-                          while !send_buf.is_empty() {
-                              let (num_sent, buf) = client.send(send_buf).await;
-                              send_buf = buf;
-                              let num_sent = num_sent.unwrap();
-                              assert!(num_sent > 0);
-                              drop(send_buf.drain(0..num_sent));
-                              total_sent += num_sent;
-                          }
-                      }
-
-                      while total_received < BUF_SIZE {
-                          let mbufs = client.recv().await;
-                          match mbufs {
-                              Ok(bufs) => {
-                                  for buf in &bufs {
-                                      if buf.is_empty() {
-                                          assert_eq!(total_received, BUF_SIZE);
-                                      } else {
-                                          h.write(buf);
-                                          total_received += buf.len();
-                                      }
-                                  }
-                              }
-                              Err(x) if x == Errno::from_raw(ENOBUFS) => {
-                                  continue;
-                              }
-                              Err(err) => panic!("{err:?}"),
-                          }
-                      }
-
-                      let digest = h.finish();
-                      assert_eq!(digest, EXPECTED_HASH);
+                      let digest = h.finalize();
+                      assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
                       unsafe { DURATION += start.elapsed() };
                       unsafe {
@@ -347,51 +340,17 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                       ex.clone().spawn(async move {
                                     let start = Instant::now();
 
+                                    let mut h = blake2::Blake2b512::new();
                                     let mut generator = ByteGen::new();
 
                                     stream.set_timeout(Duration::from_secs(120));
                                     stream.set_buf_group(SERVER_BGID);
 
-                                    let mut total_received = 0;
-                                    let mut h = DefaultHasher::new();
+                                    fiona_recv(&mut h, stream.clone()).await;
+                                    let digest = h.finalize();
+                                    assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
-                                    while total_received < BUF_SIZE {
-                                        match stream.recv().await {
-                                            Ok(bufs) => {
-                                                for buf in &bufs {
-                                                    if buf.is_empty() {
-                                                        assert_eq!(total_received, BUF_SIZE);
-                                                    } else {
-                                                        h.write(buf);
-                                                        total_received += buf.len();
-                                                    }
-                                                }
-                                            }
-                                            Err(x) if x == Errno::from_raw(ENOBUFS) => {
-                                                continue;
-                                            }
-                                            Err(err) => panic!("{err:?}"),
-                                        }
-                                    }
-
-                                    let digest = h.finish();
-                                    assert_eq!(digest, EXPECTED_HASH);
-
-                                    let mut total_sent = 0;
-                                    let mut send_buf = Vec::with_capacity(SEND_BUF_SIZE);
-                                    while total_sent < BUF_SIZE {
-                                        let mut chunk = [0_u8; SEND_BUF_SIZE];
-                                        generator.write(&mut chunk);
-                                        send_buf.extend_from_slice(&chunk);
-                                        while !send_buf.is_empty() {
-                                            let (num_sent, buf) = stream.send(send_buf).await;
-                                            send_buf = buf;
-                                            let num_sent = num_sent.unwrap();
-                                            assert!(num_sent > 0);
-                                            drop(send_buf.drain(0..num_sent));
-                                            total_sent += num_sent;
-                                        }
-                                    }
+                                    fiona_send(&mut generator, stream.clone()).await;
 
                                     unsafe { DURATION += start.elapsed() };
                                 });
@@ -447,11 +406,11 @@ fn main()
     {
         let bytes = make_bytes();
 
-        let mut h = DefaultHasher::new();
-        h.write(&bytes);
-        let digest = h.finish();
+        let mut h = blake2::Blake2b512::new();
+        h.update(&bytes);
+        let digest = h.finalize();
 
-        assert_eq!(digest, EXPECTED_HASH);
+        assert_eq!(digest.as_slice(), EXPECTED_HASH);
     }
 
     if args.tokio {
