@@ -20,6 +20,7 @@ use rand::SeedableRng;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    time::timeout,
 };
 
 const BUF_SIZE: usize = 1024 * 1024;
@@ -73,10 +74,9 @@ async fn tokio_send(generator: &mut ByteGen, stream: &mut TcpStream)
 
         let mut n = 0;
         while n < SEND_BUF_SIZE {
-            let sent = tokio::time::timeout(Duration::from_secs(120),
-                               stream.write(&send_buf[n..])).await
-                                                                                        .unwrap()
-                                                                                        .unwrap();
+            let sent = timeout(Duration::from_secs(120), stream.write(&send_buf[n..])).await
+                                                                                      .unwrap()
+                                                                                      .unwrap();
 
             assert!(sent > 0);
             n += sent;
@@ -91,9 +91,9 @@ async fn tokio_recv(h: &mut blake2::Blake2b512, stream: &mut TcpStream)
 
     let mut total_received = 0;
     while total_received < BUF_SIZE {
-        let n = tokio::time::timeout(Duration::from_secs(120), stream.read(&mut buf)).await
-                                                                                     .unwrap()
-                                                                                     .unwrap();
+        let n = timeout(Duration::from_secs(120), stream.read(&mut buf)).await
+                                                                        .unwrap()
+                                                                        .unwrap();
 
         h.update(&buf[0..n]);
         total_received += n;
@@ -128,8 +128,8 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                                                  .unwrap();
 
                           tokio_send(&mut generator, &mut client).await;
-
                           tokio_recv(&mut h, &mut client).await;
+
                           let digest = h.finalize();
                           assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
@@ -139,7 +139,9 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                           }
                       });
           }
+
           join_set.join_all().await;
+
           let avg_dur = unsafe { DURATION / nr_files };
           println!("tokio average client duration: {avg_dur:?}");
           println!("tokio client loop took: {:?} for {nr_files} connections", start.elapsed());
@@ -218,6 +220,7 @@ async fn fiona_send(generator: &mut ByteGen, stream: fiona::tcp::Stream)
 {
     let mut total_sent = 0;
     let mut send_buf = vec![0_u8; SEND_BUF_SIZE];
+
     while total_sent < BUF_SIZE {
         generator.write(send_buf.as_mut_slice());
 
@@ -261,7 +264,6 @@ async fn fiona_recv(h: &mut blake2::Blake2b512, stream: fiona::tcp::Stream)
 
 fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
 {
-    unsafe { DURATION = Duration::new(0, 0) };
     static mut TIMINGS: Vec<Duration> = Vec::new();
 
     let start = Instant::now();
@@ -274,14 +276,14 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     ex.register_buf_group(CLIENT_BGID, NUM_BUFS, RECV_BUF_SIZE)
       .unwrap();
 
-    for _idx in 0..nr_files {
+    unsafe { DURATION = Duration::new(0, 0) };
+    for _ in 0..nr_files {
         let ex2 = ex.clone();
         ex.clone().spawn(async move {
                       let start = Instant::now();
 
-                      let mut generator = ByteGen::new();
-
                       let mut h = blake2::Blake2b512::new();
+                      let mut generator = ByteGen::new();
 
                       let client = fiona::tcp::Client::new(ex2);
                       client.set_buf_group(CLIENT_BGID);
@@ -302,6 +304,7 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     }
 
     let _n = ioc.run();
+
     let avg_dur = unsafe { DURATION / nr_files };
     println!("fiona average client duration: {avg_dur:?}");
     println!("fiona client loop took: {:?} for {nr_files} connections", start.elapsed());
@@ -321,7 +324,6 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 
 fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
 {
-    unsafe { DURATION = Duration::new(0, 0) };
     let start = Instant::now();
 
     const SERVER_BGID: u16 = 27;
@@ -334,8 +336,9 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)
       .unwrap();
 
+    unsafe { DURATION = Duration::new(0, 0) };
     ex.clone().spawn(async move {
-                  for _idx in 0..nr_files {
+                  for _ in 0..nr_files {
                       let stream = acceptor.accept().await.unwrap();
                       ex.clone().spawn(async move {
                                     let start = Instant::now();
