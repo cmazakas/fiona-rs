@@ -15,7 +15,10 @@ use std::{
 
 use blake2::Digest;
 use clap::Parser;
-use nix::{errno::Errno, libc::ENOBUFS};
+use nix::{
+    errno::Errno,
+    libc::{ENOBUFS, SHUT_WR},
+};
 use rand::SeedableRng;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -100,6 +103,11 @@ async fn tokio_recv(h: &mut blake2::Blake2b512, stream: &mut TcpStream)
     }
 }
 
+async fn tokio_close(stream: &mut TcpStream)
+{
+    stream.shutdown().await.unwrap();
+}
+
 fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
 {
     static mut TIMINGS: Vec<Duration> = Vec::new();
@@ -132,6 +140,9 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 
                           let digest = h.finalize();
                           assert_eq!(digest.as_slice(), EXPECTED_HASH);
+
+                          tokio_close(&mut client).await;
+                          drop(client);
 
                           unsafe { DURATION += start.elapsed() };
                           unsafe {
@@ -193,6 +204,9 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                           assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
                           tokio_send(&mut generator, &mut stream).await;
+
+                          tokio_close(&mut stream).await;
+                          drop(stream);
 
                           unsafe { DURATION += start.elapsed() };
                       });
@@ -262,6 +276,12 @@ async fn fiona_recv(h: &mut blake2::Blake2b512, stream: fiona::tcp::Stream)
     }
 }
 
+async fn fiona_close(stream: fiona::tcp::Stream)
+{
+    stream.shutdown(SHUT_WR).await.unwrap();
+    stream.close().await.unwrap();
+}
+
 fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
 {
     static mut TIMINGS: Vec<Duration> = Vec::new();
@@ -290,11 +310,17 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                       client.set_timeout(Duration::from_secs(120));
                       client.connect_ipv4(ipv4_addr, port).await.unwrap();
 
-                      fiona_send(&mut generator, client.as_stream()).await;
-                      fiona_recv(&mut h, client.as_stream()).await;
+                      let stream = client.as_stream();
+
+                      fiona_send(&mut generator, stream.clone()).await;
+                      fiona_recv(&mut h, stream.clone()).await;
 
                       let digest = h.finalize();
                       assert_eq!(digest.as_slice(), EXPECTED_HASH);
+
+                      fiona_close(stream.clone()).await;
+                      drop(stream);
+                      drop(client);
 
                       unsafe { DURATION += start.elapsed() };
                       unsafe {
@@ -354,6 +380,9 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                                     assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
                                     fiona_send(&mut generator, stream.clone()).await;
+
+                                    fiona_close(stream.clone()).await;
+                                    drop(stream);
 
                                     unsafe { DURATION += start.elapsed() };
                                 });
