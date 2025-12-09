@@ -87,7 +87,7 @@ async fn tokio_send(generator: &mut ByteGen, stream: &mut TcpStream)
 
 async fn tokio_recv(h: &mut blake2::Blake2b512, stream: &mut TcpStream)
 {
-    let mut buf = [0; RECV_BUF_SIZE];
+    let mut buf = vec![0; RECV_BUF_SIZE];
 
     let mut total_received = 0;
     while total_received < BUF_SIZE {
