@@ -1778,7 +1778,7 @@ fn tcp_send_subspan()
         }
         assert_eq!(msg[0..3], acc);
 
-        let (n, msg) = stream.send_subspan(3..msg.len(), msg).await;
+        let (n, msg) = stream.send_subspan(3.., msg).await;
         assert_eq!(n.unwrap(), msg.len() - 3);
 
         let bufs = client.recv().await.unwrap();

@@ -240,7 +240,7 @@ async fn fiona_send(generator: &mut ByteGen, stream: fiona::tcp::Stream)
 
         let mut n = 0;
         while n < SEND_BUF_SIZE {
-            let (num_sent, buf) = stream.send_subspan(n..send_buf.len(), send_buf).await;
+            let (num_sent, buf) = stream.send_subspan(n.., send_buf).await;
             let num_sent = num_sent.unwrap();
             assert!(num_sent > 0);
 

@@ -36,7 +36,7 @@ use std::{
     marker::PhantomData,
     mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
-    ops::Range,
+    ops::{Range, RangeBounds},
     os::fd::AsRawFd,
     ptr::{self, NonNull},
     task::Poll,
@@ -607,10 +607,24 @@ impl Stream
     }
 
     #[must_use]
-    pub fn send_subspan(&self, subspan: Range<usize>, buf: Vec<u8>) -> SendFuture<'_>
+    pub fn send_subspan<R: RangeBounds<usize>>(&self, subspan: R, buf: Vec<u8>) -> SendFuture<'_>
     {
         assert!(unsafe { !(*self.p.as_ptr()).send_pending });
-        assert!(!subspan.is_empty());
+
+        let start = match subspan.start_bound() {
+            std::ops::Bound::Included(&s) => s,
+            std::ops::Bound::Excluded(&s) => s + 1,
+            std::ops::Bound::Unbounded => 0,
+        };
+
+        let end = match subspan.end_bound() {
+            std::ops::Bound::Included(&e) => e + 1,
+            std::ops::Bound::Excluded(&e) => e,
+            std::ops::Bound::Unbounded => buf.len(),
+        };
+
+        let subspan = Range { start, end };
+        assert!(subspan.end <= buf.len());
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.send_pending = true;
