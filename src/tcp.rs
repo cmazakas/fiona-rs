@@ -36,6 +36,7 @@ use std::{
     marker::PhantomData,
     mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+    ops::{Range, RangeBounds},
     os::fd::AsRawFd,
     ptr::{self, NonNull},
     task::Poll,
@@ -602,7 +603,28 @@ impl Stream
     #[must_use]
     pub fn send(&self, buf: Vec<u8>) -> SendFuture<'_>
     {
+        self.send_subspan(0..buf.len(), buf)
+    }
+
+    #[must_use]
+    pub fn send_subspan<R: RangeBounds<usize>>(&self, subspan: R, buf: Vec<u8>) -> SendFuture<'_>
+    {
         assert!(unsafe { !(*self.p.as_ptr()).send_pending });
+
+        let start = match subspan.start_bound() {
+            std::ops::Bound::Included(&s) => s,
+            std::ops::Bound::Excluded(&s) => s + 1,
+            std::ops::Bound::Unbounded => 0,
+        };
+
+        let end = match subspan.end_bound() {
+            std::ops::Bound::Included(&e) => e + 1,
+            std::ops::Bound::Excluded(&e) => e,
+            std::ops::Bound::Unbounded => buf.len(),
+        };
+
+        let subspan = Range { start, end };
+        assert!(subspan.end <= buf.len());
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.send_pending = true;
@@ -619,7 +641,8 @@ impl Stream
                              .insert(make_io_uring_op(ref_count,
                                                       OpType::TcpSend { buf,
                                                                         last_send,
-                                                                        num_sent: 0 }),
+                                                                        num_sent: 0,
+                                                                        subspan }),
                                      &stream_impl.fd_impl.ex);
 
         SendFuture { stream: self,
@@ -1319,13 +1342,16 @@ impl Future for SendFuture<'_>
         let user_data = key_data;
 
         match (op.initiated, op.done) {
-            (false, true) => panic!(),
+            (false, true) => unreachable!(),
             (true, false) => {
                 op.local_waker = Some(cx.local_waker().clone());
                 Poll::Pending
             }
             (false, false) => {
-                let OpType::TcpSend { ref buf, .. } = op.op_type else {
+                let OpType::TcpSend { ref buf,
+                                      ref subspan,
+                                      .. } = op.op_type
+                else {
                     unreachable!()
                 };
 
@@ -1334,8 +1360,8 @@ impl Future for SendFuture<'_>
                     unsafe {
                         io_uring_prep_send_zc(sqe,
                                               stream_impl.fd_impl.fd,
-                                              buf.as_ptr().cast(),
-                                              buf.len(),
+                                              buf.as_ptr().add(subspan.start).cast(),
+                                              subspan.end - subspan.start,
                                               0,
                                               0);
                     }

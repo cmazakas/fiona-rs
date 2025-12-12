@@ -2,7 +2,11 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-#![feature(ptr_metadata, box_as_ptr, local_waker, sync_unsafe_cell)]
+#![feature(ptr_metadata,
+           box_as_ptr,
+           local_waker,
+           sync_unsafe_cell,
+           range_bounds_is_empty)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::mutable_key_type,
          clippy::missing_panics_doc,
@@ -28,6 +32,7 @@ use std::{
     marker::PhantomData,
     mem::{ManuallyDrop, forget},
     ops::Deref,
+    ops::Range,
     pin::Pin,
     ptr::{self, DynMetadata, NonNull, metadata},
     rc::Rc,
@@ -791,6 +796,7 @@ enum OpType
     TcpSend
     {
         num_sent: usize,
+        subspan: Range<usize>,
         buf: Vec<u8>,
         last_send: *mut Instant,
     },
