@@ -1793,3 +1793,86 @@ fn tcp_send_subspan()
     let n = ioc.run();
     assert!(n > 0);
 }
+
+#[test]
+#[allow(clippy::redundant_closure_call)]
+fn tcp_ephemeral_port_exhaustion_panic()
+{
+    let mut params = fiona::IoContextParams::new();
+    params.nr_files = 100_000;
+    params.cq_entries = 32 * 1024;
+
+    let mut ioc = fiona::IoContext::with_params(&params);
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.clone().spawn((async |acceptor: fiona::tcp::Acceptor| {
+                         for _ in 0..100_000 {
+                             let stream = acceptor.accept().await;
+                             if stream.is_err() {
+                                 return;
+                             }
+
+                             let stream = stream.unwrap();
+                             let _ = stream;
+
+                             let timer = fiona::time::Timer::new(stream.get_executor());
+                             timer.wait(Duration::from_millis(100)).await.unwrap();
+                         }
+                     })(acceptor.clone()));
+
+    ex.clone().spawn((async |acceptor: fiona::tcp::Acceptor| {
+                         let timer = fiona::time::Timer::new(acceptor.get_executor());
+                         timer.wait(Duration::from_millis(15_000)).await.unwrap();
+
+                         acceptor.cancel().await.unwrap();
+                         acceptor.close().await.unwrap();
+                     })(acceptor.clone()));
+
+    let mut threads = Vec::new();
+    for _ in 0..4 {
+        let thread = std::thread::spawn(move || {
+            let mut params = fiona::IoContextParams::new();
+            params.nr_files = 25_000;
+            params.cq_entries = 32 * 1024;
+
+            let mut ioc = fiona::IoContext::with_params(&params);
+            let ex = ioc.get_executor();
+
+            for _ in 0..25_000 {
+                ex.clone().spawn((async |ex: fiona::Executor, port: u16| {
+                                     let client = fiona::tcp::Client::new(ex);
+
+                                     client.connect_ipv6(Ipv6Addr::LOCALHOST, port)
+                                           .await
+                                           .unwrap();
+
+                                     let timer = fiona::time::Timer::new(client.get_executor());
+                                     timer.wait(Duration::from_millis(100)).await.unwrap();
+                                 })(ex.clone(), port));
+            }
+
+            let n = ioc.run();
+            assert!(n > 0);
+        });
+
+        threads.push(thread);
+    }
+
+    let n = ioc.run();
+    assert!(n > 0);
+
+    let mut num_errs = 0;
+    for thread in threads {
+        match thread.join() {
+            Ok(_) => {}
+            Err(_) => {
+                num_errs += 1;
+            }
+        }
+    }
+
+    assert!(num_errs > 0);
+}

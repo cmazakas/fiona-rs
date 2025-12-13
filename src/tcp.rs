@@ -1257,20 +1257,23 @@ impl Drop for ConnectFuture<'_>
             assert!(op.initiated);
             assert!(op.done);
 
-            let fd = fd.try_into().unwrap();
+            if fd >= 0 {
+                let fd = fd.try_into().unwrap();
 
-            io_ops.remove(key).unwrap();
-            drop(borrow_guard);
+                io_ops.remove(key).unwrap();
+                drop(borrow_guard);
 
-            let ex = &client_impl.stream.fd_impl.ex;
-            let key = ex.p
-                        .io_ops
-                        .borrow_mut()
-                        .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), ex);
+                let ex = &client_impl.stream.fd_impl.ex;
+                let key =
+                    ex.p
+                      .io_ops
+                      .borrow_mut()
+                      .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), ex);
 
-            let sqe = get_sqe(ex);
-            unsafe { io_uring_prep_close_direct(sqe, fd) };
-            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+                let sqe = get_sqe(ex);
+                unsafe { io_uring_prep_close_direct(sqe, fd) };
+                unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+            }
 
             self.op = None;
 
