@@ -54,7 +54,7 @@ async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: 
     let mut generator = ByteGen::new();
 
     let client = fiona::tcp::Client::new(ex);
-    client.set_timeout(Duration::from_secs(120));
+    client.set_timeout(Duration::from_secs(3));
     client.connect_ipv4(ipv4_addr, port).await.unwrap();
 
     client.set_buf_group(CLIENT_BGID);
@@ -82,6 +82,10 @@ async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: 
         let mbufs = client.recv().await;
         match mbufs {
             Ok(bufs) => {
+                if bufs.is_empty() {
+                    assert_eq!(total_received, BUF_SIZE);
+                }
+
                 for buf in &bufs {
                     if buf.is_empty() {
                         assert_eq!(total_received, BUF_SIZE);
@@ -130,7 +134,7 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 
 async fn fiona_echo_server_impl(stream: fiona::tcp::Stream)
 {
-    stream.set_timeout(Duration::from_secs(120));
+    stream.set_timeout(Duration::from_secs(3));
     stream.set_buf_group(SERVER_BGID);
 
     let mut total_received = 0;
@@ -221,7 +225,7 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 fn tcp_stress_panicking()
 {
     let port = 8000;
-    let nr_files = 100;
+    let nr_files = 500;
 
     let t1 = std::thread::spawn(move || fiona_echo_server(Ipv4Addr::LOCALHOST, port, nr_files));
     std::thread::sleep(Duration::from_millis(100));

@@ -12,7 +12,7 @@ use core::panic;
 use liburing_rs::{
     __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
     IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT,
-    IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring_get_sqe,
+    IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK,
     io_uring_prep_accept_direct, io_uring_prep_cancel_fd, io_uring_prep_cancel64,
     io_uring_prep_close_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
     io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_shutdown,
@@ -1089,10 +1089,11 @@ impl Future for ConnectFuture<'_>
         assert!(!self.completed);
 
         let client_impl = unsafe { &mut *self.client.p.as_ptr() };
+        let ex = client_impl.stream.fd_impl.ex.clone();
 
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let io_ops = &mut *client_impl.stream.fd_impl.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         match (op.initiated, op.done) {
@@ -1102,14 +1103,12 @@ impl Future for ConnectFuture<'_>
                 Poll::Pending
             }
             (false, false) => {
-                let ring = client_impl.stream.fd_impl.ex.ring();
-
                 let user_data = key_data;
 
                 let OpType::TcpConnect { ref addr,
-                                         ref mut ts,
                                          ref mut needs_socket,
                                          ref mut fd,
+                                         ref mut ts,
                                          .. } = op.op_type
                 else {
                     unreachable!();
@@ -1125,12 +1124,11 @@ impl Future for ConnectFuture<'_>
                     }
                 };
 
-                let file_index;
-
                 *needs_socket = client_impl.stream.fd_impl.fd < 0;
 
+                let file_index;
                 if *needs_socket {
-                    let mfile_index = client_impl.stream.fd_impl.ex.get_available_fd();
+                    let mfile_index = ex.get_available_fd();
                     let Some(file_idx) = mfile_index else {
                         return Poll::Ready(Err(Errno::from_raw(ENFILE)));
                     };
@@ -1141,25 +1139,21 @@ impl Future for ConnectFuture<'_>
                     file_index = client_impl.stream.fd_impl.fd.try_into().unwrap();
                 }
 
-                unsafe { reserve_sqes(ring, if *needs_socket { 3 } else { 2 }) };
+                *fd = file_index.try_into().unwrap();
 
                 if *needs_socket {
-                    let sqe = unsafe { io_uring_get_sqe(ring) };
+                    let sqe = get_sqe(&ex);
+                    let r#type = SOCK_STREAM;
+                    let protocol = IPPROTO_TCP;
 
                     unsafe {
-                        io_uring_prep_socket_direct(sqe,
-                                                    af,
-                                                    SOCK_STREAM,
-                                                    IPPROTO_TCP,
-                                                    file_index,
-                                                    0);
+                        io_uring_prep_socket_direct(sqe, af, r#type, protocol, file_index, 0);
                     }
                     unsafe { io_uring_sqe_set_data64(sqe, user_data) };
-                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK) }
-                }
+                } else {
+                    unsafe { reserve_sqes(&ex, 2) };
 
-                {
-                    let sqe = unsafe { io_uring_get_sqe(ring) };
+                    let sqe = get_sqe(&ex);
                     unsafe {
                         io_uring_prep_connect(sqe,
                                               file_index.try_into().unwrap(),
@@ -1168,10 +1162,8 @@ impl Future for ConnectFuture<'_>
                     }
                     unsafe { io_uring_sqe_set_data64(sqe, user_data) };
                     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK | IOSQE_FIXED_FILE) };
-                }
 
-                {
-                    let sqe = unsafe { io_uring_get_sqe(ring) };
+                    let sqe = get_sqe(&ex);
                     unsafe { io_uring_prep_link_timeout(sqe, std::ptr::from_mut(ts).cast(), 0) };
                     unsafe { io_uring_sqe_set_data(sqe, std::ptr::null_mut()) };
                     unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };

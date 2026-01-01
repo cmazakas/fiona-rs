@@ -1,3 +1,5 @@
+#![allow(clippy::redundant_closure_call)]
+
 use core::str;
 use std::{
     future::Future,
@@ -856,13 +858,24 @@ fn tcp_double_connect()
     let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
-    ex.clone().spawn(async move {
-                  // let _stream = acceptor.accept().await.unwrap();
-                  let stream = acceptor.accept().await.unwrap();
+    ex.clone()
+      .spawn((async |acceptor: fiona::tcp::Acceptor, ex: fiona::Executor| {
+                 let ex2 = ex.clone();
+                 let acceptor2 = acceptor.clone();
+                 ex //
+                   .clone()
+                   .spawn(async move {
+                       let ex = ex2;
+                       let acceptor = acceptor2;
 
-                  let timer = fiona::time::Timer::new(stream.get_executor());
-                  timer.wait(Duration::from_millis(250)).await.unwrap();
-              });
+                       let timer = fiona::time::Timer::new(ex);
+                       timer.wait(Duration::from_millis(250)).await.unwrap();
+
+                       acceptor.cancel().await.unwrap();
+                   });
+
+                 let _stream = acceptor.accept().await;
+             })(acceptor.clone(), ex.clone()));
 
     // sequential double-connect
     {
@@ -1795,7 +1808,6 @@ fn tcp_send_subspan()
 }
 
 #[test]
-#[allow(clippy::redundant_closure_call)]
 fn tcp_ephemeral_port_exhaustion_panic()
 {
     let mut params = fiona::IoContextParams::new();

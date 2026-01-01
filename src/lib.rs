@@ -52,16 +52,18 @@ use std::{
 use nix::{errno::Errno, libc::ETIME, sys::socket::SockaddrStorage};
 
 use liburing_rs::{
-    __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
+    __kernel_timespec, AF_INET, AF_INET6, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
     IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IORING_SETUP_CQSIZE,
-    IORING_SETUP_DEFER_TASKRUN, IORING_SETUP_SINGLE_ISSUER, IOSQE_CQE_SKIP_SUCCESS, io_uring,
-    io_uring_buf_ring, io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask,
-    io_uring_cq_advance, io_uring_cqe, io_uring_cqe_seen, io_uring_for_each_cqe,
-    io_uring_free_buf_ring, io_uring_get_events, io_uring_get_sqe, io_uring_params,
-    io_uring_peek_cqe, io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_msg_ring,
-    io_uring_queue_exit, io_uring_queue_init_params, io_uring_register_files_sparse,
-    io_uring_register_ring_fd, io_uring_register_sync_msg, io_uring_setup_buf_ring,
-    io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    IORING_SETUP_DEFER_TASKRUN, IORING_SETUP_SINGLE_ISSUER, IORING_TIMEOUT_MULTISHOT,
+    IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring, io_uring_buf_ring,
+    io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_cq_advance,
+    io_uring_cqe, io_uring_cqe_seen, io_uring_for_each_cqe, io_uring_free_buf_ring,
+    io_uring_get_events, io_uring_get_sqe, io_uring_params, io_uring_peek_cqe,
+    io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_connect,
+    io_uring_prep_link_timeout, io_uring_prep_msg_ring, io_uring_prep_timeout, io_uring_queue_exit,
+    io_uring_queue_init_params, io_uring_register_files_sparse, io_uring_register_ring_fd,
+    io_uring_register_sync_msg, io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe,
+    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
     io_uring_submit_and_get_events, io_uring_submit_and_wait, io_uring_unregister_buf_ring,
 };
 
@@ -893,8 +895,9 @@ fn get_sqe(ex: &Executor) -> *mut io_uring_sqe
     sqe
 }
 
-unsafe fn reserve_sqes(ring: *mut io_uring, n: u32)
+unsafe fn reserve_sqes(ex: &Executor, n: u32)
 {
+    let ring = ex.ring();
     let r = unsafe { io_uring_sq_space_left(ring) };
     if r < n {
         unsafe { submit_ring(ring) };
@@ -1370,14 +1373,8 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
             unreachable!()
         };
 
-        let is_last_cqe = cqe.res < 0 || *got_socket || !*needs_socket;
-
         if *needs_socket && !*got_socket && cqe.res >= 0 {
             *got_socket = true;
-        }
-
-        if !is_last_cqe {
-            return;
         }
 
         let mut op = io_ops.remove(key).unwrap();
@@ -1419,6 +1416,8 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
     let OpType::TcpConnect { ref mut needs_socket,
                              ref mut got_socket,
                              ref mut fd,
+                             ref addr,
+                             ref mut ts,
                              .. } = op.op_type
     else {
         unreachable!()
@@ -1468,8 +1467,37 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
 
     // we expect one more CQE after this, the result of the actual
     // connect() call
-    if *needs_socket {
+    if *needs_socket && !*got_socket {
         *got_socket = true;
+
+        let (_af, addrlen) = {
+            if let Some(x) = addr.as_sockaddr_in() {
+                (AF_INET, std::mem::size_of_val(x))
+            } else if let Some(x) = addr.as_sockaddr_in6() {
+                (AF_INET6, std::mem::size_of_val(x))
+            } else {
+                unreachable!();
+            }
+        };
+
+        unsafe { reserve_sqes(ex, 2) };
+
+        let sqe = get_sqe(ex);
+        unsafe {
+            io_uring_prep_connect(sqe,
+                                  *fd,
+                                  std::ptr::from_ref(addr).cast(),
+                                  addrlen.try_into().unwrap());
+        }
+
+        let user_data = key_data;
+        unsafe { io_uring_sqe_set_data64(sqe, user_data) };
+        unsafe { io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK | IOSQE_FIXED_FILE) };
+
+        let sqe = get_sqe(ex);
+        unsafe { io_uring_prep_link_timeout(sqe, std::ptr::from_mut(ts).cast(), 0) };
+        unsafe { io_uring_sqe_set_data(sqe, std::ptr::null_mut()) };
+        unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
     }
 }
 
@@ -1640,21 +1668,15 @@ fn on_timeout_multishot(ex: &Executor, cqe: &mut io_uring_cqe)
     }
 
     if !has_more_cqes {
-        unimplemented!();
-        // let user_data: *mut IoUringOp = &raw mut *op;
-        // let user_data = user_data.cast();
+        let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
+            unreachable!()
+        };
 
-        // let OpType::MultishotTimeout { ref mut ts, .. } =
-        // op.op_type else {
-        //     unreachable!()
-        // };
+        let ts = ptr::from_mut(ts).cast();
 
-        // let ts = ptr::from_mut(ts).cast();
-
-        // let sqe = get_sqe(ex);
-        // unsafe { io_uring_prep_timeout(sqe, ts, 0,
-        // IORING_TIMEOUT_MULTISHOT) };
-        // unsafe { io_uring_sqe_set_data(sqe, user_data) };
+        let sqe = get_sqe(ex);
+        unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
+        unsafe { io_uring_sqe_set_data64(sqe, key_data) };
     }
 
     if cqe.res != -ETIME {
