@@ -10,7 +10,7 @@ edition = "2024"
 [dependencies]
 nix = { version = "0.30.1", features = ["event", "socket", "net"] }
 slotmap = { version = "1.0.7" }
-axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "e0ac85a573420bd193d61077b640bd9386a9a067" }
+axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "c35a45cba2947f74f6866945e4e9a60603851292" }
 
 [features]
 sanitizers = ["axboe-liburing/sanitizers"]
