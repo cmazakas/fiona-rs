@@ -11,18 +11,18 @@ use crate::{
 use core::panic;
 use liburing_rs::{
     __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
-    IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST, IORING_TIMEOUT_MULTISHOT,
-    IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK,
-    io_uring_prep_accept_direct, io_uring_prep_cancel_fd, io_uring_prep_cancel64,
-    io_uring_prep_close_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
-    io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_shutdown,
-    io_uring_prep_socket_direct, io_uring_prep_timeout, io_uring_prep_timeout_remove,
-    io_uring_prep_timeout_update, io_uring_register_files_update, io_uring_sqe_set_buf_group,
+    IORING_FILE_INDEX_ALLOC, IORING_RECVSEND_BUNDLE, IORING_RECVSEND_POLL_FIRST,
+    IORING_TIMEOUT_MULTISHOT, IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE,
+    IOSQE_IO_LINK, io_uring_prep_accept_direct, io_uring_prep_cancel_fd, io_uring_prep_cancel64,
+    io_uring_prep_close, io_uring_prep_close_direct, io_uring_prep_connect,
+    io_uring_prep_link_timeout, io_uring_prep_recv_multishot, io_uring_prep_send_zc,
+    io_uring_prep_shutdown, io_uring_prep_socket_direct_alloc, io_uring_prep_timeout,
+    io_uring_prep_timeout_remove, io_uring_prep_timeout_update, io_uring_sqe_set_buf_group,
     io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
 use nix::{
     errno::Errno,
-    libc::{AF_INET, AF_INET6, ENFILE, IPPROTO_TCP, SOCK_STREAM},
+    libc::{AF_INET, AF_INET6, IPPROTO_TCP, SOCK_STREAM, close},
     sys::socket::{
         AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrIn6,
         SockaddrLike, SockaddrStorage, bind, getsockname, listen, setsockopt, socket,
@@ -37,7 +37,7 @@ use std::{
     mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     ops::{Range, RangeBounds},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, IntoRawFd},
     ptr::{self, NonNull},
     task::Poll,
     time::{Duration, Instant},
@@ -63,6 +63,19 @@ impl Default for AcceptorOpts
 
 //-----------------------------------------------------------------------------
 
+pub(crate) struct FdImpl
+{
+    ref_count: RefCount,
+    ex: Executor,
+    pub(crate) fd: i32,
+    pub(crate) close_pending: bool,
+    pub(crate) cancel_pending: bool,
+    was_closed: bool,
+    is_fixed: bool,
+}
+
+//-----------------------------------------------------------------------------
+
 #[derive(Debug)]
 pub struct Acceptor
 {
@@ -77,10 +90,6 @@ impl Acceptor
                     af: AddressFamily)
                     -> Result<Acceptor>
     {
-        let Some(offset) = ex.get_available_fd() else {
-            return Err(Errno::from_raw(ENFILE));
-        };
-
         let socket = socket(af, SockType::Stream, SockFlag::empty(), SockProtocol::Tcp)?;
 
         if opts.reuse_addr {
@@ -93,16 +102,6 @@ impl Acceptor
 
         bind(socket.as_raw_fd(), ip_addr)?;
         listen(&socket, Backlog::new(Self::DEFAULT_BACKLOG).unwrap())?;
-
-        {
-            let ring = ex.ring();
-            let fd = socket.as_raw_fd();
-            let ret = unsafe { io_uring_register_files_update(ring, offset, &raw const fd, 1) };
-            if ret < 0 {
-                return Err(Errno::from_raw(-ret));
-            }
-            assert_eq!(ret, 1);
-        }
 
         let layout = Layout::new::<AcceptorImpl>();
         let p = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
@@ -117,10 +116,11 @@ impl Acceptor
 
         let acceptor_impl = AcceptorImpl { fd_impl: FdImpl { ref_count,
                                                              ex,
-                                                             fd: offset.try_into().unwrap(),
+                                                             fd: socket.into_raw_fd(),
                                                              cancel_pending: false,
                                                              close_pending: false,
-                                                             was_closed: false },
+                                                             was_closed: false,
+                                                             is_fixed: false },
                                            addr,
                                            accept_pending: false };
 
@@ -186,7 +186,7 @@ impl Acceptor
                                .p
                                .io_ops
                                .borrow_mut()
-                               .insert(make_io_uring_op(ref_count, OpType::TcpAccept { fd: -1 }),
+                               .insert(make_io_uring_op(ref_count, OpType::TcpAccept),
                                        &acceptor_impl.fd_impl.ex);
 
         AcceptFuture { acceptor: self,
@@ -269,18 +269,6 @@ impl Drop for Acceptor
 
 //-----------------------------------------------------------------------------
 
-pub(crate) struct FdImpl
-{
-    ref_count: RefCount,
-    ex: Executor,
-    pub(crate) fd: i32,
-    pub(crate) close_pending: bool,
-    pub(crate) cancel_pending: bool,
-    was_closed: bool,
-}
-
-//-----------------------------------------------------------------------------
-
 struct AcceptorImpl
 {
     fd_impl: FdImpl,
@@ -293,24 +281,7 @@ impl Drop for AcceptorImpl
     fn drop(&mut self)
     {
         if self.fd_impl.fd >= 0 {
-            let fd = self.fd_impl.fd.try_into().unwrap();
-
-            if self.fd_impl.was_closed {
-                self.fd_impl.ex.reclaim_fd(fd);
-                return;
-            }
-
-            let key = self.fd_impl
-                          .ex
-                          .p
-                          .io_ops
-                          .borrow_mut()
-                          .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }),
-                                  &self.fd_impl.ex);
-
-            let sqe = get_sqe(&self.fd_impl.ex);
-            unsafe { io_uring_prep_close_direct(sqe, fd) };
-            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+            unsafe { close(self.fd_impl.fd) };
         }
     }
 }
@@ -349,19 +320,6 @@ impl Future for AcceptFuture<'_>
             }
             (false, true) => unreachable!(),
             (false, false) => {
-                let Some(file_index) = acceptor_impl.fd_impl.ex.get_available_fd() else {
-                    self.completed = true;
-                    return Poll::Ready(Err(Errno::from_raw(ENFILE)));
-                };
-
-                {
-                    let OpType::TcpAccept { ref mut fd } = op.op_type else {
-                        unreachable!()
-                    };
-
-                    *fd = file_index.try_into().unwrap();
-                }
-
                 let sqe = get_sqe(&acceptor_impl.fd_impl.ex);
 
                 unsafe {
@@ -370,10 +328,9 @@ impl Future for AcceptFuture<'_>
                                                 std::ptr::null_mut(),
                                                 std::ptr::null_mut(),
                                                 0,
-                                                file_index);
+                                                IORING_FILE_INDEX_ALLOC as _);
                 }
                 unsafe { io_uring_sqe_set_data64(sqe, key_data) };
-                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) };
 
                 unsafe { add_op_ref(&raw mut acceptor_impl.fd_impl.ref_count) };
                 op.local_waker = Some(cx.local_waker().clone());
@@ -389,10 +346,7 @@ impl Future for AcceptFuture<'_>
                     let res = -res;
                     Poll::Ready(Err(Errno::from_raw(res)))
                 } else {
-                    let OpType::TcpAccept { fd } = op.op_type else {
-                        unreachable!()
-                    };
-
+                    let fd = res;
                     drop(borrow_guard);
                     Poll::Ready(Ok(Stream::new(acceptor_impl.fd_impl.ex.clone(), fd)))
                 }
@@ -430,11 +384,7 @@ impl Drop for AcceptFuture<'_>
             unsafe { add_op_ref(ref_count) };
 
             let sqe = get_sqe(&acceptor_impl.fd_impl.ex);
-            unsafe {
-                io_uring_prep_cancel_fd(sqe,
-                                        acceptor_impl.fd_impl.fd,
-                                        IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED);
-            }
+            unsafe { io_uring_prep_cancel64(sqe, key_data, 0) };
             unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
 
             self.op = None;
@@ -453,16 +403,12 @@ impl Drop for AcceptFuture<'_>
 
             io_ops.remove(key).unwrap();
             drop(borrow_guard);
-
             let ex = &acceptor_impl.fd_impl.ex;
-            let key = ex.p
-                        .io_ops
-                        .borrow_mut()
-                        .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), ex);
 
             let sqe = get_sqe(ex);
             unsafe { io_uring_prep_close_direct(sqe, fd) };
-            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
             return;
         }
 
@@ -493,22 +439,10 @@ impl Drop for StreamImpl
         if self.fd_impl.fd >= 0 {
             let fd = self.fd_impl.fd.try_into().unwrap();
 
-            if self.fd_impl.was_closed {
-                self.fd_impl.ex.reclaim_fd(fd);
-                return;
-            }
-
-            let key = self.fd_impl
-                          .ex
-                          .p
-                          .io_ops
-                          .borrow_mut()
-                          .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }),
-                                  &self.fd_impl.ex);
-
             let sqe = get_sqe(&self.fd_impl.ex);
             unsafe { io_uring_prep_close_direct(sqe, fd) };
-            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
         }
     }
 }
@@ -541,7 +475,8 @@ impl Stream
                                                              fd,
                                                              close_pending: false,
                                                              cancel_pending: false,
-                                                             was_closed: false },
+                                                             was_closed: false,
+                                                             is_fixed: true },
                                            ts: Duration::from_secs(3).into(),
                                            buf_group: u16::MAX,
                                            send_pending: false,
@@ -849,7 +784,8 @@ impl Client
                                                     fd: -1,
                                                     close_pending: false,
                                                     cancel_pending: false,
-                                                    was_closed: false },
+                                                    was_closed: false,
+                                                    is_fixed: true },
                                   ts: Duration::from_secs(3).into(),
                                   buf_group: u16::MAX,
                                   send_pending: false,
@@ -1107,7 +1043,6 @@ impl Future for ConnectFuture<'_>
 
                 let OpType::TcpConnect { ref addr,
                                          ref mut needs_socket,
-                                         ref mut fd,
                                          ref mut ts,
                                          .. } = op.op_type
                 else {
@@ -1126,29 +1061,12 @@ impl Future for ConnectFuture<'_>
 
                 *needs_socket = client_impl.stream.fd_impl.fd < 0;
 
-                let file_index;
-                if *needs_socket {
-                    let mfile_index = ex.get_available_fd();
-                    let Some(file_idx) = mfile_index else {
-                        return Poll::Ready(Err(Errno::from_raw(ENFILE)));
-                    };
-
-                    *fd = file_idx.try_into().unwrap();
-                    file_index = file_idx;
-                } else {
-                    file_index = client_impl.stream.fd_impl.fd.try_into().unwrap();
-                }
-
-                *fd = file_index.try_into().unwrap();
-
                 if *needs_socket {
                     let sqe = get_sqe(&ex);
                     let r#type = SOCK_STREAM;
                     let protocol = IPPROTO_TCP;
 
-                    unsafe {
-                        io_uring_prep_socket_direct(sqe, af, r#type, protocol, file_index, 0);
-                    }
+                    unsafe { io_uring_prep_socket_direct_alloc(sqe, af, r#type, protocol, 0) };
                     unsafe { io_uring_sqe_set_data64(sqe, user_data) };
                 } else {
                     unsafe { reserve_sqes(&ex, 2) };
@@ -1156,7 +1074,7 @@ impl Future for ConnectFuture<'_>
                     let sqe = get_sqe(&ex);
                     unsafe {
                         io_uring_prep_connect(sqe,
-                                              file_index.try_into().unwrap(),
+                                              client_impl.stream.fd_impl.fd,
                                               std::ptr::from_ref(addr).cast(),
                                               addrlen.try_into().unwrap());
                     }
@@ -1256,15 +1174,11 @@ impl Drop for ConnectFuture<'_>
                 drop(borrow_guard);
 
                 let ex = &client_impl.stream.fd_impl.ex;
-                let key =
-                    ex.p
-                      .io_ops
-                      .borrow_mut()
-                      .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), ex);
 
                 let sqe = get_sqe(ex);
                 unsafe { io_uring_prep_close_direct(sqe, fd) };
-                unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+                unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
             }
 
             self.op = None;
@@ -1432,7 +1346,11 @@ impl Future for CloseFuture<'_>
                 let sqe = get_sqe(&fd_impl.ex);
                 let fd = fd_impl.fd as u32;
 
-                unsafe { io_uring_prep_close_direct(sqe, fd) };
+                if fd_impl.is_fixed {
+                    unsafe { io_uring_prep_close_direct(sqe, fd) };
+                } else {
+                    unsafe { io_uring_prep_close(sqe, fd as _) };
+                }
                 unsafe { io_uring_sqe_set_data64(sqe, user_data) };
                 unsafe { add_op_ref(&raw mut fd_impl.ref_count) };
 
@@ -1627,7 +1545,10 @@ impl Future for CancelFuture<'_>
 
                 let sqe = get_sqe(&fd_impl.ex);
                 let fd = fd_impl.fd;
-                let flags = IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED;
+                let mut flags = IORING_ASYNC_CANCEL_ALL;
+                if fd_impl.is_fixed {
+                    flags |= IORING_ASYNC_CANCEL_FD_FIXED;
+                }
 
                 unsafe { io_uring_prep_cancel_fd(sqe, fd, flags) };
                 unsafe { io_uring_sqe_set_data64(sqe, user_data) };

@@ -70,7 +70,7 @@ use liburing_rs::{
 pub mod tcp;
 pub mod time;
 
-use slotmap::{DefaultKey, Key, KeyData};
+use slotmap::{DefaultKey, KeyData};
 use tcp::StreamImpl;
 
 use crate::io_ops::IoOpsMap;
@@ -707,7 +707,6 @@ struct IoContextFrame
 {
     ioring: RefCell<io_uring>,
     params: RefCell<io_uring_params>,
-    available_fds: RefCell<VecDeque<u32>>,
     receiver: RefCell<Receiver<Weak>>,
     sender: RefCell<Sender<Weak>>,
     buf_groups: RefCell<HashMap<u16, Box<UnsafeCell<BufGroup>>>>,
@@ -782,10 +781,7 @@ enum OpType
         ts: __kernel_timespec,
         stream: *mut StreamImpl,
     },
-    TcpAccept
-    {
-        fd: i32,
-    },
+    TcpAccept,
     TcpConnect
     {
         addr: SockaddrStorage,
@@ -812,10 +808,6 @@ enum OpType
     TcpClose,
     TcpCancel,
     DropCancel,
-    DropClose
-    {
-        fd: u32,
-    },
 }
 
 type CqeHandler = fn(ex: &Executor, cqe: &mut io_uring_cqe);
@@ -1012,9 +1004,6 @@ impl Drop for RunGuard
                     let key = DefaultKey::from(KeyData::from_ffi(user_data));
 
                     let op = self.p.io_ops.borrow_mut().remove(key).unwrap();
-                    if let OpType::DropClose { .. } = op.op_type {
-                        continue;
-                    }
 
                     let rc = op.ref_count;
                     unsafe { release_op(rc) };
@@ -1061,7 +1050,6 @@ impl IoContext
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 
         let ioc_frame = IoContextFrame { params: RefCell::new(params),
-                                         available_fds: RefCell::new(VecDeque::new()),
                                          receiver: RefCell::new(rx),
                                          sender: RefCell::new(tx),
                                          ioring: RefCell::new(ioring),
@@ -1086,13 +1074,6 @@ impl IoContext
 
             let ret = unsafe { io_uring_register_files_sparse(ring, nr_files) };
             assert_eq!(ret, 0);
-            {
-                let available_fds = &mut *p.available_fds.borrow_mut();
-                available_fds.reserve(nr_files as usize);
-                for i in 0..nr_files {
-                    available_fds.push_back(i);
-                }
-            }
         }
 
         let ioc = Self { p };
@@ -1269,13 +1250,12 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler
         OpType::Timeout { .. } => on_timeout,
         OpType::TimeoutCancel => todo!(),
         OpType::MultishotTimeout { .. } => on_timeout_multishot,
-        OpType::TcpAccept { .. } => on_tcp_accept,
+        OpType::TcpAccept => on_tcp_accept,
         OpType::TcpConnect { .. } => on_tcp_connect,
         OpType::TcpSend { .. } => on_tcp_send,
         OpType::MultishotTcpRecv { .. } => on_tcp_multishot_recv,
         OpType::TcpShutdown | OpType::TcpClose | OpType::TcpCancel => on_tcp_close,
         OpType::DropCancel => on_drop_cancel,
-        OpType::DropClose { .. } => on_drop_close,
     }
 }
 
@@ -1326,19 +1306,12 @@ fn on_tcp_accept(ex: &Executor, cqe: &mut io_uring_cqe)
         unsafe { release_op(op.ref_count) };
 
         if op.res >= 0 {
-            let OpType::TcpAccept { fd } = op.op_type else {
-                unreachable!()
-            };
-
-            let fd = fd.try_into().unwrap();
-            let key = ex.p
-                        .io_ops
-                        .borrow_mut()
-                        .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), ex);
+            let fd = op.res as _;
 
             let sqe = get_sqe(ex);
             unsafe { io_uring_prep_close_direct(sqe, fd) };
-            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
         }
 
         return;
@@ -1368,6 +1341,7 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
 
         let OpType::TcpConnect { ref mut needs_socket,
                                  ref mut got_socket,
+                                 ref mut fd,
                                  .. } = op.op_type
         else {
             unreachable!()
@@ -1375,11 +1349,12 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
 
         if *needs_socket && !*got_socket && cqe.res >= 0 {
             *got_socket = true;
+            *fd = cqe.res;
         }
 
-        let mut op = io_ops.remove(key).unwrap();
-        let OpType::TcpConnect { ref mut needs_socket,
-                                 ref mut got_socket,
+        let op = io_ops.remove(key).unwrap();
+        let OpType::TcpConnect { needs_socket,
+                                 got_socket,
                                  fd,
                                  .. } = op.op_type
         else {
@@ -1390,22 +1365,16 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
 
         // if our connect() op is borrowing an FD from the runtime,
         // we need to close it and return it
-        if *needs_socket {
+        if needs_socket {
             // this means our socket() call completed with a success
-            if *got_socket {
+            if got_socket {
                 let sqe = get_sqe(ex);
 
                 let fd = fd.try_into().unwrap();
-                let key =
-                    ex.p
-                      .io_ops
-                      .borrow_mut()
-                      .insert(make_io_uring_op(ptr::null_mut(), OpType::DropClose { fd }), ex);
 
                 unsafe { io_uring_prep_close_direct(sqe, fd) };
-                unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
-            } else {
-                ex.reclaim_fd(fd.try_into().unwrap());
+                unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
             }
         }
 
@@ -1448,17 +1417,9 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
 
                 let sqe = get_sqe(ex);
 
-                let key = ex.p
-                            .io_ops
-                            .borrow_mut()
-                            .insert(make_io_uring_op(ptr::null_mut(),
-                                                     OpType::DropClose { fd: reclaimed_fd }),
-                                    ex);
-
                 unsafe { io_uring_prep_close_direct(sqe, reclaimed_fd) };
-                unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
-            } else {
-                ex.reclaim_fd(reclaimed_fd);
+                unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
             }
         }
 
@@ -1468,6 +1429,7 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
     // we expect one more CQE after this, the result of the actual
     // connect() call
     if *needs_socket && !*got_socket {
+        *fd = cqe.res;
         *got_socket = true;
 
         let (_af, addrlen) = {
@@ -1721,23 +1683,6 @@ fn on_drop_cancel(ex: &Executor, cqe: &mut io_uring_cqe)
     unsafe { release_op(op.ref_count) };
 }
 
-fn on_drop_close(ex: &Executor, cqe: &mut io_uring_cqe)
-{
-    let mut borrow_guard = ex.p.io_ops.borrow_mut();
-    let io_ops = &mut *borrow_guard;
-
-    let key_data = cqe.user_data;
-    let key = DefaultKey::from(KeyData::from_ffi(key_data));
-
-    let op = io_ops.remove(key).unwrap();
-    let OpType::DropClose { fd } = op.op_type else {
-        unreachable!()
-    };
-
-    drop(borrow_guard);
-    ex.reclaim_fd(fd);
-}
-
 unsafe fn append_recv_buffers(buf_group: *mut BufGroup, cqe: &mut io_uring_cqe,
                               bufs: &mut BorrowedBufs)
 {
@@ -1908,23 +1853,11 @@ impl Executor
         &raw mut *self.p.ioring.borrow_mut()
     }
 
-    fn get_available_fd(&self) -> Option<u32>
-    {
-        let fds = &mut *self.p.available_fds.borrow_mut();
-        fds.pop_front()
-    }
-
-    fn reclaim_fd(&self, fd: u32)
-    {
-        let fds = &mut *self.p.available_fds.borrow_mut();
-        fds.push_back(fd);
-    }
-
     #[must_use]
     pub fn get_params(&self) -> IoContextParams
     {
         let ring_params = &*self.p.params.borrow();
-        let nr_files = self.p.available_fds.borrow().len() as u32;
+        let nr_files = 0;
         IoContextParams { sq_entries: ring_params.sq_entries,
                           cq_entries: ring_params.cq_entries,
                           nr_files }
