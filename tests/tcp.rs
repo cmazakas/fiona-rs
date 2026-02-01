@@ -270,7 +270,7 @@ fn test_downcast_destruction()
 }
 
 #[test]
-fn test_accept_select_ready_always()
+fn tcp_accept_select_ready_always()
 {
     // Test what happens when an accept would complete immediately succesfully
     // but the future isn't explicitly handled. This test is useful for handling the
@@ -319,19 +319,17 @@ fn test_accept_select_ready_always()
 
                   // Test the case where an accept() op completes, we see the CQE and the Future +
                   // task are still in scope so we still schedule resumption, but we never
-                  // actually poll() the AcceptFuture to completion.
+                  // actually poll() the AcceptFuture to completion. Because we're using multishot
+                  // accept, our op is running in the background so we have no need to explicitly
+                  // poll().
                   let client3 = fiona::tcp::Client::new(ex.clone());
                   client3.connect_ipv4(Ipv4Addr::LOCALHOST, port)
                          .await
                          .unwrap();
 
-                  let mut accept_future = acceptor.accept();
-                  assert!(futures::poll!(&mut accept_future).is_pending());
-
                   // must time-slice here
                   timer.wait(Duration::from_millis(100)).await.unwrap();
 
-                  drop(accept_future);
                   unsafe { NUM_RUNS += 1 };
               });
 

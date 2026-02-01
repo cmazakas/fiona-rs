@@ -73,7 +73,7 @@ pub mod time;
 use slotmap::{DefaultKey, KeyData};
 use tcp::StreamImpl;
 
-use crate::io_ops::IoOpsMap;
+use crate::{io_ops::IoOpsMap, tcp::Stream};
 
 pub type Result<T> = std::result::Result<T, nix::Error>;
 
@@ -781,7 +781,10 @@ enum OpType
         ts: __kernel_timespec,
         stream: *mut StreamImpl,
     },
-    TcpAccept,
+    MultishotTcpAccept
+    {
+        streams: VecDeque<Stream>,
+    },
     TcpConnect
     {
         addr: SockaddrStorage,
@@ -1250,10 +1253,10 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler
         OpType::Timeout { .. } => on_timeout,
         OpType::TimeoutCancel => todo!(),
         OpType::MultishotTimeout { .. } => on_timeout_multishot,
-        OpType::TcpAccept => on_tcp_accept,
+        OpType::MultishotTcpAccept { .. } => on_multishot_tcp_accept,
         OpType::TcpConnect { .. } => on_tcp_connect,
         OpType::TcpSend { .. } => on_tcp_send,
-        OpType::MultishotTcpRecv { .. } => on_tcp_multishot_recv,
+        OpType::MultishotTcpRecv { .. } => on_multishot_tcp_recv,
         OpType::TcpShutdown | OpType::TcpClose | OpType::TcpCancel => on_tcp_close,
         OpType::DropCancel => on_drop_cancel,
     }
@@ -1285,8 +1288,13 @@ fn on_timeout(ex: &Executor, cqe: &mut io_uring_cqe)
     }
 }
 
-fn on_tcp_accept(ex: &Executor, cqe: &mut io_uring_cqe)
+fn on_multishot_tcp_accept(ex: &Executor, cqe: &mut io_uring_cqe)
 {
+    let mut stream = None;
+    if cqe.res >= 0 {
+        stream = Some(Stream::new(ex.clone(), cqe.res));
+    }
+
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
 
@@ -1295,29 +1303,38 @@ fn on_tcp_accept(ex: &Executor, cqe: &mut io_uring_cqe)
 
     let op = io_ops.get_mut(key).unwrap();
 
-    let res = cqe.res;
-    op.res = res;
-    op.done = true;
+    let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
+    let OpType::MultishotTcpAccept { ref mut streams } = op.op_type else {
+        unreachable!()
+    };
+
+    op.res = cqe.res;
+    if let Some(stream) = stream {
+        streams.push_back(stream);
+    }
 
     if op.eager_dropped {
+        if has_more_cqes {
+            return;
+        }
+
+        op.done = true;
+
         let op = io_ops.remove(key).unwrap();
+        assert!(op.done);
+
         drop(borrow_guard);
 
-        unsafe { release_op(op.ref_count) };
-
-        if op.res >= 0 {
-            let fd = op.res as _;
-
-            let sqe = get_sqe(ex);
-            unsafe { io_uring_prep_close_direct(sqe, fd) };
-            unsafe { io_uring_sqe_set_data64(sqe, 0) };
-            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-        }
+        let rc = op.ref_count;
+        unsafe { release_op(rc) };
 
         return;
     }
 
-    unsafe { release_op(op.ref_count) };
+    if !has_more_cqes {
+        op.done = true;
+        unsafe { release_op(op.ref_count) };
+    }
 
     if let Some(local_waker) = op.local_waker.take() {
         local_waker.wake();
@@ -1548,7 +1565,7 @@ fn on_tcp_close(ex: &Executor, cqe: &mut io_uring_cqe)
     }
 }
 
-fn on_tcp_multishot_recv(ex: &Executor, cqe: &mut io_uring_cqe)
+fn on_multishot_tcp_recv(ex: &Executor, cqe: &mut io_uring_cqe)
 {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
