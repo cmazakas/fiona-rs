@@ -10,6 +10,7 @@ mod utils;
 use std::{
     hint::black_box,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -49,31 +50,13 @@ fn make_bytes() -> Vec<u8>
     bytes
 }
 
-struct ByteGen
-{
-    rng: rand::rngs::StdRng,
-}
-
-impl ByteGen
-{
-    fn new() -> Self
-    {
-        Self { rng: rand::rngs::StdRng::seed_from_u64(SEED) }
-    }
-
-    fn write(&mut self, bytes: &mut [u8])
-    {
-        rand::RngCore::fill_bytes(&mut self.rng, bytes);
-    }
-}
-
-async fn tokio_send(generator: &mut ByteGen, stream: &mut TcpStream)
+async fn tokio_send(stream: &mut TcpStream, bytes: Arc<Vec<u8>>)
 {
     let mut total_sent = 0;
     let mut send_buf = vec![0_u8; SEND_BUF_SIZE];
 
     while total_sent < BUF_SIZE {
-        generator.write(send_buf.as_mut_slice());
+        send_buf.copy_from_slice(&bytes[total_sent..total_sent + SEND_BUF_SIZE]);
 
         let mut n = 0;
         while n < SEND_BUF_SIZE {
@@ -108,26 +91,29 @@ async fn tokio_close(stream: &mut TcpStream)
     stream.shutdown().await.unwrap();
 }
 
-fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
+fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, bytes: Vec<u8>)
+                     -> Result<(), String>
 {
     static mut TIMINGS: Vec<Duration> = Vec::new();
+
+    let bytes = Arc::new(bytes);
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all()
                                                           .build()
                                                           .unwrap();
 
-    rt.block_on(async {
+    rt.block_on(async move {
           unsafe { DURATION = Duration::new(0, 0) };
 
           let start = Instant::now();
           let mut join_set = tokio::task::JoinSet::new();
 
           for _ in 0..nr_files {
+              let bytes = bytes.clone();
               join_set.spawn(async move {
                           let start = Instant::now();
 
                           let mut h = blake2::Blake2b512::new();
-                          let mut generator = ByteGen::new();
 
                           let socket = tokio::net::TcpSocket::new_v4().unwrap();
                           let mut client = socket.connect(SocketAddr::new(IpAddr::V4(ipv4_addr),
@@ -135,7 +121,7 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                                                  .await
                                                  .unwrap();
 
-                          tokio_send(&mut generator, &mut client).await;
+                          tokio_send(&mut client, bytes).await;
                           tokio_recv(&mut h, &mut client).await;
 
                           let digest = h.finalize();
@@ -171,13 +157,16 @@ fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     Ok(())
 }
 
-fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
+fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, bytes: Vec<u8>)
+                     -> Result<(), String>
 {
+    let bytes = Arc::new(bytes);
+
     let rt = tokio::runtime::Builder::new_current_thread().enable_all()
                                                           .build()
                                                           .unwrap();
 
-    rt.block_on(async {
+    rt.block_on(async move {
           unsafe { DURATION = Duration::new(0, 0) };
           let start = Instant::now();
 
@@ -192,18 +181,17 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 
           for _ in 0..nr_files {
               let mut stream = listener.accept().await.unwrap().0;
-
+              let bytes = bytes.clone();
               join_set.spawn(async move {
                           let start = Instant::now();
 
                           let mut h = blake2::Blake2b512::new();
-                          let mut generator = ByteGen::new();
 
                           tokio_recv(&mut h, &mut stream).await;
                           let digest = h.finalize();
                           assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
-                          tokio_send(&mut generator, &mut stream).await;
+                          tokio_send(&mut stream, bytes).await;
 
                           tokio_close(&mut stream).await;
                           drop(stream);
@@ -221,13 +209,13 @@ fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     Ok(())
 }
 
-async fn fiona_send(generator: &mut ByteGen, stream: fiona::tcp::Stream)
+async fn fiona_send(stream: fiona::tcp::Stream, bytes: Arc<Vec<u8>>)
 {
     let mut total_sent = 0;
     let mut send_buf = vec![0_u8; SEND_BUF_SIZE];
 
     while total_sent < BUF_SIZE {
-        generator.write(send_buf.as_mut_slice());
+        send_buf.copy_from_slice(&bytes[total_sent..total_sent + SEND_BUF_SIZE]);
 
         let mut n = 0;
         while n < SEND_BUF_SIZE {
@@ -282,11 +270,12 @@ fn make_io_context(nr_files: u32) -> fiona::IoContext
     fiona::IoContext::with_params(params)
 }
 
-fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
+fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, bytes: Vec<u8>)
+                     -> Result<(), String>
 {
     static mut TIMINGS: Vec<Duration> = Vec::new();
 
-    let start = Instant::now();
+    let bytes = Arc::new(bytes);
 
     let mut ioc = make_io_context(nr_files);
     let ex = ioc.get_executor();
@@ -296,14 +285,16 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     ex.register_buf_group(CLIENT_BGID, NUM_BUFS, RECV_BUF_SIZE)
       .unwrap();
 
+    let start = Instant::now();
+
     unsafe { DURATION = Duration::new(0, 0) };
     for _ in 0..nr_files {
         let ex2 = ex.clone();
+        let bytes = bytes.clone();
         ex.clone().spawn(async move {
                       let start = Instant::now();
 
                       let mut h = blake2::Blake2b512::new();
-                      let mut generator = ByteGen::new();
 
                       let client = fiona::tcp::Client::new(ex2);
                       client.set_buf_group(CLIENT_BGID);
@@ -312,7 +303,7 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 
                       let stream = client.as_stream();
 
-                      fiona_send(&mut generator, stream.clone()).await;
+                      fiona_send(stream.clone(), bytes.clone()).await;
                       fiona_recv(&mut h, stream.clone()).await;
 
                       let digest = h.finalize();
@@ -322,7 +313,7 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
                       drop(stream);
                       drop(client);
 
-                      unsafe { DURATION += start.elapsed() };
+                      unsafe { DURATION = DURATION.checked_add(start.elapsed()).unwrap() };
                       unsafe {
                           TIMINGS.push(start.elapsed());
                       }
@@ -348,7 +339,8 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     Ok(())
 }
 
-fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
+fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, bytes: Vec<u8>)
+                     -> Result<(), String>
 {
     let start = Instant::now();
 
@@ -362,32 +354,38 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)
       .unwrap();
 
+    let bytes = Arc::new(bytes);
+
     unsafe { DURATION = Duration::new(0, 0) };
-    ex.clone().spawn(async move {
-                  for _ in 0..nr_files {
-                      let stream = acceptor.accept().await.unwrap();
-                      ex.clone().spawn(async move {
-                                    let start = Instant::now();
 
-                                    let mut h = blake2::Blake2b512::new();
-                                    let mut generator = ByteGen::new();
+    ex //
+      .clone()
+      .spawn(async move {
+          for _ in 0..nr_files {
+              let stream = acceptor.accept().await.unwrap();
+              let bytes = bytes.clone();
 
-                                    stream.set_timeout(Duration::from_secs(120));
-                                    stream.set_buf_group(SERVER_BGID);
+              ex.clone().spawn(async move {
+                            let start = Instant::now();
 
-                                    fiona_recv(&mut h, stream.clone()).await;
-                                    let digest = h.finalize();
-                                    assert_eq!(digest.as_slice(), EXPECTED_HASH);
+                            let mut h = blake2::Blake2b512::new();
 
-                                    fiona_send(&mut generator, stream.clone()).await;
+                            stream.set_timeout(Duration::from_secs(120));
+                            stream.set_buf_group(SERVER_BGID);
 
-                                    fiona_close(stream.clone()).await;
-                                    drop(stream);
+                            fiona_recv(&mut h, stream.clone()).await;
+                            let digest = h.finalize();
+                            assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
-                                    unsafe { DURATION += start.elapsed() };
-                                });
-                  }
-              });
+                            fiona_send(stream.clone(), bytes).await;
+
+                            fiona_close(stream.clone()).await;
+                            drop(stream);
+
+                            unsafe { DURATION += start.elapsed() };
+                        });
+          }
+      });
 
     let _n = ioc.run();
 
@@ -435,36 +433,34 @@ fn main()
     let args = CliArgs::parse();
     // println!("{args:?}");
 
-    {
-        let bytes = make_bytes();
+    let bytes = make_bytes();
 
-        let mut h = blake2::Blake2b512::new();
-        h.update(&bytes);
-        let digest = h.finalize();
+    let mut h = blake2::Blake2b512::new();
+    h.update(&bytes);
+    let digest = h.finalize();
 
-        assert_eq!(digest.as_slice(), EXPECTED_HASH);
-    }
+    assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
     if args.tokio {
         if args.server {
             utils::run_once("tokio echo2 server", || {
-                black_box(tokio_echo_server(args.ipv4_addr, args.port, args.nr_files))
+                black_box(tokio_echo_server(args.ipv4_addr, args.port, args.nr_files, bytes))
             }).unwrap();
         } else {
             assert!(args.client);
             utils::run_once("tokio echo2 client", || {
-                black_box(tokio_echo_client(args.ipv4_addr, args.port, args.nr_files))
+                black_box(tokio_echo_client(args.ipv4_addr, args.port, args.nr_files, bytes))
             }).unwrap();
         }
     } else if args.fiona {
         if args.server {
-            utils::run_once("fiona echo2 server", || {
-                black_box(fiona_echo_server(args.ipv4_addr, args.port, args.nr_files))
+            utils::run_once("fiona echo2 server", move || {
+                black_box(fiona_echo_server(args.ipv4_addr, args.port, args.nr_files, bytes))
             }).unwrap();
         } else {
             assert!(args.client);
             utils::run_once("fiona echo2 client", || {
-                black_box(fiona_echo_client(args.ipv4_addr, args.port, args.nr_files))
+                black_box(fiona_echo_client(args.ipv4_addr, args.port, args.nr_files, bytes))
             }).unwrap();
         }
     }
