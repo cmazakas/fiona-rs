@@ -232,6 +232,7 @@ fn await_value() {
 #[test]
 fn await_forgotten() {
     async fn make_vec() -> Vec<i32> {
+        yield_now(()).await;
         vec![1, 2, 3, 4]
     }
 
@@ -254,10 +255,15 @@ fn await_forgotten() {
             });
     }
     assert_eq!(ioc.run(), 2);
-    unsafe {
-        drop(Box::from_raw(P_FUTURE));
-    }
     assert_eq!(*c.borrow(), 4321);
+
+    let f = unsafe { Box::from_raw(P_FUTURE) };
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut f = Pin::new(f);
+    let Poll::Ready(vec) = f.as_mut().poll(&mut cx) else {
+        panic!()
+    };
+    assert_eq!(vec, vec![1, 2, 3, 4]);
 }
 
 #[test]
@@ -288,9 +294,7 @@ fn await_forgotten_recursive() {
     async fn f(ex: fiona::Executor, c2: Rc<RefCell<i32>>) {
         let h = ex.spawn(make_vec());
         *c2.borrow_mut() = 4321;
-        unsafe {
-            P_FUTURE = Box::into_raw(Box::new(h));
-        }
+        unsafe { P_FUTURE = Box::into_raw(Box::new(h)) };
 
         ex.spawn(async {});
     }
@@ -406,12 +410,13 @@ fn await_non_send() {
 #[test]
 fn await_future_relocated() {
     async fn task() -> i32 {
+        yield_now(()).await;
         1234
     }
 
     async fn child(f: fiona::SpawnFuture<i32>) {
-        let x = f.await;
         yield_now(()).await;
+        let x = f.await;
         assert_eq!(x, 1234);
     }
 
@@ -574,18 +579,20 @@ fn await_manually_polled() {
     async fn f1(ex: fiona::Executor) {
         let w = WakerFuture.await;
 
-        // test the case where we manually poll a sibling task, attaching ourselves as
-        // the continuation our task then immediately finishes
+        // Test the case where we manually poll a sibling task, attaching ourselves as
+        // the continuation our task then immediately finishes.
         //
-        let f = std::pin::pin!(ex.spawn(f2()));
+        let f = std::pin::pin!(ex.spawn(f2(w.clone())));
 
         let mut cx = std::task::Context::from_waker(&w);
         let r = f.poll(&mut cx);
         assert!(r.is_pending());
     }
 
-    async fn f2() -> Box<i32> {
-        yield_now(Box::new(1234)).await
+    async fn f2(waker: Waker) -> Box<i32> {
+        let p = yield_now(Box::new(1234)).await;
+        waker.wake_by_ref();
+        p
     }
 
     async fn f3() {
@@ -606,8 +613,8 @@ fn await_manually_polled() {
 
 #[test]
 fn await_manually_polled_early_drop() {
-    // want to attempt to test the property that the main task we're waiting on goes
-    // out of scope when an external thread completes and tries to use the Waker
+    // Want to attempt to test the property that the main task we're waiting on goes
+    // out of scope when an external thread completes and tries to use the Waker.
 
     static mut NUM_RUNS: u64 = 0;
 
@@ -635,8 +642,8 @@ fn await_manually_polled_early_drop() {
 
 #[test]
 fn await_manual_timeslice() {
-    // want to test that a user can appropriately use our Waker to time-slice
-    // long-standing operations, letting other things in the run queue process
+    // Want to test that a user can appropriately use our Waker to time-slice
+    // long-standing operations, letting other things in the run queue process.
 
     static mut NUM_RUNS: u64 = 0;
 
