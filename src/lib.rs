@@ -1714,15 +1714,15 @@ impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F> {
 
 //-----------------------------------------------------------------------------
 
-pub struct SpawnFuture<T> {
+pub struct JoinHandle<T> {
     done: bool,
     task: Option<Task>,
     _marker: PhantomData<T>,
 }
 
-impl<T: Unpin> Unpin for SpawnFuture<T> {}
+impl<T: Unpin> Unpin for JoinHandle<T> {}
 
-impl<T> Future for SpawnFuture<T> {
+impl<T> Future for JoinHandle<T> {
     type Output = T;
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         assert!(!self.done);
@@ -1895,7 +1895,7 @@ impl Executor {
         }
     }
 
-    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T> {
+    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> JoinHandle<T> {
         let task = self.spawn_impl_helper(f);
 
         let header = task.task_header();
@@ -1913,7 +1913,7 @@ impl Executor {
             .borrow_mut()
             .push_back(Task::downgrade(&task));
 
-        SpawnFuture::<T> {
+        JoinHandle::<T> {
             task: Some(task),
             done: false,
             _marker: PhantomData,

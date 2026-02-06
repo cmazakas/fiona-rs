@@ -295,7 +295,7 @@ fn timer_futures_unordered() {
             let f4 = ex.spawn(wait_for(ex.clone(), Duration::from_millis(200), 2));
 
             let futures = [f1, f2, f3, f4];
-            let mut unordered: futures::stream::FuturesUnordered<fiona::SpawnFuture<i32>> =
+            let mut unordered: futures::stream::FuturesUnordered<fiona::JoinHandle<i32>> =
                 futures.into_iter().collect();
 
             assert!(!unordered.is_empty());

@@ -626,7 +626,7 @@ fn tcp_connection_stress_test_no_cq_overflow() {
 
         async fn run_conns(ex: fiona::Executor, port: u16) {
             for _ in 0..(TOTAL_CONNS / NR_FILES) {
-                let mut tasks: FuturesUnordered<fiona::SpawnFuture<u32>> = (0..NR_FILES)
+                let mut tasks: FuturesUnordered<fiona::JoinHandle<u32>> = (0..NR_FILES)
                     .map(|idx| ex.clone().spawn(client_task(ex.clone(), port, idx)))
                     .collect();
 
@@ -768,7 +768,7 @@ fn tcp_connection_stress_test_cq_overflow() {
 
         async fn run_conns(ex: fiona::Executor, port: u16) {
             for _ in 0..(TOTAL_CONNS / NR_FILES) {
-                let mut tasks: FuturesUnordered<fiona::SpawnFuture<u32>> = (0..NR_FILES)
+                let mut tasks: FuturesUnordered<fiona::JoinHandle<u32>> = (0..NR_FILES)
                     .map(|idx| ex.clone().spawn(client_task(ex.clone(), port, idx)))
                     .collect();
 

@@ -239,7 +239,7 @@ fn await_forgotten() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    static mut P_FUTURE: *mut fiona::SpawnFuture<Vec<i32>> = std::ptr::null_mut();
+    static mut P_FUTURE: *mut fiona::JoinHandle<Vec<i32>> = std::ptr::null_mut();
 
     let c = Rc::new(RefCell::new(0));
     {
@@ -268,7 +268,7 @@ fn await_forgotten() {
 
 #[test]
 fn await_forgotten_recursive() {
-    static mut P_FUTURE: *mut fiona::SpawnFuture<Vec<i32>> = std::ptr::null_mut();
+    static mut P_FUTURE: *mut fiona::JoinHandle<Vec<i32>> = std::ptr::null_mut();
 
     async fn make_vec() -> Vec<i32> {
         assert!(unsafe { !P_FUTURE.is_null() });
@@ -323,7 +323,7 @@ fn await_sequential() {
     }
 
     async fn sequential(ex: fiona::Executor) {
-        let mut futures = Vec::<fiona::SpawnFuture<i32>>::new();
+        let mut futures = Vec::<fiona::JoinHandle<i32>>::new();
         for i in 0..10 {
             futures.push(ex.spawn(identity(i + 1)));
         }
@@ -351,7 +351,7 @@ fn await_sequential_rev() {
     }
 
     async fn sequential(ex: fiona::Executor) {
-        let mut futures = Vec::<fiona::SpawnFuture<i32>>::new();
+        let mut futures = Vec::<fiona::JoinHandle<i32>>::new();
         for i in 0..10 {
             futures.push(ex.spawn(identity(i + 1)));
         }
@@ -414,7 +414,7 @@ fn await_future_relocated() {
         1234
     }
 
-    async fn child(f: fiona::SpawnFuture<i32>) {
+    async fn child(f: fiona::JoinHandle<i32>) {
         yield_now(()).await;
         let x = f.await;
         assert_eq!(x, 1234);
@@ -507,7 +507,7 @@ fn await_stress_test() {
 #[test]
 fn await_cycle() {
     struct RecursiveFuture {
-        this: Rc<RefCell<Option<fiona::SpawnFuture<()>>>>,
+        this: Rc<RefCell<Option<fiona::JoinHandle<()>>>>,
         recursions: i32,
         done: bool,
     }
@@ -716,12 +716,12 @@ fn await_futures_ordered() {
     }
 
     async fn sequential(ex: fiona::Executor) {
-        let mut futures = Vec::<fiona::SpawnFuture<i32>>::new();
+        let mut futures = Vec::<fiona::JoinHandle<i32>>::new();
         for i in 0..10 {
             futures.push(ex.spawn(identity(i + 1)));
         }
 
-        let mut ordered: futures::stream::FuturesOrdered<fiona::SpawnFuture<i32>> =
+        let mut ordered: futures::stream::FuturesOrdered<fiona::JoinHandle<i32>> =
             futures.into_iter().collect();
 
         let mut i = 1;
@@ -748,7 +748,7 @@ fn await_futures_unordered() {
         let f4 = ex.spawn(wait_for(Duration::from_millis(200), 2));
 
         let futures = [f1, f2, f3, f4];
-        let mut unordered: futures::stream::FuturesUnordered<fiona::SpawnFuture<i32>> =
+        let mut unordered: futures::stream::FuturesUnordered<fiona::JoinHandle<i32>> =
             futures.into_iter().collect();
 
         let mut i = 1;
