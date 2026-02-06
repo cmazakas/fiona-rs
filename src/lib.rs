@@ -2,22 +2,26 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-#![feature(ptr_metadata,
-           box_as_ptr,
-           local_waker,
-           sync_unsafe_cell,
-           range_bounds_is_empty)]
+#![feature(
+    ptr_metadata,
+    box_as_ptr,
+    local_waker,
+    sync_unsafe_cell,
+    range_bounds_is_empty
+)]
 #![warn(clippy::pedantic)]
-#![allow(clippy::mutable_key_type,
-         clippy::missing_panics_doc,
-         clippy::missing_errors_doc,
-         clippy::cast_ptr_alignment,
-         clippy::too_many_lines,
-         clippy::similar_names,
-         clippy::cast_possible_wrap,
-         clippy::cast_sign_loss,
-         clippy::cast_possible_truncation,
-         clippy::struct_excessive_bools)]
+#![allow(
+    clippy::mutable_key_type,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::cast_ptr_alignment,
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::struct_excessive_bools
+)]
 
 extern crate liburing_rs;
 extern crate nix;
@@ -82,11 +86,9 @@ pub type Result<T> = std::result::Result<T, nix::Error>;
 #[repr(C, align(64))]
 struct AlignedAtomicU64(AtomicU64);
 
-impl Deref for AlignedAtomicU64
-{
+impl Deref for AlignedAtomicU64 {
     type Target = AtomicU64;
-    fn deref(&self) -> &Self::Target
-    {
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
@@ -94,12 +96,10 @@ impl Deref for AlignedAtomicU64
 #[repr(C, align(64))]
 struct AlignedAtomicBool(AtomicBool);
 
-impl Deref for AlignedAtomicBool
-{
+impl Deref for AlignedAtomicBool {
     type Target = AtomicBool;
 
-    fn deref(&self) -> &Self::Target
-    {
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
@@ -115,63 +115,51 @@ struct DanglingTask(SyncUnsafeCell<*mut TaskHeader>);
 unsafe impl Send for DanglingTask {}
 unsafe impl Sync for DanglingTask {}
 
-impl DanglingTask
-{
-    fn new(task_header: &TaskHeader) -> Self
-    {
+impl DanglingTask {
+    fn new(task_header: &TaskHeader) -> Self {
         Self(SyncUnsafeCell::new(ptr::from_ref(task_header).cast_mut()))
     }
 
-    unsafe fn unsafe_clone(&self) -> DanglingTask
-    {
+    unsafe fn unsafe_clone(&self) -> DanglingTask {
         unsafe { DanglingTask(SyncUnsafeCell::new(*self.0.get())) }
     }
 
-    unsafe fn task_header<'a>(&self) -> &'a TaskHeader
-    {
+    unsafe fn task_header<'a>(&self) -> &'a TaskHeader {
         unsafe { &**self.0.get() }
     }
 
-    unsafe fn is_null(&self) -> bool
-    {
+    unsafe fn is_null(&self) -> bool {
         unsafe { (*self.0.get()).is_null() }
     }
 
-    unsafe fn get_inner(&self) -> *mut TaskHeader
-    {
+    unsafe fn get_inner(&self) -> *mut TaskHeader {
         unsafe { *self.0.get() }
     }
 
-    unsafe fn set_inner(&self, t: &DanglingTask)
-    {
+    unsafe fn set_inner(&self, t: &DanglingTask) {
         unsafe { *self.0.get() = *t.0.get() };
     }
 
-    unsafe fn set_next(&self, t: &DanglingTask)
-    {
+    unsafe fn set_next(&self, t: &DanglingTask) {
         unsafe { self.task_header().next.set_inner(t) };
     }
 
-    unsafe fn set_prev(&self, t: &DanglingTask)
-    {
+    unsafe fn set_prev(&self, t: &DanglingTask) {
         unsafe { self.task_header().prev.set_inner(t) };
     }
 
-    unsafe fn get_next(&self) -> DanglingTask
-    {
+    unsafe fn get_next(&self) -> DanglingTask {
         unsafe { self.task_header().next.unsafe_clone() }
     }
 
-    unsafe fn _get_prev(&self) -> DanglingTask
-    {
+    unsafe fn _get_prev(&self) -> DanglingTask {
         unsafe { self.task_header().prev.unsafe_clone() }
     }
 }
 
 //-----------------------------------------------------------------------------
 
-struct TaskHeader
-{
+struct TaskHeader {
     strong: SyncUnsafeCell<u64>,
     weak: AlignedAtomicU64,
     task_layout: Layout,
@@ -190,8 +178,7 @@ struct TaskHeader
 
 //-----------------------------------------------------------------------------
 
-struct Task
-{
+struct Task {
     p: NonNull<u8>,
     phantom: PhantomData<dyn Future<Output = ()> + 'static>,
 }
@@ -199,24 +186,20 @@ struct Task
 trait Erased {}
 impl<T> Erased for T {}
 
-impl Task
-{
-    fn task_header(&self) -> &TaskHeader
-    {
+impl Task {
+    fn task_header(&self) -> &TaskHeader {
         unsafe { &*self.p.as_ptr().cast::<TaskHeader>() }
     }
 
     // unsafe because of potential aliasing violations as Task implements Clone with
     // Rc-like semantics
-    unsafe fn poll(&mut self, cx: &mut Context) -> Poll<()>
-    {
+    unsafe fn poll(&mut self, cx: &mut Context) -> Poll<()> {
         let offset = self.task_header().future_offset;
         let p = unsafe {
-            std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(self.p
-                                                                                  .as_ptr()
-                                                                                  .add(offset),
-                                                                              self.task_header()
-                                                                                  .future_vtable)
+            std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(
+                self.p.as_ptr().add(offset),
+                self.task_header().future_vtable,
+            )
         };
 
         let future = unsafe { Pin::new_unchecked(&mut *p) };
@@ -224,31 +207,30 @@ impl Task
     }
 
     #[must_use]
-    fn downgrade(this: &Task) -> Weak
-    {
+    fn downgrade(this: &Task) -> Weak {
         this.task_header().weak.fetch_add(1, Relaxed);
-        Weak { p: this.p,
-               phantom: PhantomData }
+        Weak {
+            p: this.p,
+            phantom: PhantomData,
+        }
     }
 
-    fn into_raw(this: Self) -> *mut TaskHeader
-    {
+    fn into_raw(this: Self) -> *mut TaskHeader {
         let p = this.p.as_ptr();
         forget(this);
         p.cast::<TaskHeader>()
     }
 
-    unsafe fn from_raw(p: *mut TaskHeader) -> Task
-    {
-        Task { p: NonNull::new(p.cast()).unwrap(),
-               phantom: PhantomData }
+    unsafe fn from_raw(p: *mut TaskHeader) -> Task {
+        Task {
+            p: NonNull::new(p.cast()).unwrap(),
+            phantom: PhantomData,
+        }
     }
 }
 
-impl Drop for Task
-{
-    fn drop(&mut self)
-    {
+impl Drop for Task {
+    fn drop(&mut self) {
         unsafe { (*self.task_header().strong.get()) -= 1 };
         if unsafe { *self.task_header().strong.get() > 0 } {
             return;
@@ -256,10 +238,10 @@ impl Drop for Task
 
         let future_offset = self.task_header().future_offset;
         let future = unsafe { self.p.add(future_offset).as_ptr() };
-        let future =
-            std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(future,
-                                                                              self.task_header()
-                                                                                  .future_vtable);
+        let future = std::ptr::from_raw_parts_mut::<dyn Future<Output = ()> + 'static>(
+            future,
+            self.task_header().future_vtable,
+        );
         let value = unsafe { self.p.add(self.task_header().value_offset).as_ptr() };
         let value =
             std::ptr::from_raw_parts_mut::<dyn Erased>(value, self.task_header().value_vtable);
@@ -281,80 +263,72 @@ impl Drop for Task
     }
 }
 
-impl Clone for Task
-{
-    fn clone(&self) -> Task
-    {
+impl Clone for Task {
+    fn clone(&self) -> Task {
         unsafe { *self.task_header().strong.get() += 1 };
-        Self { p: self.p,
-               phantom: PhantomData }
+        Self {
+            p: self.p,
+            phantom: PhantomData,
+        }
     }
 }
 
-impl PartialEq for Task
-{
-    fn eq(&self, other: &Self) -> bool
-    {
+impl PartialEq for Task {
+    fn eq(&self, other: &Self) -> bool {
         std::ptr::addr_eq(self.p.as_ptr(), other.p.as_ptr())
     }
 }
 
 impl Eq for Task {}
 
-impl Hash for Task
-{
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H)
-    {
+impl Hash for Task {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.p.hash(state);
     }
 }
 
 //-----------------------------------------------------------------------------
 
-struct Weak
-{
+struct Weak {
     p: NonNull<u8>,
     phantom: PhantomData<dyn Future<Output = ()> + 'static>,
 }
 
-impl Weak
-{
-    fn into_raw(self) -> *const ()
-    {
+impl Weak {
+    fn into_raw(self) -> *const () {
         let p = self.p.as_ptr().cast();
         std::mem::forget(self);
         p
     }
 
-    unsafe fn from_raw(p: *const ()) -> Weak
-    {
-        Weak { p: NonNull::new(p.cast_mut().cast::<u8>()).unwrap(),
-               phantom: PhantomData }
+    unsafe fn from_raw(p: *const ()) -> Weak {
+        Weak {
+            p: NonNull::new(p.cast_mut().cast::<u8>()).unwrap(),
+            phantom: PhantomData,
+        }
     }
 
-    fn task_header(&self) -> &TaskHeader
-    {
+    fn task_header(&self) -> &TaskHeader {
         unsafe { &*self.p.as_ptr().cast::<TaskHeader>() }
     }
 
     // cannot be safely upgraded across thread boundaries
     // must only be upgraded on the main thread running the ring
-    unsafe fn upgrade(&self) -> Option<Task>
-    {
+    unsafe fn upgrade(&self) -> Option<Task> {
         let c = unsafe { *self.task_header().strong.get() };
         if c == 0 {
             return None;
         }
         unsafe { *self.task_header().strong.get() += 1 };
-        Some(Task { p: self.p,
-                    phantom: PhantomData })
+        Some(Task {
+            p: self.p,
+            phantom: PhantomData,
+        })
     }
 }
 
-impl Drop for Weak
-{
-    fn drop(&mut self)
-    {
+impl Drop for Weak {
+    fn drop(&mut self) {
         let weak_count = self.task_header().weak.fetch_sub(1, Release);
         if weak_count > 1 {
             return;
@@ -366,13 +340,13 @@ impl Drop for Weak
     }
 }
 
-impl Clone for Weak
-{
-    fn clone(&self) -> Self
-    {
+impl Clone for Weak {
+    fn clone(&self) -> Self {
         self.task_header().weak.fetch_add(1, Relaxed);
-        Self { p: self.p,
-               phantom: PhantomData }
+        Self {
+            p: self.p,
+            phantom: PhantomData,
+        }
     }
 }
 
@@ -381,16 +355,14 @@ unsafe impl Send for Weak {}
 
 //-----------------------------------------------------------------------------
 
-unsafe fn task_waker_clone(p: *const ()) -> RawWaker
-{
+unsafe fn task_waker_clone(p: *const ()) -> RawWaker {
     let weak = unsafe { Weak::from_raw(p) };
     std::mem::forget(weak.clone());
     std::mem::forget(weak);
     RawWaker::new(p, &TASK_WAKER_VTABLE)
 }
 
-unsafe fn task_wake(p: *const ())
-{
+unsafe fn task_wake(p: *const ()) {
     let weak = unsafe { Weak::from_raw(p) };
 
     let Some(sender) = weak.task_header().sender.as_ref() else {
@@ -409,8 +381,7 @@ unsafe fn task_wake(p: *const ())
     }
 }
 
-unsafe fn task_wake_by_ref(p: *const ())
-{
+unsafe fn task_wake_by_ref(p: *const ()) {
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
 
     let Some(sender) = weak.task_header().sender.as_ref() else {
@@ -429,8 +400,7 @@ unsafe fn task_wake_by_ref(p: *const ())
     }
 }
 
-unsafe fn task_drop(p: *const ())
-{
+unsafe fn task_drop(p: *const ()) {
     let weak = unsafe { Weak::from_raw(p) };
     drop(weak);
 }
@@ -438,24 +408,21 @@ unsafe fn task_drop(p: *const ())
 static TASK_WAKER_VTABLE: RawWakerVTable =
     RawWakerVTable::new(task_waker_clone, task_wake, task_wake_by_ref, task_drop);
 
-fn make_waker(weak: Weak) -> Waker
-{
+fn make_waker(weak: Weak) -> Waker {
     let raw_waker = RawWaker::new(weak.into_raw(), &TASK_WAKER_VTABLE);
     unsafe { Waker::from_raw(raw_waker) }
 }
 
 //-----------------------------------------------------------------------------
 
-unsafe fn task_local_waker_clone(p: *const ()) -> RawWaker
-{
+unsafe fn task_local_waker_clone(p: *const ()) -> RawWaker {
     let weak = unsafe { Weak::from_raw(p) };
     std::mem::forget(weak.clone());
     std::mem::forget(weak);
     RawWaker::new(p, &TASK_LOCAL_WAKER_VTABLE)
 }
 
-unsafe fn task_local_wake(p: *const ())
-{
+unsafe fn task_local_wake(p: *const ()) {
     let weak = unsafe { Weak::from_raw(p) };
     if let Some(_task) = unsafe { weak.upgrade() } {
         let ex = unsafe { &*weak.task_header().ex.0 };
@@ -463,8 +430,7 @@ unsafe fn task_local_wake(p: *const ())
     }
 }
 
-unsafe fn task_local_wake_by_ref(p: *const ())
-{
+unsafe fn task_local_wake_by_ref(p: *const ()) {
     let weak = ManuallyDrop::new(unsafe { Weak::from_raw(p) });
     if let Some(_task) = unsafe { weak.upgrade() } {
         let ex = unsafe { &*weak.task_header().ex.0 };
@@ -472,19 +438,19 @@ unsafe fn task_local_wake_by_ref(p: *const ())
     }
 }
 
-unsafe fn task_local_drop(p: *const ())
-{
+unsafe fn task_local_drop(p: *const ()) {
     let weak = unsafe { Weak::from_raw(p) };
     drop(weak);
 }
 
-static TASK_LOCAL_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(task_local_waker_clone,
-                                                                     task_local_wake,
-                                                                     task_local_wake_by_ref,
-                                                                     task_local_drop);
+static TASK_LOCAL_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    task_local_waker_clone,
+    task_local_wake,
+    task_local_wake_by_ref,
+    task_local_drop,
+);
 
-fn make_local_waker(weak: Weak) -> LocalWaker
-{
+fn make_local_waker(weak: Weak) -> LocalWaker {
     let raw_waker = RawWaker::new(weak.into_raw(), &TASK_LOCAL_WAKER_VTABLE);
     unsafe { LocalWaker::from_raw(raw_waker) }
 }
@@ -492,15 +458,13 @@ fn make_local_waker(weak: Weak) -> LocalWaker
 //-----------------------------------------------------------------------------
 
 #[derive(Copy, Clone)]
-struct BufHeader
-{
+struct BufHeader {
     next: isize,
     prev: isize,
     len: usize,
 }
 
-struct BufGroup
-{
+struct BufGroup {
     br: *mut io_uring_buf_ring,
     num_bufs: u32,
     buf_len: usize,
@@ -512,16 +476,13 @@ struct BufGroup
     tail: u32,
 }
 
-impl BufGroup
-{
-    fn buf_as_ptr(&mut self, bid: u16) -> *mut u8
-    {
+impl BufGroup {
+    fn buf_as_ptr(&mut self, bid: u16) -> *mut u8 {
         assert!(u32::from(bid) < self.num_bufs);
         unsafe { self.bufs.as_mut_ptr().add(self.buf_len * usize::from(bid)) }
     }
 
-    unsafe fn release(&mut self)
-    {
+    unsafe fn release(&mut self) {
         let ring = self.ring;
         let bgid = self.bgid.into();
 
@@ -532,47 +493,41 @@ impl BufGroup
 
 //-----------------------------------------------------------------------------
 
-pub struct BorrowedBufs
-{
+pub struct BorrowedBufs {
     buf_group: *mut BufGroup,
     head: isize,
     tail: isize,
     ex: Executor,
 }
 
-pub struct BorrowedBufsIterator<'a>
-{
+pub struct BorrowedBufsIterator<'a> {
     bufs: &'a BorrowedBufs,
     buf_id: isize,
 }
 
-impl BorrowedBufs
-{
-    fn new(ex: Executor, buf_group: *mut BufGroup) -> BorrowedBufs
-    {
-        BorrowedBufs { buf_group,
-                       ex,
-                       head: -1,
-                       tail: -1 }
+impl BorrowedBufs {
+    fn new(ex: Executor, buf_group: *mut BufGroup) -> BorrowedBufs {
+        BorrowedBufs {
+            buf_group,
+            ex,
+            head: -1,
+            tail: -1,
+        }
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool
-    {
+    pub fn is_empty(&self) -> bool {
         self.head == -1
     }
 
     #[must_use]
-    pub fn iter(&self) -> BorrowedBufsIterator<'_>
-    {
+    pub fn iter(&self) -> BorrowedBufsIterator<'_> {
         self.into_iter()
     }
 }
 
-impl Drop for BorrowedBufs
-{
-    fn drop(&mut self)
-    {
+impl Drop for BorrowedBufs {
+    fn drop(&mut self) {
         let buf_group = unsafe { &mut *self.buf_group };
         let br = buf_group.br;
         let mask = io_uring_buf_ring_mask(buf_group.num_bufs);
@@ -605,10 +560,8 @@ impl Drop for BorrowedBufs
     }
 }
 
-impl Debug for BorrowedBufs
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
-    {
+impl Debug for BorrowedBufs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let iter = self.iter();
         for buf in iter {
             write!(f, "{buf:?}").unwrap();
@@ -617,25 +570,23 @@ impl Debug for BorrowedBufs
     }
 }
 
-impl<'a> IntoIterator for &'a BorrowedBufs
-{
+impl<'a> IntoIterator for &'a BorrowedBufs {
     type Item = &'a [u8];
 
     type IntoIter = BorrowedBufsIterator<'a>;
 
-    fn into_iter(self) -> Self::IntoIter
-    {
-        BorrowedBufsIterator { bufs: self,
-                               buf_id: self.head }
+    fn into_iter(self) -> Self::IntoIter {
+        BorrowedBufsIterator {
+            bufs: self,
+            buf_id: self.head,
+        }
     }
 }
 
-impl<'a> Iterator for BorrowedBufsIterator<'a>
-{
+impl<'a> Iterator for BorrowedBufsIterator<'a> {
     type Item = &'a [u8];
 
-    fn next(&mut self) -> Option<Self::Item>
-    {
+    fn next(&mut self) -> Option<Self::Item> {
         if self.buf_id < 0 {
             return None;
         }
@@ -653,46 +604,39 @@ impl<'a> Iterator for BorrowedBufsIterator<'a>
 
 //-----------------------------------------------------------------------------
 
-mod io_ops
-{
+mod io_ops {
     use slotmap::{DefaultKey, SlotMap};
 
     use crate::{Executor, IoUringOp, submit_ring};
 
-    pub struct IoOpsMap
-    {
+    pub struct IoOpsMap {
         slots: SlotMap<DefaultKey, IoUringOp>,
     }
 
-    impl IoOpsMap
-    {
-        pub fn with_capacity(capacity: usize) -> IoOpsMap
-        {
-            IoOpsMap { slots: SlotMap::with_capacity(capacity) }
+    impl IoOpsMap {
+        pub fn with_capacity(capacity: usize) -> IoOpsMap {
+            IoOpsMap {
+                slots: SlotMap::with_capacity(capacity),
+            }
         }
 
-        pub fn len(&self) -> usize
-        {
+        pub fn len(&self) -> usize {
             self.slots.len()
         }
 
-        pub fn get(&self, key: DefaultKey) -> Option<&IoUringOp>
-        {
+        pub fn get(&self, key: DefaultKey) -> Option<&IoUringOp> {
             self.slots.get(key)
         }
 
-        pub fn get_mut(&mut self, key: DefaultKey) -> Option<&mut IoUringOp>
-        {
+        pub fn get_mut(&mut self, key: DefaultKey) -> Option<&mut IoUringOp> {
             self.slots.get_mut(key)
         }
 
-        pub fn remove(&mut self, key: DefaultKey) -> Option<IoUringOp>
-        {
+        pub fn remove(&mut self, key: DefaultKey) -> Option<IoUringOp> {
             self.slots.remove(key)
         }
 
-        pub fn insert(&mut self, value: IoUringOp, ex: &Executor) -> DefaultKey
-        {
+        pub fn insert(&mut self, value: IoUringOp, ex: &Executor) -> DefaultKey {
             if self.slots.len() == self.slots.capacity() {
                 unsafe { submit_ring(ex.ring()) };
             }
@@ -703,8 +647,7 @@ mod io_ops
 
 //-----------------------------------------------------------------------------
 
-struct IoContextFrame
-{
+struct IoContextFrame {
     ioring: RefCell<io_uring>,
     params: RefCell<io_uring_params>,
     receiver: RefCell<Receiver<Weak>>,
@@ -721,33 +664,28 @@ struct IoContextFrame
 //-----------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct RefCount
-{
+struct RefCount {
     obj_count: usize,
     op_count: usize,
     release_impl: unsafe fn(p: *mut u8),
     obj: *mut u8,
 }
 
-unsafe fn add_obj_ref(rc: *mut RefCount)
-{
+unsafe fn add_obj_ref(rc: *mut RefCount) {
     unsafe { (*rc).obj_count += 1 };
 }
 
-unsafe fn add_op_ref(rc: *mut RefCount)
-{
+unsafe fn add_op_ref(rc: *mut RefCount) {
     unsafe { (*rc).op_count += 1 };
 }
 
-unsafe fn release_impl<T>(p: *mut u8)
-{
+unsafe fn release_impl<T>(p: *mut u8) {
     let layout = std::alloc::Layout::new::<T>();
     unsafe { std::ptr::drop_in_place(p.cast::<T>()) };
     unsafe { std::alloc::dealloc(p, layout) };
 }
 
-unsafe fn release_obj(rc: *mut RefCount)
-{
+unsafe fn release_obj(rc: *mut RefCount) {
     unsafe { (*rc).obj_count -= 1 };
     if unsafe { (*rc).obj_count == 0 && (*rc).op_count == 0 } {
         let fp = unsafe { (*rc).release_impl };
@@ -756,8 +694,7 @@ unsafe fn release_obj(rc: *mut RefCount)
     }
 }
 
-unsafe fn release_op(rc: *mut RefCount)
-{
+unsafe fn release_op(rc: *mut RefCount) {
     unsafe { (*rc).op_count -= 1 };
     if unsafe { (*rc).obj_count == 0 && (*rc).op_count == 0 } {
         let fp = unsafe { (*rc).release_impl };
@@ -768,25 +705,20 @@ unsafe fn release_op(rc: *mut RefCount)
 
 //-----------------------------------------------------------------------------
 
-enum OpType
-{
-    Timeout
-    {
+enum OpType {
+    Timeout {
         dur: __kernel_timespec,
     },
     #[allow(dead_code)]
     TimeoutCancel,
-    MultishotTimeout
-    {
+    MultishotTimeout {
         ts: __kernel_timespec,
         stream: *mut StreamImpl,
     },
-    MultishotTcpAccept
-    {
+    MultishotTcpAccept {
         streams: VecDeque<Stream>,
     },
-    TcpConnect
-    {
+    TcpConnect {
         addr: SockaddrStorage,
         _port: u16,
         ts: __kernel_timespec,
@@ -794,15 +726,13 @@ enum OpType
         got_socket: bool,
         fd: i32,
     },
-    TcpSend
-    {
+    TcpSend {
         num_sent: usize,
         subspan: Range<usize>,
         buf: Vec<u8>,
         last_send: *mut Instant,
     },
-    MultishotTcpRecv
-    {
+    MultishotTcpRecv {
         bufs: BorrowedBufs,
         buf_group: *mut BufGroup,
         last_recv: *mut Instant,
@@ -815,8 +745,7 @@ enum OpType
 
 type CqeHandler = fn(ex: &Executor, cqe: &mut io_uring_cqe);
 
-struct IoUringOp
-{
+struct IoUringOp {
     ref_count: *mut RefCount,
     initiated: bool,
     done: bool,
@@ -826,61 +755,56 @@ struct IoUringOp
     local_waker: Option<LocalWaker>,
 }
 
-fn make_io_uring_op(ref_count: *mut RefCount, op_type: OpType) -> IoUringOp
-{
-    IoUringOp { ref_count,
-                initiated: false,
-                done: false,
-                eager_dropped: false,
-                res: -1,
-                local_waker: None,
-                op_type }
+fn make_io_uring_op(ref_count: *mut RefCount, op_type: OpType) -> IoUringOp {
+    IoUringOp {
+        ref_count,
+        initiated: false,
+        done: false,
+        eager_dropped: false,
+        res: -1,
+        local_waker: None,
+        op_type,
+    }
 }
 
 //-----------------------------------------------------------------------------
 
-pub struct IoContext
-{
+pub struct IoContext {
     p: Rc<IoContextFrame>,
 }
 
 //-----------------------------------------------------------------------------
 
-pub struct IoContextParams
-{
+pub struct IoContextParams {
     pub sq_entries: u32,
     pub cq_entries: u32,
     pub nr_files: u32,
 }
 
-impl IoContextParams
-{
+impl IoContextParams {
     #[must_use]
-    pub fn new() -> Self
-    {
-        Self { sq_entries: 256,
-               cq_entries: 1024,
-               nr_files: 1024 }
+    pub fn new() -> Self {
+        Self {
+            sq_entries: 256,
+            cq_entries: 1024,
+            nr_files: 1024,
+        }
     }
 }
 
-impl Default for IoContextParams
-{
-    fn default() -> Self
-    {
+impl Default for IoContextParams {
+    fn default() -> Self {
         Self::new()
     }
 }
 
 //-----------------------------------------------------------------------------
 
-unsafe fn submit_ring(ring: *mut io_uring)
-{
+unsafe fn submit_ring(ring: *mut io_uring) {
     let _r = unsafe { io_uring_submit_and_get_events(ring) };
 }
 
-fn get_sqe(ex: &Executor) -> *mut io_uring_sqe
-{
+fn get_sqe(ex: &Executor) -> *mut io_uring_sqe {
     let ring = ex.ring();
     let mut sqe = unsafe { io_uring_get_sqe(ring) };
     while sqe.is_null() {
@@ -890,8 +814,7 @@ fn get_sqe(ex: &Executor) -> *mut io_uring_sqe
     sqe
 }
 
-unsafe fn reserve_sqes(ex: &Executor, n: u32)
-{
+unsafe fn reserve_sqes(ex: &Executor, n: u32) {
     let ring = ex.ring();
     let r = unsafe { io_uring_sq_space_left(ring) };
     if r < n {
@@ -901,56 +824,45 @@ unsafe fn reserve_sqes(ex: &Executor, n: u32)
 
 //-----------------------------------------------------------------------------
 
-struct RunGuard
-{
+struct RunGuard {
     p: Rc<IoContextFrame>,
 }
 
-struct CQESeenGuard<'a>
-{
+struct CQESeenGuard<'a> {
     ring: *mut io_uring,
     cqe: &'a mut io_uring_cqe,
 }
 
-impl Drop for CQESeenGuard<'_>
-{
-    fn drop(&mut self)
-    {
+impl Drop for CQESeenGuard<'_> {
+    fn drop(&mut self) {
         unsafe { io_uring_cqe_seen(self.ring, self.cqe) };
     }
 }
 
-struct CQEAdvanceGuard
-{
+struct CQEAdvanceGuard {
     ring: *mut io_uring,
     n: usize,
 }
 
-impl Drop for CQEAdvanceGuard
-{
-    fn drop(&mut self)
-    {
+impl Drop for CQEAdvanceGuard {
+    fn drop(&mut self) {
         if self.n > 0 {
             unsafe { io_uring_cq_advance(self.ring, self.n.try_into().unwrap()) };
         }
     }
 }
 
-struct IncrGuard<'a>
-{
+struct IncrGuard<'a> {
     n: &'a mut usize,
 }
 
-impl Drop for IncrGuard<'_>
-{
-    fn drop(&mut self)
-    {
+impl Drop for IncrGuard<'_> {
+    fn drop(&mut self) {
         *self.n += 1;
     }
 }
 
-unsafe fn clear_task_list(p: &Rc<IoContextFrame>)
-{
+unsafe fn clear_task_list(p: &Rc<IoContextFrame>) {
     let mut curr = unsafe { p.head.unsafe_clone() };
     while unsafe { !curr.is_null() } {
         let next = unsafe { curr.get_next() };
@@ -960,18 +872,16 @@ unsafe fn clear_task_list(p: &Rc<IoContextFrame>)
 
     unsafe {
         p.head
-         .set_inner(&DanglingTask(SyncUnsafeCell::new(ptr::null_mut())));
+            .set_inner(&DanglingTask(SyncUnsafeCell::new(ptr::null_mut())));
 
         p.tail
-         .set_inner(&DanglingTask(SyncUnsafeCell::new(ptr::null_mut())));
+            .set_inner(&DanglingTask(SyncUnsafeCell::new(ptr::null_mut())));
     }
 }
 
-impl Drop for RunGuard
-{
+impl Drop for RunGuard {
     #![allow(clippy::redundant_closure_call)]
-    fn drop(&mut self)
-    {
+    fn drop(&mut self) {
         {
             let local_tasks = &mut *self.p.local_task_queue.borrow_mut();
             local_tasks.clear();
@@ -1018,30 +928,31 @@ impl Drop for RunGuard
     }
 }
 
-impl IoContext
-{
+impl IoContext {
     #[must_use]
-    pub fn new() -> Self
-    {
+    pub fn new() -> Self {
         let sq_entries = 256;
         let cq_entries = 4 * 1024;
         let nr_files = 1024; // matches the default for Linux processes
 
-        let params = IoContextParams { sq_entries,
-                                       cq_entries,
-                                       nr_files };
+        let params = IoContextParams {
+            sq_entries,
+            cq_entries,
+            nr_files,
+        };
 
         Self::with_params(&params)
     }
 
     #[must_use]
-    pub fn with_params(params: &IoContextParams) -> Self
-    {
+    pub fn with_params(params: &IoContextParams) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let IoContextParams { sq_entries,
-                              cq_entries,
-                              nr_files, } = *params;
+        let IoContextParams {
+            sq_entries,
+            cq_entries,
+            nr_files,
+        } = *params;
 
         let mut params = unsafe { std::mem::zeroed::<io_uring_params>() };
         params.sq_entries = sq_entries;
@@ -1052,18 +963,19 @@ impl IoContext
 
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 
-        let ioc_frame = IoContextFrame { params: RefCell::new(params),
-                                         receiver: RefCell::new(rx),
-                                         sender: RefCell::new(tx),
-                                         ioring: RefCell::new(ioring),
-                                         buf_groups: RefCell::new(HashMap::new()),
-                                         runguard_blacklist: RefCell::new(HashSet::new()),
-                                         local_task_queue: RefCell::new(VecDeque::new()),
-                                         io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
-                                         needs_wake:
-                                             Arc::new(AlignedAtomicBool(AtomicBool::new(true))),
-                                         head: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
-                                         tail: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())) };
+        let ioc_frame = IoContextFrame {
+            params: RefCell::new(params),
+            receiver: RefCell::new(rx),
+            sender: RefCell::new(tx),
+            ioring: RefCell::new(ioring),
+            buf_groups: RefCell::new(HashMap::new()),
+            runguard_blacklist: RefCell::new(HashSet::new()),
+            local_task_queue: RefCell::new(VecDeque::new()),
+            io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
+            needs_wake: Arc::new(AlignedAtomicBool(AtomicBool::new(true))),
+            head: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
+            tail: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
+        };
 
         let p = Rc::new(ioc_frame);
 
@@ -1085,18 +997,15 @@ impl IoContext
     }
 
     #[must_use]
-    pub fn get_executor(&self) -> Executor
-    {
+    pub fn get_executor(&self) -> Executor {
         Executor { p: self.p.clone() }
     }
 
-    fn ring(&self) -> *mut io_uring
-    {
+    fn ring(&self) -> *mut io_uring {
         &raw mut *self.p.ioring.borrow_mut()
     }
 
-    fn process_task_queues(&mut self, num_completed: &mut u64) -> bool
-    {
+    fn process_task_queues(&mut self, num_completed: &mut u64) -> bool {
         loop {
             let next = unsafe { self.p.head.get_next().get_inner() };
             let tail = unsafe { self.p.tail.get_inner() };
@@ -1104,8 +1013,10 @@ impl IoContext
                 return true;
             }
 
-            let (local_task, task) = (self.p.local_task_queue.borrow_mut().pop_front(),
-                                      self.p.receiver.borrow_mut().try_recv());
+            let (local_task, task) = (
+                self.p.local_task_queue.borrow_mut().pop_front(),
+                self.p.receiver.borrow_mut().try_recv(),
+            );
 
             match (local_task, task) {
                 (Some(weak1), Ok(weak2)) => {
@@ -1125,11 +1036,9 @@ impl IoContext
         }
     }
 
-    fn init_task_list(&self)
-    {
+    fn init_task_list(&self) {
         #[allow(clippy::unused_async)]
-        async fn empty()
-        {
+        async fn empty() {
             unreachable!()
         }
 
@@ -1155,8 +1064,7 @@ impl IoContext
         unsafe { tail.set_prev(head) };
     }
 
-    pub fn run(&mut self) -> u64
-    {
+    pub fn run(&mut self) -> u64 {
         let _guard = RunGuard { p: self.p.clone() };
 
         let mut num_completed = 0;
@@ -1190,8 +1098,7 @@ impl IoContext
     }
 }
 
-unsafe fn on_cqe(ex: &Executor, cqe: *mut io_uring_cqe, guard: &mut CQEAdvanceGuard)
-{
+unsafe fn on_cqe(ex: &Executor, cqe: *mut io_uring_cqe, guard: &mut CQEAdvanceGuard) {
     let _g = IncrGuard { n: &mut guard.n };
 
     let cqe = unsafe { &mut *cqe };
@@ -1213,8 +1120,7 @@ unsafe fn on_cqe(ex: &Executor, cqe: *mut io_uring_cqe, guard: &mut CQEAdvanceGu
     (cqe_handler)(ex, cqe);
 }
 
-fn on_work_item(weak: Weak) -> u64
-{
+fn on_work_item(weak: Weak) -> u64 {
     match unsafe { weak.upgrade() } {
         None => 0,
         Some(mut task) => {
@@ -1247,8 +1153,7 @@ fn on_work_item(weak: Weak) -> u64
     }
 }
 
-fn get_cqe_handler(op: &IoUringOp) -> CqeHandler
-{
+fn get_cqe_handler(op: &IoUringOp) -> CqeHandler {
     match &op.op_type {
         OpType::Timeout { .. } => on_timeout,
         OpType::TimeoutCancel => todo!(),
@@ -1262,8 +1167,7 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler
     }
 }
 
-fn on_timeout(ex: &Executor, cqe: &mut io_uring_cqe)
-{
+fn on_timeout(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
 
@@ -1288,8 +1192,7 @@ fn on_timeout(ex: &Executor, cqe: &mut io_uring_cqe)
     }
 }
 
-fn on_multishot_tcp_accept(ex: &Executor, cqe: &mut io_uring_cqe)
-{
+fn on_multishot_tcp_accept(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut stream = None;
     if cqe.res >= 0 {
         stream = Some(Stream::new(ex.clone(), cqe.res));
@@ -1341,8 +1244,7 @@ fn on_multishot_tcp_accept(ex: &Executor, cqe: &mut io_uring_cqe)
     }
 }
 
-fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
-{
+fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
 
@@ -1356,10 +1258,12 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
         // * we need to release the borrowed direct descriptor back to the pool
         // * if the connect() succeeded, we need to close() it
 
-        let OpType::TcpConnect { ref mut needs_socket,
-                                 ref mut got_socket,
-                                 ref mut fd,
-                                 .. } = op.op_type
+        let OpType::TcpConnect {
+            ref mut needs_socket,
+            ref mut got_socket,
+            ref mut fd,
+            ..
+        } = op.op_type
         else {
             unreachable!()
         };
@@ -1370,10 +1274,12 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
         }
 
         let op = io_ops.remove(key).unwrap();
-        let OpType::TcpConnect { needs_socket,
-                                 got_socket,
-                                 fd,
-                                 .. } = op.op_type
+        let OpType::TcpConnect {
+            needs_socket,
+            got_socket,
+            fd,
+            ..
+        } = op.op_type
         else {
             unreachable!()
         };
@@ -1399,12 +1305,14 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
         return;
     }
 
-    let OpType::TcpConnect { ref mut needs_socket,
-                             ref mut got_socket,
-                             ref mut fd,
-                             ref addr,
-                             ref mut ts,
-                             .. } = op.op_type
+    let OpType::TcpConnect {
+        ref mut needs_socket,
+        ref mut got_socket,
+        ref mut fd,
+        ref addr,
+        ref mut ts,
+        ..
+    } = op.op_type
     else {
         unreachable!()
     };
@@ -1463,10 +1371,12 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
 
         let sqe = get_sqe(ex);
         unsafe {
-            io_uring_prep_connect(sqe,
-                                  *fd,
-                                  std::ptr::from_ref(addr).cast(),
-                                  addrlen.try_into().unwrap());
+            io_uring_prep_connect(
+                sqe,
+                *fd,
+                std::ptr::from_ref(addr).cast(),
+                addrlen.try_into().unwrap(),
+            );
         }
 
         let user_data = key_data;
@@ -1480,8 +1390,7 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe)
     }
 }
 
-fn on_tcp_send(ex: &Executor, cqe: &mut io_uring_cqe)
-{
+fn on_tcp_send(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
 
@@ -1503,9 +1412,11 @@ fn on_tcp_send(ex: &Executor, cqe: &mut io_uring_cqe)
         return;
     }
 
-    let OpType::TcpSend { ref mut num_sent,
-                          last_send,
-                          .. } = op.op_type
+    let OpType::TcpSend {
+        ref mut num_sent,
+        last_send,
+        ..
+    } = op.op_type
     else {
         unreachable!()
     };
@@ -1536,8 +1447,7 @@ fn on_tcp_send(ex: &Executor, cqe: &mut io_uring_cqe)
     }
 }
 
-fn on_tcp_close(ex: &Executor, cqe: &mut io_uring_cqe)
-{
+fn on_tcp_close(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
 
@@ -1565,8 +1475,7 @@ fn on_tcp_close(ex: &Executor, cqe: &mut io_uring_cqe)
     }
 }
 
-fn on_multishot_tcp_recv(ex: &Executor, cqe: &mut io_uring_cqe)
-{
+fn on_multishot_tcp_recv(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
 
@@ -1576,9 +1485,11 @@ fn on_multishot_tcp_recv(ex: &Executor, cqe: &mut io_uring_cqe)
     let op = io_ops.get_mut(key).unwrap();
 
     let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
-    let OpType::MultishotTcpRecv { ref mut bufs,
-                                   buf_group,
-                                   last_recv, } = op.op_type
+    let OpType::MultishotTcpRecv {
+        ref mut bufs,
+        buf_group,
+        last_recv,
+    } = op.op_type
     else {
         unreachable!()
     };
@@ -1621,8 +1532,7 @@ fn on_multishot_tcp_recv(ex: &Executor, cqe: &mut io_uring_cqe)
     }
 }
 
-fn on_timeout_multishot(ex: &Executor, cqe: &mut io_uring_cqe)
-{
+fn on_timeout_multishot(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
 
@@ -1687,8 +1597,7 @@ fn on_timeout_multishot(ex: &Executor, cqe: &mut io_uring_cqe)
     }
 }
 
-fn on_drop_cancel(ex: &Executor, cqe: &mut io_uring_cqe)
-{
+fn on_drop_cancel(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
 
@@ -1700,9 +1609,9 @@ fn on_drop_cancel(ex: &Executor, cqe: &mut io_uring_cqe)
     unsafe { release_op(op.ref_count) };
 }
 
-unsafe fn append_recv_buffers(buf_group: *mut BufGroup, cqe: &mut io_uring_cqe,
-                              bufs: &mut BorrowedBufs)
-{
+unsafe fn append_recv_buffers(
+    buf_group: *mut BufGroup, cqe: &mut io_uring_cqe, bufs: &mut BorrowedBufs,
+) {
     let buf_group = unsafe { &mut *buf_group };
     let buf_len = buf_group.buf_len;
     let num_bufs = buf_group.num_bufs;
@@ -1743,10 +1652,8 @@ unsafe fn append_recv_buffers(buf_group: *mut BufGroup, cqe: &mut io_uring_cqe,
     }
 }
 
-impl Drop for IoContext
-{
-    fn drop(&mut self)
-    {
+impl Drop for IoContext {
+    fn drop(&mut self) {
         drop(RunGuard { p: self.p.clone() });
 
         let buf_groups = &mut *self.p.buf_groups.borrow_mut();
@@ -1764,36 +1671,30 @@ impl Drop for IoContext
     }
 }
 
-impl Default for IoContext
-{
-    fn default() -> Self
-    {
+impl Default for IoContext {
+    fn default() -> Self {
         Self::new()
     }
 }
 
 //-----------------------------------------------------------------------------
 
-struct SpawnValue<T>
-{
+struct SpawnValue<T> {
     t: Option<T>,
     waker: Option<LocalWaker>,
 }
 
 //-----------------------------------------------------------------------------
 
-struct WrapperFuture<T, F: Future<Output = T>>
-{
+struct WrapperFuture<T, F: Future<Output = T>> {
     f: F,
     value: *mut SpawnValue<T>,
 }
 
-impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F>
-{
+impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F> {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
         let r = unsafe { Pin::new_unchecked(&mut this.f).poll(cx) };
@@ -1813,8 +1714,7 @@ impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F>
 
 //-----------------------------------------------------------------------------
 
-pub struct SpawnFuture<T>
-{
+pub struct SpawnFuture<T> {
     done: bool,
     task: Option<Task>,
     _marker: PhantomData<T>,
@@ -1822,22 +1722,21 @@ pub struct SpawnFuture<T>
 
 impl<T: Unpin> Unpin for SpawnFuture<T> {}
 
-impl<T> Future for SpawnFuture<T>
-{
+impl<T> Future for SpawnFuture<T> {
     type Output = T;
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         assert!(!self.done);
         let this = unsafe { self.get_unchecked_mut() };
         let offset = this.task.as_ref().unwrap().task_header().value_offset;
         let spawn_value = unsafe {
-            &mut *this.task
-                      .as_ref()
-                      .unwrap()
-                      .p
-                      .add(offset)
-                      .cast::<SpawnValue<T>>()
-                      .as_ptr()
+            &mut *this
+                .task
+                .as_ref()
+                .unwrap()
+                .p
+                .add(offset)
+                .cast::<SpawnValue<T>>()
+                .as_ptr()
         };
 
         let result = spawn_value.t.take();
@@ -1858,30 +1757,27 @@ impl<T> Future for SpawnFuture<T>
 //-----------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct Executor
-{
+pub struct Executor {
     p: Rc<IoContextFrame>,
 }
 
-impl Executor
-{
-    fn ring(&self) -> *mut io_uring
-    {
+impl Executor {
+    fn ring(&self) -> *mut io_uring {
         &raw mut *self.p.ioring.borrow_mut()
     }
 
     #[must_use]
-    pub fn get_params(&self) -> IoContextParams
-    {
+    pub fn get_params(&self) -> IoContextParams {
         let ring_params = &*self.p.params.borrow();
         let nr_files = 0;
-        IoContextParams { sq_entries: ring_params.sq_entries,
-                          cq_entries: ring_params.cq_entries,
-                          nr_files }
+        IoContextParams {
+            sq_entries: ring_params.sq_entries,
+            cq_entries: ring_params.cq_entries,
+            nr_files,
+        }
     }
 
-    pub fn register_buf_group(&self, bgid: u16, num_bufs: u32, buf_len: usize) -> Result<()>
-    {
+    pub fn register_buf_group(&self, bgid: u16, num_bufs: u32, buf_len: usize) -> Result<()> {
         let mut ret = 0_i32;
 
         let ring = self.ring();
@@ -1897,9 +1793,11 @@ impl Executor
         let mut bufs = vec![0; buf_len * num_bufs as usize];
         let mut bid_map = Vec::with_capacity(num_bufs as usize);
         let buf_headers = vec![
-            BufHeader { next: -1,
-                        prev: -1,
-                        len: 0 };
+            BufHeader {
+                next: -1,
+                prev: -1,
+                len: 0
+            };
             num_bufs as usize
         ];
 
@@ -1907,12 +1805,14 @@ impl Executor
         for bid in 0..num_bufs {
             let addr = unsafe { bufs.as_mut_ptr().add(buf_len * bid as usize) };
             unsafe {
-                io_uring_buf_ring_add(buf_ring,
-                                      addr.cast(),
-                                      buf_len as _,
-                                      bid as _,
-                                      mask,
-                                      bid as _);
+                io_uring_buf_ring_add(
+                    buf_ring,
+                    addr.cast(),
+                    buf_len as _,
+                    bid as _,
+                    mask,
+                    bid as _,
+                );
             }
 
             bid_map.push(bid as u16);
@@ -1920,15 +1820,17 @@ impl Executor
 
         unsafe { io_uring_buf_ring_advance(buf_ring, num_bufs.try_into().unwrap()) };
 
-        let bg = BufGroup { br: buf_ring,
-                            num_bufs,
-                            buf_len,
-                            bgid,
-                            bufs,
-                            buf_headers,
-                            ring,
-                            tail: 0,
-                            bid_map };
+        let bg = BufGroup {
+            br: buf_ring,
+            num_bufs,
+            buf_len,
+            bgid,
+            bufs,
+            buf_headers,
+            ring,
+            tail: 0,
+            bid_map,
+        };
 
         self.p
             .buf_groups
@@ -1938,55 +1840,62 @@ impl Executor
         Ok(())
     }
 
-    fn spawn_impl_helper<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> Task
-    {
+    fn spawn_impl_helper<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> Task {
         let sender = self.p.sender.borrow().clone();
 
         let future_vtable =
             metadata::<dyn Future<Output = ()>>(std::ptr::null::<WrapperFuture<T, F>>());
         let value_vtable = metadata::<dyn Erased>(std::ptr::null::<SpawnValue<T>>());
 
-        let (layout, value_offset) = Layout::new::<TaskHeader>().extend(value_vtable.layout())
-                                                                .unwrap();
+        let (layout, value_offset) = Layout::new::<TaskHeader>()
+            .extend(value_vtable.layout())
+            .unwrap();
         let (layout, future_offset) = layout.extend(future_vtable.layout()).unwrap();
         let layout = layout.pad_to_align();
 
         let ring_fd = self.p.ioring.borrow().ring_fd;
 
-        let task_header = TaskHeader { strong: SyncUnsafeCell::new(1),
-                                       weak: AlignedAtomicU64(AtomicU64::new(1)),
-                                       value_offset,
-                                       future_offset,
-                                       future_vtable,
-                                       value_vtable,
-                                       sender: Some(sender),
-                                       ring_fd,
-                                       ex: DanglingExecutor(Rc::into_raw(self.clone().p)),
-                                       task_layout: layout,
-                                       needs_wake: self.p.needs_wake.clone(),
-                                       done: SyncUnsafeCell::new(false),
-                                       next: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
-                                       prev: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())) };
+        let task_header = TaskHeader {
+            strong: SyncUnsafeCell::new(1),
+            weak: AlignedAtomicU64(AtomicU64::new(1)),
+            value_offset,
+            future_offset,
+            future_vtable,
+            value_vtable,
+            sender: Some(sender),
+            ring_fd,
+            ex: DanglingExecutor(Rc::into_raw(self.clone().p)),
+            task_layout: layout,
+            needs_wake: self.p.needs_wake.clone(),
+            done: SyncUnsafeCell::new(false),
+            next: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
+            prev: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
+        };
 
         let p = unsafe { std::alloc::alloc(layout) };
         assert!(!p.is_null());
 
-        let wrapped = WrapperFuture { f,
-                                      value: unsafe { p.add(value_offset).cast() } };
+        let wrapped = WrapperFuture {
+            f,
+            value: unsafe { p.add(value_offset).cast() },
+        };
 
-        let value = SpawnValue::<T> { t: None,
-                                      waker: None };
+        let value = SpawnValue::<T> {
+            t: None,
+            waker: None,
+        };
 
         unsafe { std::ptr::write(p.cast::<TaskHeader>(), task_header) };
         unsafe { std::ptr::write(p.add(value_offset).cast::<SpawnValue<T>>(), value) };
         unsafe { std::ptr::write(p.add(future_offset).cast::<WrapperFuture<T, F>>(), wrapped) };
 
-        Task { p: NonNull::new(p).unwrap(),
-               phantom: PhantomData }
+        Task {
+            p: NonNull::new(p).unwrap(),
+            phantom: PhantomData,
+        }
     }
 
-    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T>
-    {
+    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> SpawnFuture<T> {
         let task = self.spawn_impl_helper(f);
 
         let header = task.task_header();
@@ -2004,17 +1913,18 @@ impl Executor
             .borrow_mut()
             .push_back(Task::downgrade(&task));
 
-        SpawnFuture::<T> { task: Some(task),
-                           done: false,
-                           _marker: PhantomData }
+        SpawnFuture::<T> {
+            task: Some(task),
+            done: false,
+            _marker: PhantomData,
+        }
     }
 }
 
 //-----------------------------------------------------------------------------
 
 #[cfg(test)]
-mod test
-{
+mod test {
     use std::mem::zeroed;
 
     use nix::libc::{ECANCELED, ETIME};
@@ -2031,15 +1941,13 @@ mod test
     fn sync_only<T: Sync>() {}
 
     #[test]
-    fn is_task_header_send()
-    {
+    fn is_task_header_send() {
         send_only::<TaskHeader>();
         sync_only::<TaskHeader>();
     }
 
     #[test]
-    fn timeout_inline_submit_cancel()
-    {
+    fn timeout_inline_submit_cancel() {
         // want to prove that timeouts and their removals are
         // processed inline with ring submission.
         // io_uring processes the SQ from left-to-right and if
@@ -2048,15 +1956,12 @@ mod test
         // this is supposed to replicate a user abusing our Timer future's
         // usage of cancel-on-drop and also proves that a user can generate
         // any number of CQEs associated with our usea, and we must
-        struct DropGuard
-        {
+        struct DropGuard {
             ring: *mut io_uring,
         }
 
-        impl Drop for DropGuard
-        {
-            fn drop(&mut self)
-            {
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
                 unsafe { io_uring_queue_exit(self.ring) };
             }
         }
@@ -2070,8 +1975,10 @@ mod test
 
             let _guard = DropGuard { ring };
 
-            let mut ts = __kernel_timespec { tv_sec: 1,
-                                             tv_nsec: 0 };
+            let mut ts = __kernel_timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            };
 
             {
                 let sqe = io_uring_get_sqe(ring);

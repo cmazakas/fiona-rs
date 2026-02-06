@@ -3,7 +3,8 @@ use std::{net::Ipv4Addr, time::Duration};
 use nix::errno::Errno;
 
 fn bufs_to_string<'a, I>(bufs: I) -> String
-    where I: IntoIterator<Item = &'a [u8]>
+where
+    I: IntoIterator<Item = &'a [u8]>,
 {
     let mut s = String::new();
     for buf in bufs {
@@ -13,12 +14,10 @@ fn bufs_to_string<'a, I>(bufs: I) -> String
 }
 
 #[test]
-fn tcp_recv_timeout()
-{
+fn tcp_recv_timeout() {
     // Test that our recv operation can timeout and then be restarted.
 
-    async fn server_timeout(ex: fiona::Executor)
-    {
+    async fn server_timeout(ex: fiona::Executor) {
         let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
         let port = acceptor.port();
 
@@ -29,17 +28,19 @@ fn tcp_recv_timeout()
         ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
 
         let ex2 = ex.clone();
-        let client_task = ex.clone() //
-                            .spawn(async move {
-                                let ex = ex2;
-                                let client = fiona::tcp::Client::new(ex.clone());
+        let client_task = ex
+            .clone() //
+            .spawn(async move {
+                let ex = ex2;
+                let client = fiona::tcp::Client::new(ex.clone());
 
-                                client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                                      .await
-                                      .unwrap();
+                client
+                    .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                    .await
+                    .unwrap();
 
-                                client
-                            });
+                client
+            });
 
         let stream = acceptor.accept().await.unwrap();
         stream.set_buf_group(bgid);
@@ -50,12 +51,12 @@ fn tcp_recv_timeout()
 
         let client2 = client.clone();
         ex.spawn(async move {
-              let client = client2;
-              let msg = String::from("hello, world!").into_bytes();
-              let (num_sent, buf) = client.send(msg).await;
-              assert_eq!(num_sent.unwrap(), buf.len());
-          })
-          .await;
+            let client = client2;
+            let msg = String::from("hello, world!").into_bytes();
+            let (num_sent, buf) = client.send(msg).await;
+            assert_eq!(num_sent.unwrap(), buf.len());
+        })
+        .await;
 
         let bufs = stream.recv().await.unwrap();
         assert_eq!(bufs_to_string(&bufs), "hello, world!");
@@ -65,12 +66,12 @@ fn tcp_recv_timeout()
 
         let client2 = client.clone();
         ex.spawn(async move {
-              let client = client2;
-              let msg = String::from("hello, world!").into_bytes();
-              let (num_sent, buf) = client.send(msg).await;
-              assert_eq!(num_sent.unwrap(), buf.len());
-          })
-          .await;
+            let client = client2;
+            let msg = String::from("hello, world!").into_bytes();
+            let (num_sent, buf) = client.send(msg).await;
+            assert_eq!(num_sent.unwrap(), buf.len());
+        })
+        .await;
 
         let bufs = stream.recv().await.unwrap();
         assert_eq!(bufs_to_string(&bufs), "hello, world!");
@@ -81,8 +82,7 @@ fn tcp_recv_timeout()
         unsafe { NUM_RUNS += 1 };
     }
 
-    async fn client_timeout(ex: fiona::Executor)
-    {
+    async fn client_timeout(ex: fiona::Executor) {
         let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
         let port = acceptor.port();
 
@@ -93,17 +93,19 @@ fn tcp_recv_timeout()
         ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
 
         let ex2 = ex.clone();
-        let client_task = ex.clone() //
-                            .spawn(async move {
-                                let ex = ex2;
-                                let client = fiona::tcp::Client::new(ex.clone());
+        let client_task = ex
+            .clone() //
+            .spawn(async move {
+                let ex = ex2;
+                let client = fiona::tcp::Client::new(ex.clone());
 
-                                client.connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                                      .await
-                                      .unwrap();
+                client
+                    .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                    .await
+                    .unwrap();
 
-                                client
-                            });
+                client
+            });
 
         let stream = acceptor.accept().await.unwrap();
         stream.set_buf_group(bgid);

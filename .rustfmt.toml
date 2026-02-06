@@ -2,5 +2,3 @@ wrap_comments = true
 max_width = 100
 fn_params_layout = "Compressed"
 fn_call_width = 100
-brace_style = "AlwaysNextLine"
-indent_style = "Visual"

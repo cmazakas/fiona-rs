@@ -29,195 +29,199 @@ const SERVER_BGID: u16 = 27;
 
 const SEED: u64 = 1234;
 
-fn make_bytes() -> Vec<u8>
-{
+fn make_bytes() -> Vec<u8> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
     let mut bytes = vec![0_u8; BUF_SIZE];
     rand::RngCore::fill_bytes(&mut rng, &mut bytes);
     bytes
 }
 
-struct ByteGen
-{
+struct ByteGen {
     rng: rand::rngs::StdRng,
 }
 
-impl ByteGen
-{
-    fn new() -> Self
-    {
-        Self { rng: rand::rngs::StdRng::seed_from_u64(SEED) }
+impl ByteGen {
+    fn new() -> Self {
+        Self {
+            rng: rand::rngs::StdRng::seed_from_u64(SEED),
+        }
     }
 
-    fn write(&mut self, bytes: &mut [u8; 16 * 1024])
-    {
+    fn write(&mut self, bytes: &mut [u8; 16 * 1024]) {
         rand::RngCore::fill_bytes(&mut self.rng, bytes);
     }
 }
 
-fn tokio_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, nr_threads: u32)
-                     -> Result<(), String>
-{
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(nr_threads.try_into()
-                                                                                  .unwrap())
-                                                        .enable_all()
-                                                        .build()
-                                                        .unwrap();
+fn tokio_echo_client(
+    ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, nr_threads: u32,
+) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(nr_threads.try_into().unwrap())
+        .enable_all()
+        .build()
+        .unwrap();
 
     rt.block_on(async {
-          let start = Instant::now();
-          let mut join_set = tokio::task::JoinSet::new();
+        let start = Instant::now();
+        let mut join_set = tokio::task::JoinSet::new();
 
-          for _ in 0..nr_threads * nr_files {
-              join_set.spawn(async move {
-                          let mut generator = ByteGen::new();
+        for _ in 0..nr_threads * nr_files {
+            join_set.spawn(async move {
+                let mut generator = ByteGen::new();
 
-                          let socket = tokio::net::TcpSocket::new_v4().unwrap();
-                          let mut client = socket.connect(SocketAddr::new(IpAddr::V4(ipv4_addr),
-                                                                          port))
-                                                 .await
-                                                 .unwrap();
+                let socket = tokio::net::TcpSocket::new_v4().unwrap();
+                let mut client = socket
+                    .connect(SocketAddr::new(IpAddr::V4(ipv4_addr), port))
+                    .await
+                    .unwrap();
 
-                          let mut total_sent = 0;
-                          let mut send_buf = Vec::<u8>::with_capacity(16 * 1024);
+                let mut total_sent = 0;
+                let mut send_buf = Vec::<u8>::with_capacity(16 * 1024);
 
-                          while total_sent < BUF_SIZE {
-                              let mut chunk = [0_u8; 16 * 1024];
-                              generator.write(&mut chunk);
+                while total_sent < BUF_SIZE {
+                    let mut chunk = [0_u8; 16 * 1024];
+                    generator.write(&mut chunk);
 
-                              send_buf.extend_from_slice(&chunk);
-                              while !send_buf.is_empty() {
-                                  let n = tokio::time::timeout(Duration::from_secs(120),
-                                                               client.write(&send_buf)).await
-                                                                                       .unwrap()
-                                                                                       .unwrap();
+                    send_buf.extend_from_slice(&chunk);
+                    while !send_buf.is_empty() {
+                        let n =
+                            tokio::time::timeout(Duration::from_secs(120), client.write(&send_buf))
+                                .await
+                                .unwrap()
+                                .unwrap();
 
-                                  assert!(n > 0);
+                        assert!(n > 0);
 
-                                  drop(send_buf.drain(0..n));
-                                  total_sent += n;
-                              }
-                          }
+                        drop(send_buf.drain(0..n));
+                        total_sent += n;
+                    }
+                }
 
-                          let mut buf = [0; RECV_BUF_SIZE];
+                let mut buf = [0; RECV_BUF_SIZE];
 
-                          let mut total_received = 0;
-                          let mut h = DefaultHasher::new();
+                let mut total_received = 0;
+                let mut h = DefaultHasher::new();
 
-                          while total_received < BUF_SIZE {
-                              let n = tokio::time::timeout(Duration::from_secs(120),
-                                                           client.read(&mut buf)).await
-                                                                                 .unwrap()
-                                                                                 .unwrap();
+                while total_received < BUF_SIZE {
+                    let n = tokio::time::timeout(Duration::from_secs(120), client.read(&mut buf))
+                        .await
+                        .unwrap()
+                        .unwrap();
 
-                              h.write(&buf[0..n]);
-                              total_received += n;
-                          }
+                    h.write(&buf[0..n]);
+                    total_received += n;
+                }
 
-                          let digest = h.finish();
-                          assert_eq!(digest, 5326650159322985034);
-                      });
-          }
-          join_set.join_all().await;
+                let digest = h.finish();
+                assert_eq!(digest, 5326650159322985034);
+            });
+        }
+        join_set.join_all().await;
 
-          println!("tokio client loop took: {:?} for {} connections",
-                   start.elapsed(),
-                   nr_files * nr_threads);
-      });
+        println!(
+            "tokio client loop took: {:?} for {} connections",
+            start.elapsed(),
+            nr_files * nr_threads
+        );
+    });
 
     Ok(())
 }
 
-fn tokio_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, nr_threads: u32)
-                     -> Result<(), String>
-{
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(nr_threads.try_into()
-                                                                                  .unwrap())
-                                                        .enable_all()
-                                                        .build()
-                                                        .unwrap();
+fn tokio_echo_server(
+    ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, nr_threads: u32,
+) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(nr_threads.try_into().unwrap())
+        .enable_all()
+        .build()
+        .unwrap();
 
     rt.block_on(async {
-          let start = Instant::now();
+        let start = Instant::now();
 
-          let socket = tokio::net::TcpSocket::new_v4().unwrap();
-          socket.reuseaddr().unwrap();
-          socket.bind(SocketAddr::new(IpAddr::V4(ipv4_addr), port))
-                .unwrap();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.reuseaddr().unwrap();
+        socket
+            .bind(SocketAddr::new(IpAddr::V4(ipv4_addr), port))
+            .unwrap();
 
-          let listener = socket.listen(2048).unwrap();
+        let listener = socket.listen(2048).unwrap();
 
-          let mut join_set = tokio::task::JoinSet::new();
+        let mut join_set = tokio::task::JoinSet::new();
 
-          for _ in 0..nr_threads * nr_files {
-              let mut stream = listener.accept().await.unwrap().0;
+        for _ in 0..nr_threads * nr_files {
+            let mut stream = listener.accept().await.unwrap().0;
 
-              join_set.spawn(async move {
-                          let mut generator = ByteGen::new();
+            join_set.spawn(async move {
+                let mut generator = ByteGen::new();
 
-                          let mut buf = [0; RECV_BUF_SIZE];
+                let mut buf = [0; RECV_BUF_SIZE];
 
-                          let mut total_received = 0;
-                          let mut h = DefaultHasher::new();
+                let mut total_received = 0;
+                let mut h = DefaultHasher::new();
 
-                          while total_received < BUF_SIZE {
-                              let n = tokio::time::timeout(Duration::from_secs(120),
-                                                           stream.read(&mut buf)).await
-                                                                                 .unwrap()
-                                                                                 .unwrap();
+                while total_received < BUF_SIZE {
+                    let n = tokio::time::timeout(Duration::from_secs(120), stream.read(&mut buf))
+                        .await
+                        .unwrap()
+                        .unwrap();
 
-                              h.write(&buf[0..n]);
-                              total_received += n;
-                          }
+                    h.write(&buf[0..n]);
+                    total_received += n;
+                }
 
-                          let digest = h.finish();
-                          assert_eq!(digest, 5326650159322985034);
+                let digest = h.finish();
+                assert_eq!(digest, 5326650159322985034);
 
-                          let mut total_sent = 0;
-                          let mut send_buf = Vec::<u8>::with_capacity(16 * 1024);
+                let mut total_sent = 0;
+                let mut send_buf = Vec::<u8>::with_capacity(16 * 1024);
 
-                          while total_sent < BUF_SIZE {
-                              let mut chunk = [0_u8; 16 * 1024];
-                              generator.write(&mut chunk);
+                while total_sent < BUF_SIZE {
+                    let mut chunk = [0_u8; 16 * 1024];
+                    generator.write(&mut chunk);
 
-                              send_buf.extend_from_slice(&chunk);
-                              while !send_buf.is_empty() {
-                                  let n = tokio::time::timeout(Duration::from_secs(120),
-                                                               stream.write(&send_buf)).await
-                                                                                       .unwrap()
-                                                                                       .unwrap();
+                    send_buf.extend_from_slice(&chunk);
+                    while !send_buf.is_empty() {
+                        let n =
+                            tokio::time::timeout(Duration::from_secs(120), stream.write(&send_buf))
+                                .await
+                                .unwrap()
+                                .unwrap();
 
-                                  assert!(n > 0);
+                        assert!(n > 0);
 
-                                  drop(send_buf.drain(0..n));
-                                  total_sent += n;
-                              }
-                          }
-                      });
-          }
-          join_set.join_all().await;
+                        drop(send_buf.drain(0..n));
+                        total_sent += n;
+                    }
+                }
+            });
+        }
+        join_set.join_all().await;
 
-          println!("tokio accept loop took: {:?} for {} connections",
-                   start.elapsed(),
-                   nr_files * nr_threads);
-      });
+        println!(
+            "tokio accept loop took: {:?} for {} connections",
+            start.elapsed(),
+            nr_files * nr_threads
+        );
+    });
 
     Ok(())
 }
 
 const CQ_ENTRIES: u32 = 64 * 1024;
 
-fn make_io_context(nr_files: u32) -> fiona::IoContext
-{
-    let params = &fiona::IoContextParams { sq_entries: 256,
-                                           cq_entries: CQ_ENTRIES,
-                                           nr_files: 2 * nr_files };
+fn make_io_context(nr_files: u32) -> fiona::IoContext {
+    let params = &fiona::IoContextParams {
+        sq_entries: 256,
+        cq_entries: CQ_ENTRIES,
+        nr_files: 2 * nr_files,
+    };
 
     fiona::IoContext::with_params(params)
 }
 
-async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: u16)
-{
+async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: u16) {
     let mut generator = ByteGen::new();
 
     let client = fiona::tcp::Client::new(ex);
@@ -269,41 +273,42 @@ async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: 
     assert_eq!(digest, 5326650159322985034);
 }
 
-fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, nr_threads: u32)
-                     -> Result<(), String>
-{
+fn fiona_echo_client(
+    ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, nr_threads: u32,
+) -> Result<(), String> {
     let start = Instant::now();
 
     let mut threads = Vec::<JoinHandle<()>>::with_capacity(nr_threads as _);
     for _ in 0..nr_threads {
         threads.push(std::thread::spawn(move || {
-                         let mut ioc = make_io_context(nr_files);
-                         let ex = ioc.get_executor();
+            let mut ioc = make_io_context(nr_files);
+            let ex = ioc.get_executor();
 
-                         ex.register_buf_group(CLIENT_BGID, NUM_BUFS, RECV_BUF_SIZE)
-                           .unwrap();
+            ex.register_buf_group(CLIENT_BGID, NUM_BUFS, RECV_BUF_SIZE)
+                .unwrap();
 
-                         for _ in 0..nr_files {
-                             ex.spawn(fiona_echo_client_impl(ex.clone(), ipv4_addr, port));
-                         }
+            for _ in 0..nr_files {
+                ex.spawn(fiona_echo_client_impl(ex.clone(), ipv4_addr, port));
+            }
 
-                         ioc.run();
-                     }));
+            ioc.run();
+        }));
     }
 
     for t in threads {
         t.join().unwrap();
     }
 
-    println!("fiona client loop took: {:?} for {} connections",
-             start.elapsed(),
-             nr_files * nr_threads);
+    println!(
+        "fiona client loop took: {:?} for {} connections",
+        start.elapsed(),
+        nr_files * nr_threads
+    );
 
     Ok(())
 }
 
-async fn fiona_echo_server_impl(stream: fiona::tcp::Stream)
-{
+async fn fiona_echo_server_impl(stream: fiona::tcp::Stream) {
     stream.set_timeout(Duration::from_secs(120));
     stream.set_buf_group(SERVER_BGID);
 
@@ -351,9 +356,9 @@ async fn fiona_echo_server_impl(stream: fiona::tcp::Stream)
     }
 }
 
-fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, nr_threads: u32)
-                     -> Result<(), String>
-{
+fn fiona_echo_server(
+    ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, nr_threads: u32,
+) -> Result<(), String> {
     static TOTAL_CONNS: AtomicU64 = AtomicU64::new(0);
     TOTAL_CONNS.store(nr_threads as u64 * nr_files as u64, Ordering::Relaxed);
 
@@ -364,58 +369,60 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, nr_threads: 
     for _ in 0..nr_threads {
         let (shutdown_tx, mut shutdown_rx) = (shutdown_tx.clone(), shutdown_tx.subscribe());
         threads.push(std::thread::spawn(move || {
-                         let mut ioc = make_io_context(nr_files);
-                         let ex = ioc.get_executor();
+            let mut ioc = make_io_context(nr_files);
+            let ex = ioc.get_executor();
 
-                         ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)
-                           .unwrap();
+            ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)
+                .unwrap();
 
-                         let opts = &AcceptorOpts { reuse_addr: true,
-                                                    reuse_port: true };
-                         let acceptor = fiona::tcp::Acceptor::bind_ipv4_with_params(ex.clone(),
-                                                                                    ipv4_addr,
-                                                                                    port,
-                                                                                    opts).unwrap();
+            let opts = &AcceptorOpts {
+                reuse_addr: true,
+                reuse_port: true,
+            };
+            let acceptor =
+                fiona::tcp::Acceptor::bind_ipv4_with_params(ex.clone(), ipv4_addr, port, opts)
+                    .unwrap();
 
-                         ex //
-                           .clone()
-                           .spawn(async move {
-                               loop {
-                                   tokio::select! {
-                                       stream = acceptor.accept() => {
-                                        ex.spawn(fiona_echo_server_impl(stream.unwrap()));
+            ex //
+                .clone()
+                .spawn(async move {
+                    loop {
+                        tokio::select! {
+                            stream = acceptor.accept() => {
+                             ex.spawn(fiona_echo_server_impl(stream.unwrap()));
 
-                                           if TOTAL_CONNS.fetch_sub(1, Ordering::Relaxed) == 1 {
-                                               shutdown_tx.send(()).unwrap();
-                                               break;
-                                           }
-                                       },
-                                    _ = shutdown_rx.recv() => {
-                                        break;
-                                    },
-                                   }
-                               }
-                           });
+                                if TOTAL_CONNS.fetch_sub(1, Ordering::Relaxed) == 1 {
+                                    shutdown_tx.send(()).unwrap();
+                                    break;
+                                }
+                            },
+                         _ = shutdown_rx.recv() => {
+                             break;
+                         },
+                        }
+                    }
+                });
 
-                         ioc.run();
-                     }));
+            ioc.run();
+        }));
     }
 
     for t in threads {
         t.join().unwrap();
     }
 
-    println!("fiona accept loop took: {:?} for {} connections",
-             start.elapsed(),
-             nr_threads * nr_files);
+    println!(
+        "fiona accept loop took: {:?} for {} connections",
+        start.elapsed(),
+        nr_threads * nr_files
+    );
 
     Ok(())
 }
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
-struct CliArgs
-{
+struct CliArgs {
     #[arg(long)]
     tokio: bool,
 
@@ -447,8 +454,7 @@ struct CliArgs
     nr_threads: u32,
 }
 
-fn main()
-{
+fn main() {
     let args = CliArgs::parse();
     // println!("{args:?}");
 
@@ -476,36 +482,48 @@ fn main()
     if args.tokio {
         if args.server {
             utils::run_once("tokio echo2 server", || {
-                black_box(tokio_echo_server(args.ipv4_addr,
-                                            args.port,
-                                            args.nr_files,
-                                            args.nr_threads))
-            }).unwrap();
+                black_box(tokio_echo_server(
+                    args.ipv4_addr,
+                    args.port,
+                    args.nr_files,
+                    args.nr_threads,
+                ))
+            })
+            .unwrap();
         } else {
             assert!(args.client);
             utils::run_once("tokio echo2 client", || {
-                black_box(tokio_echo_client(args.ipv4_addr,
-                                            args.port,
-                                            args.nr_files,
-                                            args.nr_threads))
-            }).unwrap();
+                black_box(tokio_echo_client(
+                    args.ipv4_addr,
+                    args.port,
+                    args.nr_files,
+                    args.nr_threads,
+                ))
+            })
+            .unwrap();
         }
     } else if args.fiona {
         if args.server {
             utils::run_once("fiona echo2 server", || {
-                black_box(fiona_echo_server(args.ipv4_addr,
-                                            args.port,
-                                            args.nr_files,
-                                            args.nr_threads))
-            }).unwrap();
+                black_box(fiona_echo_server(
+                    args.ipv4_addr,
+                    args.port,
+                    args.nr_files,
+                    args.nr_threads,
+                ))
+            })
+            .unwrap();
         } else {
             assert!(args.client);
             utils::run_once("fiona echo2 client", || {
-                black_box(fiona_echo_client(args.ipv4_addr,
-                                            args.port,
-                                            args.nr_files,
-                                            args.nr_threads))
-            }).unwrap();
+                black_box(fiona_echo_client(
+                    args.ipv4_addr,
+                    args.port,
+                    args.nr_files,
+                    args.nr_threads,
+                ))
+            })
+            .unwrap();
         }
     }
 }

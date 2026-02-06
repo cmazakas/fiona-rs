@@ -22,35 +22,33 @@ const SERVER_BGID: u16 = 27;
 
 use std::hash::Hasher;
 
-struct ByteGen
-{
+struct ByteGen {
     rng: rand::rngs::StdRng,
 }
 
-impl ByteGen
-{
-    fn new() -> Self
-    {
-        Self { rng: rand::rngs::StdRng::seed_from_u64(1234) }
+impl ByteGen {
+    fn new() -> Self {
+        Self {
+            rng: rand::rngs::StdRng::seed_from_u64(1234),
+        }
     }
 
-    fn write(&mut self, bytes: &mut [u8; 16 * 1024])
-    {
+    fn write(&mut self, bytes: &mut [u8; 16 * 1024]) {
         rand::RngCore::fill_bytes(&mut self.rng, bytes);
     }
 }
 
-fn make_io_context(nr_files: u32) -> fiona::IoContext
-{
-    let params = &fiona::IoContextParams { sq_entries: 256,
-                                           cq_entries: CQ_ENTRIES,
-                                           nr_files: 2 * nr_files };
+fn make_io_context(nr_files: u32) -> fiona::IoContext {
+    let params = &fiona::IoContextParams {
+        sq_entries: 256,
+        cq_entries: CQ_ENTRIES,
+        nr_files: 2 * nr_files,
+    };
 
     fiona::IoContext::with_params(params)
 }
 
-async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: u16)
-{
+async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: u16) {
     let mut generator = ByteGen::new();
 
     let client = fiona::tcp::Client::new(ex);
@@ -106,34 +104,32 @@ async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: 
     assert_eq!(digest, 5326650159322985034);
 }
 
-fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
-{
+fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String> {
     let mut ioc = make_io_context(nr_files);
     let ex = ioc.get_executor();
 
     ex.register_buf_group(CLIENT_BGID, NUM_BUFS, RECV_BUF_SIZE)
-      .unwrap();
+        .unwrap();
 
     ex //
-      .clone()
-      .spawn(async move {
-          let mut tasks = Vec::new();
-          for _ in 0..nr_files {
-              tasks.push(ex.spawn(fiona_echo_client_impl(ex.clone(), ipv4_addr, port)));
-          }
+        .clone()
+        .spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..nr_files {
+                tasks.push(ex.spawn(fiona_echo_client_impl(ex.clone(), ipv4_addr, port)));
+            }
 
-          for h in tasks {
-              h.await;
-          }
-      });
+            for h in tasks {
+                h.await;
+            }
+        });
 
     ioc.run();
 
     Ok(())
 }
 
-async fn fiona_echo_server_impl(stream: fiona::tcp::Stream)
-{
+async fn fiona_echo_server_impl(stream: fiona::tcp::Stream) {
     stream.set_timeout(Duration::from_secs(3));
     stream.set_buf_group(SERVER_BGID);
 
@@ -185,36 +181,37 @@ async fn fiona_echo_server_impl(stream: fiona::tcp::Stream)
     }
 }
 
-fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String>
-{
+fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<(), String> {
     TOTAL_CONNS.store(nr_files as u64, Ordering::Relaxed);
 
     let mut ioc = make_io_context(nr_files);
     let ex = ioc.get_executor();
 
     ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)
-      .unwrap();
+        .unwrap();
 
-    let opts = &AcceptorOpts { reuse_addr: true,
-                               reuse_port: true };
+    let opts = &AcceptorOpts {
+        reuse_addr: true,
+        reuse_port: true,
+    };
     let acceptor =
         fiona::tcp::Acceptor::bind_ipv4_with_params(ex.clone(), ipv4_addr, port, opts).unwrap();
 
     ex.clone().spawn(async move {
-                  loop {
-                      match acceptor.accept().await {
-                          Err(Errno::ECANCELED) => break,
-                          Err(e) => panic!("{e:?}"),
-                          Ok(stream) => {
-                              stream.get_executor().spawn(fiona_echo_server_impl(stream));
-                          }
-                      }
+        loop {
+            match acceptor.accept().await {
+                Err(Errno::ECANCELED) => break,
+                Err(e) => panic!("{e:?}"),
+                Ok(stream) => {
+                    stream.get_executor().spawn(fiona_echo_server_impl(stream));
+                }
+            }
 
-                      if TOTAL_CONNS.fetch_sub(1, Ordering::Relaxed) == 1 {
-                          break;
-                      }
-                  }
-              });
+            if TOTAL_CONNS.fetch_sub(1, Ordering::Relaxed) == 1 {
+                break;
+            }
+        }
+    });
 
     ioc.run();
 
@@ -222,8 +219,7 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
 }
 
 #[test]
-fn tcp_stress_panicking()
-{
+fn tcp_stress_panicking() {
     let port = 8000;
     let nr_files = 500;
 

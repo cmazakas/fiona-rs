@@ -19,20 +19,17 @@ use crate::{
     release_impl, release_obj,
 };
 
-struct TimerImpl
-{
+struct TimerImpl {
     ref_count: RefCount,
     ex: Executor,
     timeout_pending: bool,
 }
 
-pub struct Timer
-{
+pub struct Timer {
     p: NonNull<TimerImpl>,
 }
 
-pub struct TimerFuture<'a>
-{
+pub struct TimerFuture<'a> {
     timer: &'a Timer,
     op: Option<u64>,
     completed: bool,
@@ -40,33 +37,36 @@ pub struct TimerFuture<'a>
 
 //-----------------------------------------------------------------------------
 
-impl Timer
-{
+impl Timer {
     #[must_use]
-    pub fn new(ex: Executor) -> Self
-    {
+    pub fn new(ex: Executor) -> Self {
         let layout = std::alloc::Layout::new::<TimerImpl>();
         let p = unsafe { std::alloc::alloc(layout) };
 
-        let ref_count = RefCount { obj_count: 1,
-                                   op_count: 0,
-                                   release_impl: release_impl::<TimerImpl>,
-                                   obj: p };
+        let ref_count = RefCount {
+            obj_count: 1,
+            op_count: 0,
+            release_impl: release_impl::<TimerImpl>,
+            obj: p,
+        };
 
-        let timer_impl = TimerImpl { ref_count,
-                                     ex,
-                                     timeout_pending: false };
+        let timer_impl = TimerImpl {
+            ref_count,
+            ex,
+            timeout_pending: false,
+        };
 
         let p = p.cast::<TimerImpl>();
         unsafe { std::ptr::write(p, timer_impl) };
 
-        Self { p: NonNull::new(p).unwrap() }
+        Self {
+            p: NonNull::new(p).unwrap(),
+        }
     }
 
     #[inline]
     #[must_use]
-    pub fn wait(&self, dur: Duration) -> TimerFuture<'_>
-    {
+    pub fn wait(&self, dur: Duration) -> TimerFuture<'_> {
         let timer_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!timer_impl.timeout_pending);
 
@@ -77,28 +77,28 @@ impl Timer
         let mut guard = timer_impl.ex.p.io_ops.borrow_mut();
         let io_ops = &mut *guard;
 
-        let key = io_ops.insert(make_io_uring_op(ref_count, OpType::Timeout { dur: dur.into() }),
-                                &timer_impl.ex);
+        let key = io_ops.insert(
+            make_io_uring_op(ref_count, OpType::Timeout { dur: dur.into() }),
+            &timer_impl.ex,
+        );
 
-        TimerFuture { timer: self,
-                      completed: false,
-                      op: Some(key.data().as_ffi()) }
+        TimerFuture {
+            timer: self,
+            completed: false,
+            op: Some(key.data().as_ffi()),
+        }
     }
 }
 
-impl Drop for Timer
-{
-    fn drop(&mut self)
-    {
+impl Drop for Timer {
+    fn drop(&mut self) {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
         unsafe { release_obj(rc) };
     }
 }
 
-impl Clone for Timer
-{
-    fn clone(&self) -> Self
-    {
+impl Clone for Timer {
+    fn clone(&self) -> Self {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).ref_count };
         unsafe { add_obj_ref(rc) };
 
@@ -108,10 +108,8 @@ impl Clone for Timer
 
 //-----------------------------------------------------------------------------
 
-impl Drop for TimerFuture<'_>
-{
-    fn drop(&mut self)
-    {
+impl Drop for TimerFuture<'_> {
+    fn drop(&mut self) {
         let timer_impl = unsafe { &mut *self.timer.p.as_ptr() };
         timer_impl.timeout_pending = false;
 
@@ -144,13 +142,12 @@ impl Drop for TimerFuture<'_>
     }
 }
 
-impl Future for TimerFuture<'_>
-{
+impl Future for TimerFuture<'_> {
     type Output = Result<()>;
 
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
-            -> std::task::Poll<Self::Output>
-    {
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         assert!(!self.completed);
 
         let timer_impl = unsafe { &mut *self.timer.p.as_ptr() };

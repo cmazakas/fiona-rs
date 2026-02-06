@@ -19,20 +19,18 @@ use std::{
 use futures::{SinkExt, StreamExt, stream::FuturesUnordered};
 use rand::SeedableRng;
 
-struct YieldFuture<T: Unpin>
-{
+struct YieldFuture<T: Unpin> {
     yielded: bool,
     done: bool,
     t: Option<T>,
 }
 
-impl<T: Unpin> Future for YieldFuture<T>
-{
+impl<T: Unpin> Future for YieldFuture<T> {
     type Output = T;
 
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
-            -> std::task::Poll<Self::Output>
-    {
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         assert!(!self.done);
         match self.yielded {
             false => {
@@ -48,18 +46,17 @@ impl<T: Unpin> Future for YieldFuture<T>
     }
 }
 
-impl<T: Unpin> YieldFuture<T>
-{
-    fn new(t: T) -> Self
-    {
-        Self { yielded: false,
-               done: false,
-               t: Some(t) }
+impl<T: Unpin> YieldFuture<T> {
+    fn new(t: T) -> Self {
+        Self {
+            yielded: false,
+            done: false,
+            t: Some(t),
+        }
     }
 }
 
-fn yield_now<T: Unpin>(t: T) -> YieldFuture<T>
-{
+fn yield_now<T: Unpin>(t: T) -> YieldFuture<T> {
     YieldFuture::new(t)
 }
 
@@ -67,51 +64,46 @@ fn yield_now<T: Unpin>(t: T) -> YieldFuture<T>
 
 struct WakerFuture;
 
-impl Future for WakerFuture
-{
+impl Future for WakerFuture {
     type Output = Waker;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         Poll::Ready(cx.waker().clone())
     }
 }
 
 //-----------------------------------------------------------------------------
 
-struct TimerFuture<T>
-{
+struct TimerFuture<T> {
     dur: Duration,
     t: Option<JoinHandle<()>>,
     done: bool,
     value: Option<T>,
 }
 
-impl<T> TimerFuture<T>
-{
-    fn new(dur: Duration, val: T) -> Self
-    {
-        Self { dur,
-               t: None,
-               done: false,
-               value: Some(val) }
+impl<T> TimerFuture<T> {
+    fn new(dur: Duration, val: T) -> Self {
+        Self {
+            dur,
+            t: None,
+            done: false,
+            value: Some(val),
+        }
     }
 }
 
-impl<T: Unpin> Future for TimerFuture<T>
-{
+impl<T: Unpin> Future for TimerFuture<T> {
     type Output = T;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         assert!(!self.done);
         match self.t.take() {
             None => {
                 let dur = self.dur;
                 let waker = cx.waker().clone();
                 self.t = Some(std::thread::spawn(move || {
-                                  std::thread::sleep(dur);
-                                  waker.wake();
-                              }));
+                    std::thread::sleep(dur);
+                    waker.wake();
+                }));
                 Poll::Pending
             }
             Some(join_handle) => {
@@ -123,8 +115,7 @@ impl<T: Unpin> Future for TimerFuture<T>
     }
 }
 
-fn wait_for<T>(dur: Duration, t: T) -> TimerFuture<T>
-{
+fn wait_for<T>(dur: Duration, t: T) -> TimerFuture<T> {
     TimerFuture::new(dur, t)
 }
 
@@ -133,8 +124,7 @@ fn wait_for<T>(dur: Duration, t: T) -> TimerFuture<T>
 trait RayonSafe: Unpin + Send + 'static {}
 impl<T: Unpin + Send + 'static> RayonSafe for T {}
 
-struct RayonFuture<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe>
-{
+struct RayonFuture<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> {
     initiated: bool,
     done: bool,
     thread_pool: Rc<rayon::ThreadPool>,
@@ -142,24 +132,22 @@ struct RayonFuture<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe>
     value: Arc<Mutex<Option<T>>>,
 }
 
-impl<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> RayonFuture<T, F>
-{
-    fn new(thread_pool: Rc<rayon::ThreadPool>, f: F) -> Self
-    {
-        RayonFuture { initiated: false,
-                      done: false,
-                      thread_pool,
-                      value: Arc::new(Mutex::new(None)),
-                      f: Some(f) }
+impl<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> RayonFuture<T, F> {
+    fn new(thread_pool: Rc<rayon::ThreadPool>, f: F) -> Self {
+        RayonFuture {
+            initiated: false,
+            done: false,
+            thread_pool,
+            value: Arc::new(Mutex::new(None)),
+            f: Some(f),
+        }
     }
 }
 
-impl<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> Future for RayonFuture<T, F>
-{
+impl<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> Future for RayonFuture<T, F> {
     type Output = T;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         assert!(!self.done);
 
         if self.initiated {
@@ -193,8 +181,7 @@ impl<T: RayonSafe, F: (FnOnce() -> T) + RayonSafe> Future for RayonFuture<T, F>
 
 //-----------------------------------------------------------------------------
 
-fn make_bytes(n: usize) -> Vec<u8>
-{
+fn make_bytes(n: usize) -> Vec<u8> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(1234);
     let mut bytes = vec![0_u8; n];
     rand::RngCore::fill_bytes(&mut rng, &mut bytes);
@@ -204,8 +191,7 @@ fn make_bytes(n: usize) -> Vec<u8>
 //-----------------------------------------------------------------------------
 
 #[test]
-fn await_simple()
-{
+fn await_simple() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
@@ -213,18 +199,16 @@ fn await_simple()
     {
         let c2 = c.clone();
         ex.spawn(async move {
-              *c2.borrow_mut() = 1234;
-          });
+            *c2.borrow_mut() = 1234;
+        });
     }
     assert_eq!(ioc.run(), 1);
     assert_eq!(*c.borrow(), 1234);
 }
 
 #[test]
-fn await_value()
-{
-    async fn make_vec() -> Vec<i32>
-    {
+fn await_value() {
+    async fn make_vec() -> Vec<i32> {
         yield_now(()).await;
         vec![1, 2, 3, 4]
     }
@@ -237,19 +221,17 @@ fn await_value()
         let c2 = c.clone();
         let ex2 = ex.clone();
         ex.spawn(async move {
-              let v = ex2.spawn(make_vec()).await;
-              *c2.borrow_mut() = v.len();
-          });
+            let v = ex2.spawn(make_vec()).await;
+            *c2.borrow_mut() = v.len();
+        });
     }
     assert_eq!(ioc.run(), 2);
     assert_eq!(*c.borrow(), 4);
 }
 
 #[test]
-fn await_forgotten()
-{
-    async fn make_vec() -> Vec<i32>
-    {
+fn await_forgotten() {
+    async fn make_vec() -> Vec<i32> {
         vec![1, 2, 3, 4]
     }
 
@@ -262,14 +244,14 @@ fn await_forgotten()
     {
         let c2 = c.clone();
         ex //
-          .clone()
-          .spawn(async move {
-              let h = ex.spawn(make_vec());
-              *c2.borrow_mut() = 4321;
-              unsafe {
-                  P_FUTURE = Box::leak(Box::new(h));
-              }
-          });
+            .clone()
+            .spawn(async move {
+                let h = ex.spawn(make_vec());
+                *c2.borrow_mut() = 4321;
+                unsafe {
+                    P_FUTURE = Box::leak(Box::new(h));
+                }
+            });
     }
     assert_eq!(ioc.run(), 2);
     unsafe {
@@ -279,12 +261,10 @@ fn await_forgotten()
 }
 
 #[test]
-fn await_forgotten_recursive()
-{
+fn await_forgotten_recursive() {
     static mut P_FUTURE: *mut fiona::SpawnFuture<Vec<i32>> = std::ptr::null_mut();
 
-    async fn make_vec() -> Vec<i32>
-    {
+    async fn make_vec() -> Vec<i32> {
         assert!(unsafe { !P_FUTURE.is_null() });
         let f = unsafe { Pin::new_unchecked(&mut *P_FUTURE) };
 
@@ -305,8 +285,7 @@ fn await_forgotten_recursive()
     let c = Rc::new(RefCell::new(0));
     let c2 = c.clone();
 
-    async fn f(ex: fiona::Executor, c2: Rc<RefCell<i32>>)
-    {
+    async fn f(ex: fiona::Executor, c2: Rc<RefCell<i32>>) {
         let h = ex.spawn(make_vec());
         *c2.borrow_mut() = 4321;
         unsafe {
@@ -334,15 +313,12 @@ fn await_forgotten_recursive()
 }
 
 #[test]
-fn await_sequential()
-{
-    async fn identity(x: i32) -> i32
-    {
+fn await_sequential() {
+    async fn identity(x: i32) -> i32 {
         yield_now(x).await
     }
 
-    async fn sequential(ex: fiona::Executor)
-    {
+    async fn sequential(ex: fiona::Executor) {
         let mut futures = Vec::<fiona::SpawnFuture<i32>>::new();
         for i in 0..10 {
             futures.push(ex.spawn(identity(i + 1)));
@@ -365,15 +341,12 @@ fn await_sequential()
 }
 
 #[test]
-fn await_sequential_rev()
-{
-    async fn identity(x: i32) -> i32
-    {
+fn await_sequential_rev() {
+    async fn identity(x: i32) -> i32 {
         x
     }
 
-    async fn sequential(ex: fiona::Executor)
-    {
+    async fn sequential(ex: fiona::Executor) {
         let mut futures = Vec::<fiona::SpawnFuture<i32>>::new();
         for i in 0..10 {
             futures.push(ex.spawn(identity(i + 1)));
@@ -396,26 +369,23 @@ fn await_sequential_rev()
 }
 
 #[test]
-fn await_non_send()
-{
-    struct ThreadLocal
-    {
+fn await_non_send() {
+    struct ThreadLocal {
         x: Rc<Cell<i32>>,
     }
 
-    async fn make_int() -> i32
-    {
+    async fn make_int() -> i32 {
         1234
     }
 
-    async fn child(ex: fiona::Executor) -> ThreadLocal
-    {
+    async fn child(ex: fiona::Executor) -> ThreadLocal {
         let x = ex.spawn(make_int()).await;
-        ThreadLocal { x: Rc::new(Cell::new(x)) }
+        ThreadLocal {
+            x: Rc::new(Cell::new(x)),
+        }
     }
 
-    async fn parent(ex: fiona::Executor)
-    {
+    async fn parent(ex: fiona::Executor) {
         let f1 = ex.spawn(child(ex.clone()));
         let f2 = ex.spawn(child(ex.clone()));
 
@@ -434,22 +404,18 @@ fn await_non_send()
 }
 
 #[test]
-fn await_future_relocated()
-{
-    async fn task() -> i32
-    {
+fn await_future_relocated() {
+    async fn task() -> i32 {
         1234
     }
 
-    async fn child(f: fiona::SpawnFuture<i32>)
-    {
+    async fn child(f: fiona::SpawnFuture<i32>) {
         let x = f.await;
         yield_now(()).await;
         assert_eq!(x, 1234);
     }
 
-    async fn parent(ex: fiona::Executor)
-    {
+    async fn parent(ex: fiona::Executor) {
         let f = ex.spawn(task());
         ex.spawn(child(f)).await;
     }
@@ -464,10 +430,8 @@ fn await_future_relocated()
 
 #[test]
 #[should_panic]
-fn await_future_panics()
-{
-    async fn task(x: i32)
-    {
+fn await_future_panics() {
+    async fn task(x: i32) {
         let p = Box::new(x);
         yield_now(()).await;
         assert!(*p < 5);
@@ -483,16 +447,13 @@ fn await_future_panics()
 }
 
 #[test]
-fn await_from_main()
-{
+fn await_from_main() {
     // TODO: kind of an abstraction leak that this is possible
     // but I don't see a good solution here
 
     struct PanicWaker;
-    impl std::task::Wake for PanicWaker
-    {
-        fn wake(self: std::sync::Arc<Self>)
-        {
+    impl std::task::Wake for PanicWaker {
+        fn wake(self: std::sync::Arc<Self>) {
             panic!();
         }
     }
@@ -518,12 +479,10 @@ fn await_from_main()
 }
 
 #[test]
-fn await_stress_test()
-{
+fn await_stress_test() {
     static mut NUM_RUNS: u64 = 0;
 
-    async fn task(x: i32)
-    {
+    async fn task(x: i32) {
         let x2 = yield_now(x).await;
         assert_eq!(x2, x);
         unsafe { NUM_RUNS += 1 };
@@ -541,20 +500,16 @@ fn await_stress_test()
 }
 
 #[test]
-fn await_cycle()
-{
-    struct RecursiveFuture
-    {
+fn await_cycle() {
+    struct RecursiveFuture {
         this: Rc<RefCell<Option<fiona::SpawnFuture<()>>>>,
         recursions: i32,
         done: bool,
     }
 
-    impl Future for RecursiveFuture
-    {
+    impl Future for RecursiveFuture {
         type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output>
-        {
+        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
             assert!(!self.done);
 
             let r;
@@ -581,12 +536,13 @@ fn await_cycle()
         }
     }
 
-    async fn start(ex: fiona::Executor)
-    {
+    async fn start(ex: fiona::Executor) {
         let p = Rc::new(RefCell::new(None));
-        let f = ex.spawn(RecursiveFuture { this: p.clone(),
-                                           recursions: 0,
-                                           done: false });
+        let f = ex.spawn(RecursiveFuture {
+            this: p.clone(),
+            recursions: 0,
+            done: false,
+        });
         *p.borrow_mut() = Some(f);
     }
 
@@ -599,26 +555,23 @@ fn await_cycle()
 }
 
 #[test]
-fn await_timer()
-{
+fn await_timer() {
     let dur = Duration::from_millis(250);
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
     ex.spawn(async move {
-          let v = wait_for(dur, vec![1, 2, 3, 4]).await;
-          assert_eq!(v, vec![1, 2, 3, 4]);
-      });
+        let v = wait_for(dur, vec![1, 2, 3, 4]).await;
+        assert_eq!(v, vec![1, 2, 3, 4]);
+    });
 
     let n = ioc.run();
     assert_eq!(n, 1);
 }
 
 #[test]
-fn await_manually_polled()
-{
-    async fn f1(ex: fiona::Executor)
-    {
+fn await_manually_polled() {
+    async fn f1(ex: fiona::Executor) {
         let w = WakerFuture.await;
 
         // test the case where we manually poll a sibling task, attaching ourselves as
@@ -631,13 +584,11 @@ fn await_manually_polled()
         assert!(r.is_pending());
     }
 
-    async fn f2() -> Box<i32>
-    {
+    async fn f2() -> Box<i32> {
         yield_now(Box::new(1234)).await
     }
 
-    async fn f3()
-    {
+    async fn f3() {
         let x = yield_now(4321).await;
         let p = yield_now(Box::new(x)).await;
         assert_eq!(*p, 4321);
@@ -654,15 +605,13 @@ fn await_manually_polled()
 }
 
 #[test]
-fn await_manually_polled_early_drop()
-{
+fn await_manually_polled_early_drop() {
     // want to attempt to test the property that the main task we're waiting on goes
     // out of scope when an external thread completes and tries to use the Waker
 
     static mut NUM_RUNS: u64 = 0;
 
-    async fn f1()
-    {
+    async fn f1() {
         let w = WakerFuture.await;
         let mut cx = std::task::Context::from_waker(&w);
 
@@ -685,8 +634,7 @@ fn await_manually_polled_early_drop()
 }
 
 #[test]
-fn await_manual_timeslice()
-{
+fn await_manual_timeslice() {
     // want to test that a user can appropriately use our Waker to time-slice
     // long-standing operations, letting other things in the run queue process
 
@@ -696,8 +644,7 @@ fn await_manual_timeslice()
 
     let flag = Rc::new(RefCell::new(false));
 
-    async fn f1(flag: Rc<RefCell<bool>>, vec: Rc<RefCell<Vec<i32>>>)
-    {
+    async fn f1(flag: Rc<RefCell<bool>>, vec: Rc<RefCell<Vec<i32>>>) {
         let mut v1 = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
         poll_fn(|cx| {
@@ -711,13 +658,13 @@ fn await_manual_timeslice()
 
             cx.waker().wake_by_ref();
             Poll::Pending
-        }).await;
+        })
+        .await;
 
         unsafe { NUM_RUNS += 1 };
     }
 
-    async fn f2(flag: Rc<RefCell<bool>>, vec: Rc<RefCell<Vec<i32>>>)
-    {
+    async fn f2(flag: Rc<RefCell<bool>>, vec: Rc<RefCell<Vec<i32>>>) {
         let mut v2 = vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
 
         poll_fn(|cx| {
@@ -731,7 +678,8 @@ fn await_manual_timeslice()
 
             cx.waker().wake_by_ref();
             Poll::Pending
-        }).await;
+        })
+        .await;
 
         unsafe { NUM_RUNS += 1 };
     }
@@ -753,17 +701,14 @@ fn await_manual_timeslice()
 //-----------------------------------------------------------------------------
 
 #[test]
-fn await_futures_ordered()
-{
-    async fn identity(x: i32) -> i32
-    {
+fn await_futures_ordered() {
+    async fn identity(x: i32) -> i32 {
         let mut v = vec![x];
         v = yield_now(v).await;
         v[0]
     }
 
-    async fn sequential(ex: fiona::Executor)
-    {
+    async fn sequential(ex: fiona::Executor) {
         let mut futures = Vec::<fiona::SpawnFuture<i32>>::new();
         for i in 0..10 {
             futures.push(ex.spawn(identity(i + 1)));
@@ -788,10 +733,8 @@ fn await_futures_ordered()
 }
 
 #[test]
-fn await_futures_unordered()
-{
-    async fn launch_timers(ex: fiona::Executor)
-    {
+fn await_futures_unordered() {
+    async fn launch_timers(ex: fiona::Executor) {
         let f1 = ex.spawn(wait_for(Duration::from_millis(300), 3));
         let f2 = ex.spawn(wait_for(Duration::from_millis(400), 4));
         let f3 = ex.spawn(wait_for(Duration::from_millis(100), 1));
@@ -818,8 +761,7 @@ fn await_futures_unordered()
 }
 
 #[test]
-fn await_local_waker_outlives()
-{
+fn await_local_waker_outlives() {
     let p = Rc::<RefCell<Option<LocalWaker>>>::new(RefCell::new(None));
     let q = Rc::<RefCell<Option<Waker>>>::new(RefCell::new(None));
 
@@ -831,12 +773,13 @@ fn await_local_waker_outlives()
             let p = p.clone();
             let q = q.clone();
             ex.spawn(async move {
-                  poll_fn(|cx| {
-                      *p.borrow_mut() = Some(cx.local_waker().clone());
-                      *q.borrow_mut() = Some(cx.waker().clone());
-                      Poll::Ready(())
-                  }).await;
-              });
+                poll_fn(|cx| {
+                    *p.borrow_mut() = Some(cx.local_waker().clone());
+                    *q.borrow_mut() = Some(cx.waker().clone());
+                    Poll::Ready(())
+                })
+                .await;
+            });
         }
 
         ioc.run();
@@ -851,12 +794,10 @@ fn await_local_waker_outlives()
 }
 
 #[test]
-fn await_futures_mpsc()
-{
+fn await_futures_mpsc() {
     let mut ioc = fiona::IoContext::new();
 
-    async fn receiver(mut rx: futures::channel::mpsc::Receiver<i32>)
-    {
+    async fn receiver(mut rx: futures::channel::mpsc::Receiver<i32>) {
         let before = Instant::now();
 
         let value = rx.next().await.unwrap();
@@ -867,8 +808,7 @@ fn await_futures_mpsc()
         assert_eq!(value, 1234);
     }
 
-    async fn sender(_ex: fiona::Executor, mut tx: futures::channel::mpsc::Sender<i32>)
-    {
+    async fn sender(_ex: fiona::Executor, mut tx: futures::channel::mpsc::Sender<i32>) {
         std::thread::sleep(Duration::from_millis(100));
         tx.send(1234).await.unwrap();
     }
@@ -895,23 +835,21 @@ fn await_futures_mpsc()
 }
 
 #[test]
-fn await_rayon_tasks()
-{
+fn await_rayon_tasks() {
     // Want to test that our IoContext can toss work onto a Rayon threadpool which
     // we then await on in bulk.
 
-    async fn fiona_task(thread_pool: Rc<rayon::ThreadPool>)
-    {
+    async fn fiona_task(thread_pool: Rc<rayon::ThreadPool>) {
         let mut tasks = FuturesUnordered::new();
         for _ in 0..64 {
             tasks.push(RayonFuture::new(thread_pool.clone(), || {
-                           let bytes = make_bytes(16 * 1024 * 1024);
-                           let mut h = DefaultHasher::new();
-                           for _ in 0..8 {
-                               h.write(&bytes);
-                           }
-                           h.finish()
-                       }));
+                let bytes = make_bytes(16 * 1024 * 1024);
+                let mut h = DefaultHasher::new();
+                for _ in 0..8 {
+                    h.write(&bytes);
+                }
+                h.finish()
+            }));
         }
 
         while let Some(h) = tasks.next().await {
@@ -919,9 +857,12 @@ fn await_rayon_tasks()
         }
     }
 
-    let thread_pool = Rc::new(rayon::ThreadPoolBuilder::new().num_threads(32)
-                                                             .build()
-                                                             .unwrap());
+    let thread_pool = Rc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(32)
+            .build()
+            .unwrap(),
+    );
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
@@ -930,30 +871,27 @@ fn await_rayon_tasks()
 }
 
 #[test]
-fn await_rayon_stress_test()
-{
-    async fn fiona_task(thread_pool: Rc<rayon::ThreadPool>)
-    {
+fn await_rayon_stress_test() {
+    async fn fiona_task(thread_pool: Rc<rayon::ThreadPool>) {
         let hash = RayonFuture::new(thread_pool.clone(), || {
-                       let bytes = make_bytes(64 * 1024);
-                       let mut h = DefaultHasher::new();
-                       h.write(&bytes);
-                       h.finish()
-                   }).await;
+            let bytes = make_bytes(64 * 1024);
+            let mut h = DefaultHasher::new();
+            h.write(&bytes);
+            h.finish()
+        })
+        .await;
 
         assert_eq!(hash, 18184493139860282385);
     }
 
-    async fn timer_task(ex: fiona::Executor)
-    {
+    async fn timer_task(ex: fiona::Executor) {
         let timer = fiona::time::Timer::new(ex);
         for _ in 0..50_000 {
             timer.wait(Duration::from_micros(10)).await.unwrap();
         }
     }
 
-    async fn async_main(ex: fiona::Executor, thread_pool: Rc<rayon::ThreadPool>)
-    {
+    async fn async_main(ex: fiona::Executor, thread_pool: Rc<rayon::ThreadPool>) {
         let mut tasks = FuturesUnordered::new();
         for _ in 0..100_000 {
             tasks.push(ex.spawn(fiona_task(thread_pool.clone())));
@@ -962,22 +900,24 @@ fn await_rayon_stress_test()
         while (tasks.next().await).is_some() {}
     }
 
-    let thread_pool = Rc::new(rayon::ThreadPoolBuilder::new().num_threads(32)
-                                                             .build()
-                                                             .unwrap());
+    let thread_pool = Rc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(32)
+            .build()
+            .unwrap(),
+    );
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
     ex.clone().spawn(timer_task(ex.clone()));
     ex.clone()
-      .spawn(async_main(ex.clone(), thread_pool.clone()));
+        .spawn(async_main(ex.clone(), thread_pool.clone()));
     let n = ioc.run();
     assert_eq!(n, 100_000 + 2);
 }
 
 #[test]
-fn await_double_wake()
-{
+fn await_double_wake() {
     // Because our runtime now uses an amortized wakeup mechanism (i.e eventfd write
     // or ring message), we need to test the case where the main thread running the
     // ring is preempted before it can set the atomic flag to true, which means that
@@ -986,19 +926,17 @@ fn await_double_wake()
     // queue one more time before blocking on io_uring_submit_and_wait(), after it's
     // set the atomic flag to true.
 
-    async fn timer_task()
-    {
+    async fn timer_task() {
         wait_for(Duration::from_micros(10), ()).await;
     }
 
-    async fn double_wake_task(ex: fiona::Executor)
-    {
+    async fn double_wake_task(ex: fiona::Executor) {
         for _ in 0..25_000 {
             let h1 = ex.clone().spawn(timer_task());
             let h2 = ex.clone().spawn(timer_task());
             let h3 = ex.clone().spawn(async {
-                                   yield_now(()).await;
-                               });
+                yield_now(()).await;
+            });
 
             h3.await;
             h2.await;

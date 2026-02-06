@@ -16,8 +16,7 @@ const CQ_ENTRIES: u32 = 32 * 1024;
 const NUM_OPS: u64 = 1_000_000;
 const NUM_THREADS: u64 = 10;
 
-fn make_ring() -> *mut io_uring
-{
+fn make_ring() -> *mut io_uring {
     let mut params = unsafe { std::mem::zeroed::<io_uring_params>() };
     params.sq_entries = SQ_ENTRIES;
     params.cq_entries = CQ_ENTRIES;
@@ -36,13 +35,11 @@ fn make_ring() -> *mut io_uring
     ring
 }
 
-unsafe fn submit_ring(ring: *mut io_uring)
-{
+unsafe fn submit_ring(ring: *mut io_uring) {
     let _r = unsafe { io_uring_submit_and_get_events(ring) };
 }
 
-unsafe fn get_sqe(ring: *mut io_uring) -> *mut io_uring_sqe
-{
+unsafe fn get_sqe(ring: *mut io_uring) -> *mut io_uring_sqe {
     let mut sqe = unsafe { io_uring_get_sqe(ring) };
     while sqe.is_null() {
         unsafe { submit_ring(ring) };
@@ -51,8 +48,7 @@ unsafe fn get_sqe(ring: *mut io_uring) -> *mut io_uring_sqe
     sqe
 }
 
-fn eventfd()
-{
+fn eventfd() {
     use std::os::fd::AsRawFd;
 
     let ring = make_ring();
@@ -69,16 +65,14 @@ fn eventfd()
     for _ in 0..NUM_THREADS {
         let tx = tx.clone();
         threads.push(std::thread::spawn(move || {
-                         let buf = &0x01_u64.to_ne_bytes();
-                         for _ in 0..NUM_OPS / NUM_THREADS {
-                             unsafe {
-                                 nix::libc::write(event_fd,
-                                                  buf.as_ptr().cast::<c_void>(),
-                                                  buf.len());
-                             }
-                             tx.send(1).unwrap();
-                         }
-                     }));
+            let buf = &0x01_u64.to_ne_bytes();
+            for _ in 0..NUM_OPS / NUM_THREADS {
+                unsafe {
+                    nix::libc::write(event_fd, buf.as_ptr().cast::<c_void>(), buf.len());
+                }
+                tx.send(1).unwrap();
+            }
+        }));
     }
 
     let start = Instant::now();
@@ -117,8 +111,7 @@ fn eventfd()
     }
 }
 
-fn ring_messaging()
-{
+fn ring_messaging() {
     let ring = make_ring();
 
     let mut n = 0;
@@ -128,12 +121,12 @@ fn ring_messaging()
     let mut threads = Vec::new();
     for _ in 0..NUM_THREADS {
         threads.push(std::thread::spawn(move || {
-                         for _ in 0..NUM_OPS / NUM_THREADS {
-                             let mut sqe = unsafe { std::mem::zeroed::<io_uring_sqe>() };
-                             unsafe { io_uring_prep_msg_ring(&mut sqe, ring_fd, 0x01, 0, 0) };
-                             unsafe { io_uring_register_sync_msg(&mut sqe) };
-                         }
-                     }));
+            for _ in 0..NUM_OPS / NUM_THREADS {
+                let mut sqe = unsafe { std::mem::zeroed::<io_uring_sqe>() };
+                unsafe { io_uring_prep_msg_ring(&mut sqe, ring_fd, 0x01, 0, 0) };
+                unsafe { io_uring_register_sync_msg(&mut sqe) };
+            }
+        }));
     }
 
     let start = Instant::now();
@@ -162,8 +155,7 @@ fn ring_messaging()
     }
 }
 
-fn main()
-{
+fn main() {
     eventfd();
     ring_messaging();
 }
