@@ -826,6 +826,7 @@ unsafe fn reserve_sqes(ex: &Executor, n: u32) {
 
 struct RunGuard {
     p: Rc<IoContextFrame>,
+    preserve_head_and_tail: bool,
 }
 
 struct CQESeenGuard<'a> {
@@ -862,12 +863,27 @@ impl Drop for IncrGuard<'_> {
     }
 }
 
-unsafe fn clear_task_list(p: &Rc<IoContextFrame>) {
+unsafe fn clear_task_list(p: &Rc<IoContextFrame>, preserve_head_and_tail: bool) {
     let mut curr = unsafe { p.head.unsafe_clone() };
+    if preserve_head_and_tail {
+        curr = unsafe { curr.get_next() };
+    }
+
     while unsafe { !curr.is_null() } {
+        let is_tail = unsafe { curr.get_inner() == p.tail.get_inner() };
+        if preserve_head_and_tail && is_tail {
+            break;
+        }
+
         let next = unsafe { curr.get_next() };
         drop(unsafe { Task::from_raw(*curr.0.get()) });
         curr = next;
+    }
+
+    if preserve_head_and_tail {
+        unsafe { p.head.set_next(&p.tail) };
+        unsafe { p.tail.set_prev(&p.head) };
+        return;
     }
 
     unsafe {
@@ -890,7 +906,7 @@ impl Drop for RunGuard {
                 drop(task);
             }
 
-            unsafe { clear_task_list(&self.p) };
+            unsafe { clear_task_list(&self.p, self.preserve_head_and_tail) };
         }
 
         let ring = (|| &raw mut *self.p.ioring.borrow_mut())();
@@ -925,6 +941,8 @@ impl Drop for RunGuard {
 
             unsafe { io_uring_get_events(ring) };
         }
+
+        blacklist.clear();
     }
 }
 
@@ -1065,7 +1083,10 @@ impl IoContext {
     }
 
     pub fn run(&mut self) -> u64 {
-        let _guard = RunGuard { p: self.p.clone() };
+        let _guard = RunGuard {
+            p: self.p.clone(),
+            preserve_head_and_tail: true,
+        };
 
         let mut num_completed = 0;
 
@@ -1654,7 +1675,10 @@ unsafe fn append_recv_buffers(
 
 impl Drop for IoContext {
     fn drop(&mut self) {
-        drop(RunGuard { p: self.p.clone() });
+        drop(RunGuard {
+            p: self.p.clone(),
+            preserve_head_and_tail: false,
+        });
 
         let buf_groups = &mut *self.p.buf_groups.borrow_mut();
         for (_, buf_group) in buf_groups.iter() {

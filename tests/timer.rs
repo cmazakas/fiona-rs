@@ -2,11 +2,14 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
+#![allow(clippy::redundant_closure_call)]
+
 extern crate rand;
 
 use std::{
     cell::RefCell,
     future::Future,
+    panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
     task::Poll,
     time::{Duration, Instant},
@@ -418,4 +421,57 @@ fn timer_random() {
 
     let n = ioc.run();
     assert_eq!(n, 10_000);
+}
+
+#[test]
+fn timer_double_run() {
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    for _ in 0..2 {
+        ex.spawn((async |ex: fiona::Executor| {
+            let timer = fiona::time::Timer::new(ex);
+            timer.wait(Duration::from_millis(100)).await.unwrap();
+        })(ex.clone()));
+    }
+
+    assert_eq!(ioc.run(), 2);
+
+    for _ in 0..2 {
+        ex.spawn((async |ex: fiona::Executor| {
+            let timer = fiona::time::Timer::new(ex);
+            timer.wait(Duration::from_millis(100)).await.unwrap();
+        })(ex.clone()));
+    }
+
+    assert_eq!(ioc.run(), 2);
+}
+
+#[test]
+fn timer_double_run_panic_reuse() {
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn((async |ex: fiona::Executor| {
+        let timer = fiona::time::Timer::new(ex);
+        timer.wait(Duration::from_millis(100)).await.unwrap();
+    })(ex.clone()));
+
+    ex.spawn(async { panic!() });
+
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            ioc.run();
+        }))
+        .is_err()
+    );
+
+    for _ in 0..2 {
+        ex.spawn((async |ex: fiona::Executor| {
+            let timer = fiona::time::Timer::new(ex);
+            timer.wait(Duration::from_millis(100)).await.unwrap();
+        })(ex.clone()));
+    }
+
+    assert_eq!(ioc.run(), 2);
 }

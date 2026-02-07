@@ -100,6 +100,44 @@ fn tcp_acceptor_hello_world() {
 }
 
 #[test]
+fn tcp_acceptor_hello_world_double_run() {
+    // Hello World example for TCP accept().
+
+    static mut NUM_RUNS: u64 = 0;
+
+    let mut ioc = fiona::IoContext::new();
+
+    for _ in 0..2 {
+        let ex = ioc.get_executor();
+
+        let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+        assert!(acceptor.port() != 0);
+
+        let port = acceptor.port();
+
+        ex.spawn(async move {
+            let _stream = acceptor.accept().await.unwrap();
+            unsafe { NUM_RUNS += 1 };
+        });
+
+        let client = fiona::tcp::Client::new(ex.clone());
+        ex.spawn(async move {
+            client
+                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            unsafe { NUM_RUNS += 1 };
+        });
+
+        let n = ioc.run();
+        assert_eq!(n, 2);
+    }
+
+    assert_eq!(unsafe { NUM_RUNS }, 4);
+}
+
+#[test]
 fn tcp_multiple_accepts() {
     // Test that we can accept and hold onto multiple TCP sockets at a time.
     // Also test that we can properly recycle fds as well with the runtime.
