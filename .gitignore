@@ -1,2 +1,8 @@
 /target
 /.cargo
+/tests/test_certs/ca.key
+/tests/test_certs/ca.crt
+/tests/test_certs/server.key
+/tests/test_certs/server.csr
+/tests/test_certs/server.crt
+/tests/test_certs/ca.srl
