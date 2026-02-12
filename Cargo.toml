@@ -8,23 +8,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-nix = { version = "0.31.1", features = ["event", "socket", "net"] }
-slotmap = { version = "1.1.1" }
 axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "4c288fe8bedb5e0c4e709ef1d05338dc9ddf318d" }
+nix = { version = "0.31.1", features = ["event", "socket", "net"] }
 rustls = "0.23.36"
 rustls-pki-types = "1.14.0"
-webpki-roots = "1.0.6"
+slotmap = { version = "1.1.1" }
 
 [features]
 sanitizers = ["axboe-liburing/sanitizers"]
 
 [dev-dependencies]
+blake2 = "0.10.6"
+clap = { version = "4.5.45", features = ["derive"] }
 futures = "0.3.31"
 rand = "0.9.2"
-tokio = { version = "1.49.0", features = ["full"] }
-clap = { version = "4.5.45", features = ["derive"] }
 rayon = "1.11.0"
-blake2 = "0.10.6"
+tokio = { version = "1.49.0", features = ["full"] }
+webpki-roots = "1.0.6"
 
 [profile.release-with-debug]
 inherits = "release"
