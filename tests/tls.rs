@@ -2,7 +2,10 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-use std::sync::Arc;
+use std::{
+    io::{Read, Write},
+    sync::Arc,
+};
 
 use rustls_pki_types::pem::PemObject;
 
@@ -66,12 +69,55 @@ fn tls_hello_world() {
         server_session.write_tls(&mut buf).unwrap();
     }
 
+    while client_session.is_handshaking() {
+        let n = client_session.read_tls(&mut &buf[..]).unwrap();
+        client_session.process_new_packets().unwrap();
+        buf.drain(0..n);
+        assert!(client_session.wants_read());
+    }
+    buf.clear();
+
+    while client_session.wants_write() {
+        client_session.write_tls(&mut buf).unwrap();
+    }
+
+    while server_session.is_handshaking() {
+        let n = server_session.read_tls(&mut &buf[..]).unwrap();
+        server_session.process_new_packets().unwrap();
+        buf.drain(0..n);
+    }
+    buf.clear();
+
+    // Post-handshake and we still TLS data to write.
+    assert!(server_session.wants_write());
+
+    // Leave this code commented out to test a unified write of pending ciphertext
+    // along with encrypted application data, set down below.
+
+    // while server_session.wants_write() {
+    //     assert!(server_session.write_tls(&mut buf).unwrap() > 0);
+    // }
+    // assert!(!server_session.wants_write());
+    // client_session.read_tls(&mut &buf[..]).unwrap();
+    // client_session.process_new_packets().unwrap();
+
+    assert!(client_session.wants_read());
+    assert!(!client_session.wants_write());
+    assert!(server_session.wants_read());
+
+    let client_msg = "I bestow the heads of virgins and the first-born sons!".as_bytes();
+    let server_msg = "...within these monuments of stone!".as_bytes();
+
+    client_session.writer().write_all(client_msg).unwrap();
+    server_session.writer().write_all(server_msg).unwrap();
+
+    buf.clear();
+    while server_session.wants_write() {
+        server_session.write_tls(&mut buf).unwrap();
+    }
+
     client_session.read_tls(&mut &buf[..]).unwrap();
     client_session.process_new_packets().unwrap();
-
-    assert!(!client_session.is_handshaking());
-    assert!(client_session.wants_write());
-    assert!(client_session.wants_read());
 
     buf.clear();
     while client_session.wants_write() {
@@ -80,6 +126,21 @@ fn tls_hello_world() {
 
     server_session.read_tls(&mut &buf[..]).unwrap();
     server_session.process_new_packets().unwrap();
+    buf.clear();
 
-    assert!(!server_session.is_handshaking());
+    if let Err(err) = server_session.reader().read_to_end(&mut buf) {
+        assert!(err.kind() == std::io::ErrorKind::WouldBlock);
+    } else {
+        unreachable!()
+    };
+
+    assert_eq!(buf, client_msg);
+
+    buf.clear();
+    if let Err(err) = client_session.reader().read_to_end(&mut buf) {
+        assert!(err.kind() == std::io::ErrorKind::WouldBlock);
+    } else {
+        unreachable!()
+    };
+    assert_eq!(buf, server_msg);
 }
