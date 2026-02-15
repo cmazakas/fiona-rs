@@ -88,11 +88,14 @@ fn tls_hello_world() {
     }
     buf.clear();
 
+    assert_eq!(client_session.protocol_version().unwrap(), rustls::ProtocolVersion::TLSv1_3);
+    assert_eq!(server_session.protocol_version().unwrap(), rustls::ProtocolVersion::TLSv1_3);
+
     // Post-handshake and we still TLS data to write.
     assert!(server_session.wants_write());
 
-    // Leave this code commented out to test a unified write of pending ciphertext
-    // along with encrypted application data, set down below.
+    // Leave this code commented out to test a unified write of pending handshake
+    // data along with encrypted application data, set down below.
 
     // while server_session.wants_write() {
     //     assert!(server_session.write_tls(&mut buf).unwrap() > 0);
@@ -126,14 +129,13 @@ fn tls_hello_world() {
 
     server_session.read_tls(&mut &buf[..]).unwrap();
     server_session.process_new_packets().unwrap();
-    buf.clear();
 
+    buf.clear();
     if let Err(err) = server_session.reader().read_to_end(&mut buf) {
         assert!(err.kind() == std::io::ErrorKind::WouldBlock);
     } else {
         unreachable!()
     };
-
     assert_eq!(buf, client_msg);
 
     buf.clear();
@@ -143,4 +145,29 @@ fn tls_hello_world() {
         unreachable!()
     };
     assert_eq!(buf, server_msg);
+
+    buf.clear();
+    client_session.send_close_notify();
+    while client_session.wants_write() {
+        client_session.write_tls(&mut buf).unwrap();
+    }
+
+    server_session.read_tls(&mut &buf[..]).unwrap();
+    let state = server_session.process_new_packets().unwrap();
+    assert!(state.peer_has_closed());
+
+    buf.clear();
+    server_session.send_close_notify();
+    while server_session.wants_write() {
+        server_session.write_tls(&mut buf).unwrap();
+    }
+
+    client_session.read_tls(&mut &buf[..]).unwrap();
+    client_session.process_new_packets().unwrap();
+
+    assert!(!client_session.wants_read());
+    assert!(!client_session.wants_write());
+
+    assert!(!server_session.wants_read());
+    assert!(!server_session.wants_write());
 }
