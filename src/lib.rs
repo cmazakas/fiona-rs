@@ -658,6 +658,23 @@ struct IoContextFrame {
     tail: DanglingTask,
 }
 
+impl Drop for IoContextFrame {
+    fn drop(&mut self) {
+        let buf_groups = &mut *self.buf_groups.borrow_mut();
+        for (_, buf_group) in buf_groups.iter() {
+            unsafe { (*buf_group.get()).release() };
+        }
+        buf_groups.clear();
+
+        unsafe { io_uring_queue_exit(&raw mut *self.ioring.borrow_mut()) };
+
+        let n = self.io_ops.borrow().len();
+        if n > 0 {
+            eprintln!("IO operation leak detected. {n} ops leaked.");
+        }
+    }
+}
+
 //-----------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -873,7 +890,7 @@ unsafe fn clear_task_list(p: &Rc<IoContextFrame>, preserve_head_and_tail: bool) 
         }
 
         let next = unsafe { curr.get_next() };
-        drop(unsafe { Task::from_raw(*curr.0.get()) });
+        drop(unsafe { Task::from_raw(curr.get_inner()) });
         curr = next;
     }
 
@@ -1015,10 +1032,6 @@ impl IoContext {
     #[must_use]
     pub fn get_executor(&self) -> Executor {
         Executor { p: self.p.clone() }
-    }
-
-    fn ring(&self) -> *mut io_uring {
-        &raw mut *self.p.ioring.borrow_mut()
     }
 
     fn process_task_queues(&mut self, num_completed: &mut u64) -> bool {
@@ -1677,19 +1690,6 @@ impl Drop for IoContext {
             p: self.p.clone(),
             preserve_head_and_tail: false,
         });
-
-        let buf_groups = &mut *self.p.buf_groups.borrow_mut();
-        for (_, buf_group) in buf_groups.iter() {
-            unsafe { (*buf_group.get()).release() };
-        }
-        buf_groups.clear();
-
-        unsafe { io_uring_queue_exit(self.ring()) };
-
-        let n = self.p.io_ops.borrow().len();
-        if n > 0 {
-            eprintln!("IO operation leak detected. {n} ops leaked.");
-        }
     }
 }
 
@@ -1918,6 +1918,8 @@ impl Executor {
     }
 
     pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> JoinHandle<T> {
+        assert!(unsafe { !self.p.head.get_inner().is_null() });
+
         let task = self.spawn_impl_helper(f);
 
         let header = task.task_header();

@@ -1,1 +1,2 @@
 leak:timer_forget_expired
+leak:tcp_io_object_outlives_io_context

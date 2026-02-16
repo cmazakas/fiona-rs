@@ -41,6 +41,45 @@ impl Future for WakerFuture {
 }
 
 #[test]
+fn tcp_io_object_outlives_io_context() {
+    // Test that it's sound for an I/O object to outlive its backing IoContext.
+
+    let ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+    let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex, Ipv4Addr::LOCALHOST, 0).unwrap();
+
+    drop(ioc);
+
+    assert_ne!(acceptor.port(), 0);
+    let ex = acceptor.get_executor();
+
+    let params = ex.get_params();
+    assert!(params.sq_entries > 0);
+
+    ex.register_buf_group(1234, 256, 1024).unwrap();
+
+    // Creating this Future itself shouldn't leak but invoking the Future via poll()
+    // should. This is because we create an actual I/O operation and emplace an SQE
+    // in the submission queue. Because we no longer create an internal RunGuard,
+    // there's nothing to clean up the queues so we're left with a leak because we
+    // never release the operation via release_op().
+    let mut fut = acceptor.accept();
+    let noop_waker = std::task::Waker::noop();
+    let mut ctx = std::task::Context::from_waker(noop_waker);
+    assert!(std::pin::pin!(&mut fut).poll(&mut ctx).is_pending());
+    assert!(std::pin::pin!(&mut fut).poll(&mut ctx).is_pending());
+
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let string = String::from("hello, world!");
+        ex.spawn(async move {
+            assert_eq!(string, "hello, world!");
+        });
+    }));
+
+    assert!(r.is_err());
+}
+
+#[test]
 fn tcp_acceptor_eager_drop() {
     // Test eager-dropping an AcceptFuture that has only been initiated.
 
