@@ -650,7 +650,6 @@ struct IoContextFrame {
     receiver: RefCell<Receiver<Weak>>,
     sender: RefCell<Sender<Weak>>,
     buf_groups: RefCell<HashMap<u16, Box<UnsafeCell<BufGroup>>>>,
-    runguard_blacklist: RefCell<HashSet<u64>>,
     local_task_queue: RefCell<VecDeque<Weak>>,
     io_ops: RefCell<IoOpsMap>,
     needs_wake: Arc<AlignedAtomicBool>,
@@ -909,6 +908,40 @@ unsafe fn clear_task_list(p: &Rc<IoContextFrame>, preserve_head_and_tail: bool) 
     }
 }
 
+unsafe fn clear_completion_queue(io_ops: &RefCell<IoOpsMap>, ring: *mut io_uring) {
+    let mut blacklist = HashSet::<u64>::new();
+
+    unsafe { submit_ring(ring) };
+    unsafe { io_uring_get_events(ring) };
+
+    let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
+    while unsafe { io_uring_peek_cqe(ring, &raw mut cqe) } == 0 {
+        let cqe = unsafe { &mut *cqe };
+        let user_data = cqe.user_data;
+
+        {
+            let _g = CQESeenGuard { ring, cqe };
+
+            if user_data != 0 && user_data != 1 {
+                if blacklist.contains(&user_data) {
+                    continue;
+                }
+
+                blacklist.insert(user_data);
+
+                let key = DefaultKey::from(KeyData::from_ffi(user_data));
+
+                let op = io_ops.borrow_mut().remove(key).unwrap();
+
+                let rc = op.ref_count;
+                unsafe { release_op(rc) };
+            }
+        }
+
+        unsafe { io_uring_get_events(ring) };
+    }
+}
+
 impl Drop for RunGuard {
     #![allow(clippy::redundant_closure_call)]
     fn drop(&mut self) {
@@ -924,39 +957,7 @@ impl Drop for RunGuard {
         }
 
         let ring = (|| &raw mut *self.p.ioring.borrow_mut())();
-        unsafe { submit_ring(ring) };
-        unsafe { io_uring_get_events(ring) };
-
-        let blacklist = &mut *self.p.runguard_blacklist.borrow_mut();
-
-        let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
-        while unsafe { io_uring_peek_cqe(ring, &raw mut cqe) } == 0 {
-            let cqe = unsafe { &mut *cqe };
-            let user_data = cqe.user_data;
-
-            {
-                let _g = CQESeenGuard { ring, cqe };
-
-                if user_data != 0 && user_data != 1 {
-                    if blacklist.contains(&user_data) {
-                        continue;
-                    }
-
-                    blacklist.insert(user_data);
-
-                    let key = DefaultKey::from(KeyData::from_ffi(user_data));
-
-                    let op = self.p.io_ops.borrow_mut().remove(key).unwrap();
-
-                    let rc = op.ref_count;
-                    unsafe { release_op(rc) };
-                }
-            }
-
-            unsafe { io_uring_get_events(ring) };
-        }
-
-        blacklist.clear();
+        unsafe { clear_completion_queue(&self.p.io_ops, ring) };
     }
 }
 
@@ -965,7 +966,7 @@ impl IoContext {
     pub fn new() -> Self {
         let sq_entries = 256;
         let cq_entries = 4 * 1024;
-        let nr_files = 1024; // matches the default for Linux processes
+        let nr_files = 1024; // Matches the default for Linux processes.
 
         let params = IoContextParams {
             sq_entries,
@@ -1002,7 +1003,6 @@ impl IoContext {
             sender: RefCell::new(tx),
             ioring: RefCell::new(ioring),
             buf_groups: RefCell::new(HashMap::new()),
-            runguard_blacklist: RefCell::new(HashSet::new()),
             local_task_queue: RefCell::new(VecDeque::new()),
             io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
             needs_wake: Arc::new(AlignedAtomicBool(AtomicBool::new(true))),
@@ -1190,10 +1190,10 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler {
         OpType::Timeout { .. } => on_timeout,
         OpType::TimeoutCancel => todo!(),
         OpType::MultishotTimeout { .. } => on_timeout_multishot,
-        OpType::MultishotTcpAccept { .. } => on_multishot_tcp_accept,
+        OpType::MultishotTcpAccept { .. } => on_tcp_accept_multishot,
         OpType::TcpConnect { .. } => on_tcp_connect,
         OpType::TcpSend { .. } => on_tcp_send,
-        OpType::MultishotTcpRecv { .. } => on_multishot_tcp_recv,
+        OpType::MultishotTcpRecv { .. } => on_tcp_recv_multishot,
         OpType::TcpShutdown | OpType::TcpClose | OpType::TcpCancel => on_tcp_close,
         OpType::DropCancel => on_drop_cancel,
     }
@@ -1224,7 +1224,7 @@ fn on_timeout(ex: &Executor, cqe: &mut io_uring_cqe) {
     }
 }
 
-fn on_multishot_tcp_accept(ex: &Executor, cqe: &mut io_uring_cqe) {
+fn on_tcp_accept_multishot(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut stream = None;
     if cqe.res >= 0 {
         stream = Some(Stream::new(ex.clone(), cqe.res));
@@ -1507,7 +1507,7 @@ fn on_tcp_close(ex: &Executor, cqe: &mut io_uring_cqe) {
     }
 }
 
-fn on_multishot_tcp_recv(ex: &Executor, cqe: &mut io_uring_cqe) {
+fn on_tcp_recv_multishot(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
 
