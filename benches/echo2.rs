@@ -32,8 +32,8 @@ use tokio::{
 };
 
 const BUF_SIZE: usize = 1024 * 1024;
-const RECV_BUF_SIZE: usize = 64 * 1024;
-const SEND_BUF_SIZE: usize = 256 * 1024;
+const RECV_BUF_SIZE: usize = 8 * 1024;
+const SEND_BUF_SIZE: usize = 16 * 1024;
 const NUM_BUFS: u32 = 16 * 1024;
 const CQ_ENTRIES: u32 = 64 * 1024;
 const SEED: u64 = 1234;
