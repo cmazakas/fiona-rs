@@ -938,6 +938,11 @@ impl Client {
         let stream = self.as_stream();
         stream.recv().await
     }
+
+    pub async fn close(&self) -> Result<()> {
+        let stream = self.as_stream();
+        stream.close().await
+    }
 }
 
 impl Clone for Client {

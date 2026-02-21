@@ -6,6 +6,7 @@
 
 use core::str;
 use std::{
+    cell::RefCell,
     future::Future,
     net::{Ipv4Addr, Ipv6Addr},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -38,45 +39,6 @@ impl Future for WakerFuture {
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         Poll::Ready(cx.waker().clone())
     }
-}
-
-#[test]
-fn tcp_io_object_outlives_io_context() {
-    // Test that it's sound for an I/O object to outlive its backing IoContext.
-
-    let ioc = fiona::IoContext::new();
-    let ex = ioc.get_executor();
-    let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex, Ipv4Addr::LOCALHOST, 0).unwrap();
-
-    drop(ioc);
-
-    assert_ne!(acceptor.port(), 0);
-    let ex = acceptor.get_executor();
-
-    let params = ex.get_params();
-    assert!(params.sq_entries > 0);
-
-    ex.register_buf_group(1234, 256, 1024).unwrap();
-
-    // Creating this Future itself shouldn't leak but invoking the Future via poll()
-    // should. This is because we create an actual I/O operation and emplace an SQE
-    // in the submission queue. Because we no longer create an internal RunGuard,
-    // there's nothing to clean up the queues so we're left with a leak because we
-    // never release the operation via release_op().
-    let mut fut = acceptor.accept();
-    let noop_waker = std::task::Waker::noop();
-    let mut ctx = std::task::Context::from_waker(noop_waker);
-    assert!(std::pin::pin!(&mut fut).poll(&mut ctx).is_pending());
-    assert!(std::pin::pin!(&mut fut).poll(&mut ctx).is_pending());
-
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        let string = String::from("hello, world!");
-        ex.spawn(async move {
-            assert_eq!(string, "hello, world!");
-        });
-    }));
-
-    assert!(r.is_err());
 }
 
 #[test]
@@ -1955,4 +1917,138 @@ fn tcp_ephemeral_port_exhaustion_panic() {
     }
 
     assert!(num_errs > 0);
+}
+
+#[test]
+fn tcp_acceptor_outlives_io_context() {
+    // Test that it's sound for an I/O object to outlive its backing IoContext.
+
+    let ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+    let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex, Ipv4Addr::LOCALHOST, 0).unwrap();
+
+    drop(ioc);
+
+    assert_ne!(acceptor.port(), 0);
+    let ex = acceptor.get_executor();
+
+    let params = ex.get_params();
+    assert!(params.sq_entries > 0);
+
+    ex.register_buf_group(1234, 256, 1024).unwrap();
+
+    // Creating this Future itself shouldn't leak but invoking the Future via poll()
+    // should. This is because we create an actual I/O operation and emplace an SQE
+    // in the submission queue. Because we no longer create an internal RunGuard,
+    // there's nothing to clean up the queues so we're left with a leak because we
+    // never release the operation via release_op().
+    let mut fut = acceptor.accept();
+    let noop_waker = std::task::Waker::noop();
+    let mut ctx = std::task::Context::from_waker(noop_waker);
+    assert!(std::pin::pin!(&mut fut).poll(&mut ctx).is_pending());
+    assert!(std::pin::pin!(&mut fut).poll(&mut ctx).is_pending());
+
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let string = String::from("hello, world!");
+        ex.spawn(async move {
+            assert_eq!(string, "hello, world!");
+        });
+    }));
+
+    assert!(r.is_err());
+}
+
+#[test]
+fn tcp_sockets_outlive_io_context() {
+    // Test that it's sound for a connected pair of sockets to outlive the backing
+    // I/O context.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    let bgid = 0;
+    let num_bufs = 128;
+    let buf_len = 8;
+    ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
+
+    let client_stream = Rc::new(RefCell::new(None));
+    let server_stream = Rc::new(RefCell::new(None));
+
+    async fn server(
+        acceptor: fiona::tcp::Acceptor, bgid: u16,
+        server_stream: Rc<RefCell<Option<fiona::tcp::Stream>>>,
+    ) {
+        let stream = acceptor.accept().await.unwrap();
+        stream.set_buf_group(bgid);
+
+        *server_stream.borrow_mut() = Some(stream);
+    }
+
+    async fn client(
+        ex: fiona::Executor, port: u16, bgid: u16,
+        client_stream: Rc<RefCell<Option<fiona::tcp::Client>>>,
+    ) {
+        let client = fiona::tcp::Client::new(ex);
+
+        client
+            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        client.set_buf_group(bgid);
+
+        *client_stream.borrow_mut() = Some(client);
+    }
+
+    ex.clone()
+        .spawn(server(acceptor, bgid, server_stream.clone()));
+
+    ex.clone()
+        .spawn(client(ex, port, bgid, client_stream.clone()));
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+
+    drop(ioc);
+
+    let server = server_stream.borrow_mut().take().unwrap();
+    let client = client_stream.borrow_mut().take().unwrap();
+
+    let mut send1 = server.send(vec![0, 1, 2, 3]);
+    let mut send2 = client.send(vec![3, 2, 1, 0]);
+
+    let mut recv1 = server.recv();
+    let mut recv2 = client.recv();
+
+    let mut close1 = server.close();
+    let mut close2 = client.close();
+
+    let noop_waker = std::task::Waker::noop();
+    let mut ctx = std::task::Context::from_waker(noop_waker);
+
+    // Turns out that our SendFuture is Unpin but our async fn wrapper for the
+    // client isn't.
+    assert!(std::pin::pin!(&mut send1).poll(&mut ctx).is_pending());
+    assert!(unsafe {
+        std::pin::Pin::new_unchecked(&mut send2)
+            .poll(&mut ctx)
+            .is_pending()
+    });
+
+    assert!(std::pin::pin!(&mut recv1).poll(&mut ctx).is_pending());
+    assert!(unsafe {
+        std::pin::Pin::new_unchecked(&mut recv2)
+            .poll(&mut ctx)
+            .is_pending()
+    });
+
+    assert!(std::pin::pin!(&mut close1).poll(&mut ctx).is_pending());
+    assert!(unsafe {
+        std::pin::Pin::new_unchecked(&mut close2)
+            .poll(&mut ctx)
+            .is_pending()
+    });
 }
