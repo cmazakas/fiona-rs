@@ -2,8 +2,11 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
+#![allow(clippy::redundant_closure_call)]
+
 use std::{
     io::{Read, Write},
+    net::Ipv6Addr,
     sync::Arc,
 };
 
@@ -13,39 +16,47 @@ use rustls_pki_types::pem::PemObject;
 //     x.iter().map(|b| format!("{:02x}", b)).collect()
 // }
 
-#[test]
-fn tls_hello_world() {
-    let cert =
-        rustls_pki_types::CertificateDer::from_pem_file("tests/test_certs/server.crt").unwrap();
+const SERVER_CA: &str = "tests/test_certs/ca.crt";
+const SERVER_CERT: &str = "tests/test_certs/server.crt";
+const SERVER_PRIVATE_KEY: &str = "tests/test_certs/server.key";
 
-    let cert_key =
-        rustls_pki_types::PrivateKeyDer::from_pem_file("tests/test_certs/server.key").unwrap();
+fn make_server_config() -> Arc<rustls::ServerConfig> {
+    let cert = rustls_pki_types::CertificateDer::from_pem_file(SERVER_CERT).unwrap();
+    let cert_key = rustls_pki_types::PrivateKeyDer::from_pem_file(SERVER_PRIVATE_KEY).unwrap();
 
-    let server_tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], cert_key)
-        .unwrap();
+    Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], cert_key)
+            .unwrap(),
+    )
+}
 
-    let mut server_session = rustls::ServerConnection::new(Arc::new(server_tls_config)).unwrap();
-    assert!(server_session.is_handshaking());
-    assert!(server_session.wants_read());
-    assert!(!server_session.wants_write());
-
+fn make_client_config() -> Arc<rustls::ClientConfig> {
     let mut cert_store = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
 
-    let root_ca =
-        rustls_pki_types::CertificateDer::from_pem_file("tests/test_certs/ca.crt").unwrap();
+    let root_ca = rustls_pki_types::CertificateDer::from_pem_file(SERVER_CA).unwrap();
 
     cert_store.add(root_ca).unwrap();
 
-    let client_tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(Arc::new(cert_store))
-        .with_no_client_auth();
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(Arc::new(cert_store))
+            .with_no_client_auth(),
+    )
+}
+
+#[test]
+fn tls_hello_world() {
+    let mut server_session = rustls::ServerConnection::new(make_server_config()).unwrap();
+    assert!(server_session.is_handshaking());
+    assert!(server_session.wants_read());
+    assert!(!server_session.wants_write());
 
     let mut client_session = rustls::ClientConnection::new(
-        Arc::new(client_tls_config),
+        make_client_config(),
         rustls_pki_types::ServerName::try_from("localhost").unwrap(),
     )
     .unwrap();
@@ -91,7 +102,7 @@ fn tls_hello_world() {
     assert_eq!(client_session.protocol_version().unwrap(), rustls::ProtocolVersion::TLSv1_3);
     assert_eq!(server_session.protocol_version().unwrap(), rustls::ProtocolVersion::TLSv1_3);
 
-    // Post-handshake and we still TLS data to write.
+    // Post-handshake and we still have TLS data to write.
     assert!(server_session.wants_write());
 
     // Leave this code commented out to test a unified write of pending handshake
@@ -170,4 +181,44 @@ fn tls_hello_world() {
 
     assert!(!server_session.wants_read());
     assert!(!server_session.wants_write());
+}
+
+#[test]
+fn tls_handshake() {
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+    let acceptor = fiona::tcp::Acceptor::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.register_buf_group(1234, 1024, 256).unwrap();
+    ex.register_buf_group(4321, 1024, 256).unwrap();
+
+    ex.spawn((async |acceptor: fiona::tcp::Acceptor| {
+        let stream = acceptor.accept().await.unwrap();
+        stream.set_buf_group(1234);
+
+        let tls_stream = fiona::tls::server_handshake(stream, make_server_config()).await;
+        let _tls_stream = tls_stream.unwrap();
+    })(acceptor));
+
+    ex.spawn((async |ex: fiona::Executor, port: u16| {
+        let client = fiona::tcp::Client::new(ex);
+        client
+            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        client.set_buf_group(4321);
+
+        let tls_client = fiona::tls::client_handshake(
+            client,
+            make_client_config(),
+            "localhost".try_into().unwrap(),
+        )
+        .await;
+        let _tls_client = tls_client;
+    })(ex.clone(), port));
+
+    assert_eq!(ioc.run(), 2);
 }

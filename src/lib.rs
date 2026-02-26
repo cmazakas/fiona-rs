@@ -70,6 +70,7 @@ use liburing_rs::{
 
 pub mod tcp;
 pub mod time;
+pub mod tls;
 
 use slotmap::{DefaultKey, KeyData};
 use tcp::StreamImpl;
