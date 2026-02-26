@@ -1736,7 +1736,6 @@ fn tcp_reuse_port_ipv6() {
 }
 
 #[test]
-#[allow(clippy::redundant_closure_call)]
 fn tcp_acceptor_cancel() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
@@ -1758,7 +1757,6 @@ fn tcp_acceptor_cancel() {
 }
 
 #[test]
-#[allow(clippy::redundant_closure_call)]
 fn tcp_acceptor_close() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
@@ -1785,7 +1783,6 @@ fn tcp_acceptor_close() {
 }
 
 #[test]
-#[allow(clippy::redundant_closure_call)]
 fn tcp_send_subspan() {
     let mut ioc = fiona::IoContext::new();
 
