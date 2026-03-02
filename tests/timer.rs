@@ -475,3 +475,24 @@ fn timer_double_run_panic_reuse() {
 
     assert_eq!(ioc.run(), 2);
 }
+
+#[test]
+fn timer_relocate_future() {
+    // Test that our Futures are safe to relocate before we eventually .await them.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.clone().spawn(async move {
+        let timer = fiona::time::Timer::new(ex.clone());
+        let f = timer.wait(Duration::from_millis(100));
+        let original_address = &raw const f;
+
+        let f2 = f;
+        assert_ne!(&raw const f2, original_address);
+
+        f2.await.unwrap();
+    });
+
+    assert_eq!(ioc.run(), 1);
+}
