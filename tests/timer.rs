@@ -10,6 +10,7 @@ use std::{
     cell::RefCell,
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
     rc::Rc,
     task::Poll,
     time::{Duration, Instant},
@@ -129,7 +130,7 @@ fn timer_early_drop() {
             {
                 let w = WakerFuture.await;
                 assert!(
-                    std::pin::pin!(&mut f)
+                    unsafe { Pin::new_unchecked(&mut f) }
                         .poll(&mut std::task::Context::from_waker(&w))
                         .is_pending()
                 );
@@ -177,15 +178,14 @@ fn timer_shared_panic() {
 #[inline(never)]
 #[should_panic = "assertion failed: !timer_impl.timeout_pending"]
 fn timer_forget_expired() {
-    // this function must be marked inline(never) because if its name disappears,
-    // it's cumbersome to ignore it in an lsan suppression file
-    // preventing it from being inlined ensures that its name is always visible for
-    // the purposes of suppression and matching
+    // This function must be marked inline(never) because if its name disappears,
+    // it's cumbersome to ignore it in an lsan suppression file preventing it from
+    // being inlined ensures that its name is always visible for the purposes of
+    // suppression and matching.
 
-    // because we allocate operation state per Future, if we forget()
-    // a timer future, we should only get a spurious poll() (which is sound)
-    // and then a memory leak
-    // the io object should be still be usable without issue
+    // Because we allocate operation state per Future, if we forget() a timer
+    // future, we should only get a spurious poll() (which is sound) and then a
+    // memory leak the io object should be still be usable without issue.
 
     static mut NUM_RUNS: u64 = 0;
 
@@ -195,7 +195,7 @@ fn timer_forget_expired() {
         {
             let w = WakerFuture.await;
             assert!(
-                std::pin::pin!(&mut f)
+                unsafe { Pin::new_unchecked(&mut f) }
                     .poll(&mut std::task::Context::from_waker(&w))
                     .is_pending()
             );
@@ -245,19 +245,19 @@ fn timer_multiple_eager_drops() {
 
         {
             let mut f = timer.wait(dur);
-            assert!(std::pin::pin!(&mut f).poll(&mut cx).is_pending());
+            assert!(unsafe { Pin::new_unchecked(&mut f).poll(&mut cx).is_pending() });
             drop(f);
         }
 
         {
             let mut f = timer.wait(dur);
-            assert!(std::pin::pin!(&mut f).poll(&mut cx).is_pending());
+            assert!(unsafe { Pin::new_unchecked(&mut f).poll(&mut cx).is_pending() });
             drop(f);
         }
 
         {
             let mut f = timer.wait(dur);
-            assert!(std::pin::pin!(&mut f).poll(&mut cx).is_pending());
+            assert!(unsafe { Pin::new_unchecked(&mut f).poll(&mut cx).is_pending() });
             drop(f);
         }
 
