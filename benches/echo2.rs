@@ -300,12 +300,13 @@ fn fiona_echo_client(
 
             let mut h = blake2::Blake2b512::new();
 
-            let client = fiona::tcp::Client::new(ex2);
-            client.set_buf_group(CLIENT_BGID);
-            client.set_timeout(Duration::from_secs(120));
-            client.connect_ipv4(ipv4_addr, port).await.unwrap();
+            let stream = fiona::tcp::ClientBuilder::new(ex2)
+                .connect_ipv4(ipv4_addr, port)
+                .await
+                .unwrap();
 
-            let stream = client.as_stream();
+            stream.set_buf_group(CLIENT_BGID);
+            stream.set_timeout(Duration::from_secs(120));
 
             fiona_send(stream.clone(), bytes.clone()).await;
             fiona_recv(&mut h, stream.clone()).await;
@@ -315,7 +316,6 @@ fn fiona_echo_client(
 
             fiona_close(stream.clone()).await;
             drop(stream);
-            drop(client);
 
             unsafe { DURATION = DURATION.checked_add(start.elapsed()).unwrap() };
             unsafe {
