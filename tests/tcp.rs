@@ -57,7 +57,7 @@ fn tcp_acceptor_eager_drop() {
 
             let w = WakerFuture.await;
             assert!(
-                unsafe { std::pin::Pin::new_unchecked(&mut f) }
+                Pin::new(&mut f)
                     .poll(&mut std::task::Context::from_waker(&w))
                     .is_pending()
             );
@@ -1013,7 +1013,7 @@ fn tcp_select_drop_ready_recv_future() {
 
         let mut recv_future = stream.recv();
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        let r = unsafe { Pin::new_unchecked(&mut recv_future).poll(&mut cx) };
+        let r = Pin::new(&mut recv_future).poll(&mut cx);
         assert!(r.is_pending());
 
         let mut timers = Vec::<fiona::time::Timer>::new();
@@ -1032,7 +1032,7 @@ fn tcp_select_drop_ready_recv_future() {
         }
 
         for timeout in &mut timeouts {
-            let r = unsafe { Pin::new_unchecked(timeout).poll(&mut cx) };
+            let r = Pin::new(timeout).poll(&mut cx);
             assert!(r.is_pending());
         }
 
@@ -1040,7 +1040,7 @@ fn tcp_select_drop_ready_recv_future() {
         drop(stream);
 
         for timeout in &mut timeouts {
-            unsafe { Pin::new_unchecked(timeout).await.unwrap() };
+            Pin::new(timeout).await.unwrap();
         }
 
         timer.wait(Duration::from_millis(100)).await.unwrap();
@@ -1135,7 +1135,7 @@ fn tcp_close_eager_drop() {
     async fn server(acceptor: fiona::tcp::Acceptor) {
         let stream = acceptor.accept().await.unwrap();
         let mut f = stream.close();
-        assert!(futures::poll!(unsafe { Pin::new_unchecked(&mut f) }).is_pending());
+        assert!(futures::poll!(&mut f).is_pending());
 
         drop(f);
 
@@ -1244,7 +1244,7 @@ fn tcp_shutdown_eager_drop() {
         let stream = acceptor.accept().await.unwrap();
 
         let mut f = stream.shutdown(SHUT_RDWR);
-        assert!(futures::poll!(unsafe { Pin::new_unchecked(&mut f) }).is_pending());
+        assert!(futures::poll!(&mut f).is_pending());
 
         drop(f);
 
@@ -1374,7 +1374,7 @@ fn tcp_eager_drop_send_ready() {
         timer.wait(Duration::from_millis(10)).await.unwrap();
 
         let mut f = stream.send(vec![0, 1, 2, 3, 4]);
-        assert!(futures::poll!(unsafe { Pin::new_unchecked(&mut f) }).is_pending());
+        assert!(futures::poll!(&mut f).is_pending());
         drop(f);
 
         timer.wait(Duration::from_millis(150)).await.unwrap();
@@ -1432,11 +1432,7 @@ fn tcp_eager_drop_connect_ready() {
         let w = WakerFuture.await;
         let mut cx = std::task::Context::from_waker(&w);
 
-        assert!(
-            unsafe { std::pin::Pin::new_unchecked(&mut connect_future) }
-                .poll(&mut cx)
-                .is_pending()
-        );
+        assert!(Pin::new(&mut connect_future).poll(&mut cx).is_pending());
 
         let timer = fiona::time::Timer::new(ex.clone());
         timer.wait(Duration::from_millis(250)).await.unwrap();
@@ -1851,16 +1847,8 @@ fn tcp_acceptor_outlives_io_context() {
     let mut fut = acceptor.accept();
     let noop_waker = std::task::Waker::noop();
     let mut ctx = std::task::Context::from_waker(noop_waker);
-    assert!(unsafe {
-        std::pin::Pin::new_unchecked(&mut fut)
-            .poll(&mut ctx)
-            .is_pending()
-    });
-    assert!(unsafe {
-        std::pin::Pin::new_unchecked(&mut fut)
-            .poll(&mut ctx)
-            .is_pending()
-    });
+    assert!(Pin::new(&mut fut).poll(&mut ctx).is_pending());
+    assert!(Pin::new(&mut fut).poll(&mut ctx).is_pending());
 
     let r = catch_unwind(AssertUnwindSafe(|| {
         let string = String::from("hello, world!");
@@ -1941,12 +1929,12 @@ fn tcp_sockets_outlive_io_context() {
     let noop_waker = std::task::Waker::noop();
     let mut ctx = std::task::Context::from_waker(noop_waker);
 
-    assert!(unsafe { Pin::new_unchecked(&mut send1).poll(&mut ctx).is_pending() });
-    assert!(unsafe { Pin::new_unchecked(&mut send2).poll(&mut ctx).is_pending() });
+    assert!(Pin::new(&mut send1).poll(&mut ctx).is_pending());
+    assert!(Pin::new(&mut send2).poll(&mut ctx).is_pending());
 
-    assert!(unsafe { Pin::new_unchecked(&mut recv1).poll(&mut ctx).is_pending() });
-    assert!(unsafe { Pin::new_unchecked(&mut recv2).poll(&mut ctx).is_pending() });
+    assert!(Pin::new(&mut recv1).poll(&mut ctx).is_pending());
+    assert!(Pin::new(&mut recv2).poll(&mut ctx).is_pending());
 
-    assert!(unsafe { Pin::new_unchecked(&mut close1).poll(&mut ctx).is_pending() });
-    assert!(unsafe { Pin::new_unchecked(&mut close2).poll(&mut ctx).is_pending() });
+    assert!(Pin::new(&mut close1).poll(&mut ctx).is_pending());
+    assert!(Pin::new(&mut close2).poll(&mut ctx).is_pending());
 }

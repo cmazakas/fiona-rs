@@ -4,7 +4,7 @@
 
 extern crate liburing_rs;
 
-use std::{future::Future, marker::PhantomPinned, ptr::NonNull, task::Poll, time::Duration};
+use std::{future::Future, ptr::NonNull, task::Poll, time::Duration};
 
 use nix::{errno::Errno, libc::ETIME};
 
@@ -33,7 +33,6 @@ pub struct TimerFuture<'a> {
     timer: &'a Timer,
     op: Option<u64>,
     completed: bool,
-    _pin: PhantomPinned,
 }
 
 //-----------------------------------------------------------------------------
@@ -94,7 +93,6 @@ impl Timer {
             timer: self,
             completed: false,
             op: Some(key.data().as_ffi()),
-            _pin: PhantomPinned,
         }
     }
 }
@@ -155,22 +153,20 @@ impl Future for TimerFuture<'_> {
     type Output = Result<()>;
 
     fn poll(
-        self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
+        assert!(!self.completed);
 
-        assert!(!this.completed);
+        let timer_impl = unsafe { &mut *self.timer.p.as_ptr() };
 
-        let timer_impl = unsafe { &mut *this.timer.p.as_ptr() };
-
-        let key_data = this.op.unwrap();
+        let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
         let io_ops = &mut *timer_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
         match (op.initiated, op.done) {
             (true, true) => {
-                this.completed = true;
+                self.completed = true;
 
                 let res = op.res;
                 if res < 0 {

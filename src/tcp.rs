@@ -33,7 +33,7 @@ use std::{
     alloc::Layout,
     collections::VecDeque,
     future::Future,
-    marker::{PhantomData, PhantomPinned},
+    marker::PhantomData,
     mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     ops::{Range, RangeBounds},
@@ -179,7 +179,6 @@ impl Acceptor {
         AcceptFuture {
             acceptor: self,
             completed: false,
-            _pin: PhantomPinned,
         }
     }
 
@@ -210,7 +209,6 @@ impl Acceptor {
             completed: false,
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
-            _pin: PhantomPinned,
         }
     }
 
@@ -235,7 +233,6 @@ impl Acceptor {
             completed: false,
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
-            _pin: PhantomPinned,
         }
     }
 }
@@ -304,7 +301,6 @@ impl Drop for AcceptorImpl {
 pub struct AcceptFuture<'a> {
     acceptor: &'a Acceptor,
     completed: bool,
-    _pin: PhantomPinned,
 }
 
 impl Future for AcceptFuture<'_> {
@@ -574,7 +570,6 @@ impl Stream {
             stream: self,
             completed: false,
             op: Some(key.data().as_ffi()),
-            _pin: PhantomPinned,
         }
     }
 
@@ -587,7 +582,6 @@ impl Stream {
         RecvFuture {
             stream: self,
             completed: false,
-            _pin: PhantomPinned,
         }
     }
 
@@ -612,7 +606,6 @@ impl Stream {
             completed: false,
             op: Some(key.data().as_ffi()),
             how,
-            _pin: PhantomPinned,
         }
     }
 
@@ -637,7 +630,6 @@ impl Stream {
             completed: false,
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
-            _pin: PhantomPinned,
         }
     }
 
@@ -662,7 +654,6 @@ impl Stream {
             op: Some(key.data().as_ffi()),
             fd_impl: &raw mut stream_impl.fd_impl,
             _m: PhantomData,
-            _pin: PhantomPinned,
         }
     }
 
@@ -760,7 +751,6 @@ pub struct SendFuture<'a> {
     stream: &'a Stream,
     completed: bool,
     op: Option<u64>,
-    _pin: PhantomPinned,
 }
 
 impl Drop for SendFuture<'_> {
@@ -797,13 +787,14 @@ impl Drop for SendFuture<'_> {
 impl Future for SendFuture<'_> {
     type Output = (Result<usize>, Vec<u8>);
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        assert!(!this.completed);
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        assert!(!self.completed);
 
-        let stream_impl = unsafe { &mut *this.stream.p.as_ptr() };
+        let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
 
-        let key_data = this.op.unwrap();
+        let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
         let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
@@ -850,7 +841,7 @@ impl Future for SendFuture<'_> {
                 Poll::Pending
             }
             (true, true) => {
-                this.completed = true;
+                self.completed = true;
 
                 let OpType::TcpSend {
                     ref mut buf,
@@ -879,17 +870,17 @@ pub struct CloseFuture<'a> {
     completed: bool,
     op: Option<u64>,
     _m: PhantomData<&'a FdImpl>,
-    _pin: PhantomPinned,
 }
 
 impl Future for CloseFuture<'_> {
     type Output = Result<()>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        let fd_impl = unsafe { &mut *this.fd_impl };
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        let fd_impl = unsafe { &mut *self.fd_impl };
 
-        let key_data = this.op.unwrap();
+        let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
         let io_ops = &mut *fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
@@ -923,7 +914,7 @@ impl Future for CloseFuture<'_> {
                 Poll::Pending
             }
             (true, true) => {
-                this.completed = true;
+                self.completed = true;
 
                 let OpType::TcpClose = op.op_type else {
                     unreachable!()
@@ -977,17 +968,17 @@ pub struct ShutdownFuture<'a> {
     completed: bool,
     op: Option<u64>,
     how: i32,
-    _pin: PhantomPinned,
 }
 
 impl Future for ShutdownFuture<'_> {
     type Output = Result<()>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        let stream_impl = unsafe { &mut *this.stream.p.as_ptr() };
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
 
-        let key_data = this.op.unwrap();
+        let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
         let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
@@ -1007,7 +998,7 @@ impl Future for ShutdownFuture<'_> {
 
                 let sqe = get_sqe(&stream_impl.fd_impl.ex);
                 let fd = stream_impl.fd_impl.fd;
-                unsafe { io_uring_prep_shutdown(sqe, fd, this.how) };
+                unsafe { io_uring_prep_shutdown(sqe, fd, self.how) };
                 unsafe { io_uring_sqe_set_data64(sqe, user_data) };
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) };
 
@@ -1018,7 +1009,7 @@ impl Future for ShutdownFuture<'_> {
                 Poll::Pending
             }
             (true, true) => {
-                this.completed = true;
+                self.completed = true;
 
                 let OpType::TcpShutdown = op.op_type else {
                     unreachable!()
@@ -1071,20 +1062,20 @@ pub struct CancelFuture<'a> {
     completed: bool,
     op: Option<u64>,
     _m: PhantomData<&'a FdImpl>,
-    _pin: PhantomPinned,
 }
 
 impl Future for CancelFuture<'_> {
     type Output = Result<()>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        assert!(!this.completed);
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        assert!(!self.completed);
 
-        let key_data = this.op.unwrap();
+        let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
 
-        let fd_impl = unsafe { &mut *this.fd_impl };
+        let fd_impl = unsafe { &mut *self.fd_impl };
         let mut io_ops = fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
@@ -1125,7 +1116,7 @@ impl Future for CancelFuture<'_> {
 
                 drop(io_ops);
 
-                this.completed = true;
+                self.completed = true;
 
                 if res < 0 {
                     Poll::Ready(Err(Errno::from_raw(-res)))
@@ -1161,7 +1152,6 @@ impl Drop for CancelFuture<'_> {
 pub struct RecvFuture<'a> {
     stream: &'a Stream,
     completed: bool,
-    _pin: PhantomPinned,
 }
 
 impl Drop for RecvFuture<'_> {
@@ -1174,12 +1164,12 @@ impl Drop for RecvFuture<'_> {
 impl Future for RecvFuture<'_> {
     type Output = Result<BorrowedBufs>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        assert!(!self.completed);
 
-        assert!(!this.completed);
-
-        let stream_impl = unsafe { &mut *this.stream.p.as_ptr() };
+        let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
         let ex = stream_impl.fd_impl.ex.clone();
 
         match stream_impl.recv_op {
@@ -1192,7 +1182,7 @@ impl Future for RecvFuture<'_> {
 
                 let buf_group = match ex.p.buf_groups.borrow().get(&bgid) {
                     None => {
-                        this.completed = true;
+                        self.completed = true;
                         return Poll::Ready(Err(Errno::ENOENT));
                     }
                     Some(buf_group) => buf_group.get(),
@@ -1251,7 +1241,7 @@ impl Future for RecvFuture<'_> {
                 };
 
                 if !bufs.is_empty() {
-                    this.completed = true;
+                    self.completed = true;
 
                     let mut user_bufs = BorrowedBufs::new(ex.clone(), buf_group);
                     mem::swap(&mut user_bufs, bufs);
@@ -1265,7 +1255,7 @@ impl Future for RecvFuture<'_> {
                 }
 
                 if op.res == 0 {
-                    this.completed = true;
+                    self.completed = true;
                     assert!(op.done);
                     if op.done {
                         stream_impl.recv_op = None;
@@ -1275,7 +1265,7 @@ impl Future for RecvFuture<'_> {
                 }
 
                 if op.res < 0 {
-                    this.completed = true;
+                    self.completed = true;
                     let res = -op.res;
                     if op.done {
                         stream_impl.recv_op = None;
@@ -1373,7 +1363,9 @@ pub struct ConnectBuilderFuture {
 impl Future for ConnectBuilderFuture {
     type Output = Result<Stream>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
         assert!(!self.completed);
 
         let ex = self.ex.clone();
@@ -1418,7 +1410,7 @@ impl Future for ConnectBuilderFuture {
                 Poll::Pending
             }
             (true, true) => {
-                unsafe { self.get_unchecked_mut().completed = true };
+                self.completed = true;
 
                 let OpType::TcpConnect { fd, .. } = op.op_type else {
                     unreachable!();

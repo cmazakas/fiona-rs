@@ -272,7 +272,7 @@ fn await_forgotten_recursive() {
 
     async fn make_vec() -> Vec<i32> {
         assert!(unsafe { !P_FUTURE.is_null() });
-        let f = unsafe { Pin::new_unchecked(&mut *P_FUTURE) };
+        let f = unsafe { Pin::new(&mut *P_FUTURE) };
 
         let w = WakerFuture.await;
         let mut cx = std::task::Context::from_waker(&w);
@@ -521,7 +521,7 @@ fn await_cycle() {
             {
                 let mut tmp = self.this.borrow_mut();
                 let future = tmp.as_mut();
-                r = unsafe { Pin::new_unchecked(&mut future.unwrap()).poll(cx) };
+                r = Pin::new(&mut future.unwrap()).poll(cx);
             }
 
             if self.recursions > 100 {
