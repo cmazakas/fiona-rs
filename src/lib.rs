@@ -939,8 +939,14 @@ unsafe fn clear_completion_queue(io_ops: &RefCell<IoOpsMap>, ring: *mut io_uring
 
                 let key = DefaultKey::from(KeyData::from_ffi(user_data));
 
-                let op = io_ops.borrow_mut().remove(key).unwrap();
-                let rc = op.ref_count;
+                let was_eager_dropped = io_ops.borrow().get(key).unwrap().eager_dropped;
+                let rc = if was_eager_dropped {
+                    let op = io_ops.borrow_mut().remove(key).unwrap();
+                    op.ref_count
+                } else {
+                    io_ops.borrow().get(key).unwrap().ref_count
+                };
+
                 if !rc.is_null() {
                     unsafe { release_op(rc) };
                 }

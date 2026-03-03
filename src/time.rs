@@ -67,6 +67,13 @@ impl Timer {
 
     #[inline]
     #[must_use]
+    pub fn get_executor(&self) -> Executor {
+        let timer_impl = unsafe { &mut *self.p.as_ptr() };
+        timer_impl.ex.clone()
+    }
+
+    #[inline]
+    #[must_use]
     pub fn wait(&self, dur: Duration) -> TimerFuture<'_> {
         let timer_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!timer_impl.timeout_pending);

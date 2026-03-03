@@ -496,3 +496,85 @@ fn timer_relocate_future() {
 
     assert_eq!(ioc.run(), 1);
 }
+
+#[test]
+fn timer_foreign_executor() {
+    // Test what happens when we start migrating I/O objects across different
+    // execution contexts.
+
+    {
+        // Intent here is to post the SQE and not see the completed operation. This
+        // means the TimerFuture should never resolve and also that the op from the
+        // backing slotmap shouldn't be released either, i.e. this test should leak I/O
+        // ops.
+
+        let ioc1 = Rc::new(RefCell::new(fiona::IoContext::new()));
+        let ioc2 = Rc::new(RefCell::new(fiona::IoContext::new()));
+
+        let ex1 = ioc1.borrow().get_executor();
+        let ex2 = ioc2.borrow().get_executor();
+
+        let timer1 = fiona::time::Timer::new(ex1);
+
+        ex2.spawn((async |timer1: fiona::time::Timer,
+                          ioc1: Rc<RefCell<fiona::IoContext>>,
+                          ex2: fiona::Executor| {
+            let mut f1 = timer1.wait(Duration::from_millis(100));
+            let waker = WakerFuture.await;
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(unsafe { Pin::new_unchecked(&mut f1).poll(&mut cx).is_pending() });
+
+            timer1.get_executor().spawn(async move {});
+            ioc1.borrow_mut().run();
+
+            assert!(unsafe { Pin::new_unchecked(&mut f1).poll(&mut cx).is_pending() });
+
+            let timer2 = fiona::time::Timer::new(ex2);
+            timer2.wait(Duration::from_millis(100)).await.unwrap();
+
+            timer1.get_executor().spawn(async move {});
+            ioc1.borrow_mut().run();
+
+            assert!(unsafe { Pin::new_unchecked(&mut f1).poll(&mut cx).is_pending() });
+            assert!(unsafe { Pin::new_unchecked(&mut f1).poll(&mut cx).is_pending() });
+        })(timer1.clone(), ioc1.clone(), ex2.clone()));
+
+        ioc2.borrow_mut().run();
+    }
+
+    {
+        // Post the SQE and make sure there was enough intermittent work such that we
+        // process the CQE and mark the operation as done.
+
+        let ioc1 = Rc::new(RefCell::new(fiona::IoContext::new()));
+        let ioc2 = Rc::new(RefCell::new(fiona::IoContext::new()));
+
+        let ex1 = ioc1.borrow().get_executor();
+        let ex2 = ioc2.borrow().get_executor();
+
+        let timer1 = fiona::time::Timer::new(ex1);
+
+        ex2.spawn((async |timer1: fiona::time::Timer,
+                          ioc1: Rc<RefCell<fiona::IoContext>>,
+                          ex2: fiona::Executor| {
+            let mut f1 = timer1.wait(Duration::from_millis(100));
+            let waker = WakerFuture.await;
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(unsafe { Pin::new_unchecked(&mut f1).poll(&mut cx).is_pending() });
+
+            let ex1_copy = timer1.get_executor();
+            timer1.get_executor().spawn(async move {
+                let timer1_2 = fiona::time::Timer::new(ex1_copy);
+                timer1_2.wait(Duration::from_millis(125)).await.unwrap();
+            });
+            ioc1.borrow_mut().run();
+
+            let timer2 = fiona::time::Timer::new(ex2);
+            timer2.wait(Duration::from_millis(100)).await.unwrap();
+
+            assert!(unsafe { Pin::new_unchecked(&mut f1).poll(&mut cx).is_ready() });
+        })(timer1.clone(), ioc1.clone(), ex2.clone()));
+
+        ioc2.borrow_mut().run();
+    }
+}
