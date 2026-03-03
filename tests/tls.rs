@@ -198,8 +198,22 @@ fn tls_handshake() {
         let stream = acceptor.accept().await.unwrap();
         stream.set_buf_group(1234);
 
-        let tls_stream = fiona::tls::server_handshake(stream, make_server_config()).await;
-        let _tls_stream = tls_stream.unwrap();
+        let tls_stream = fiona::tls::server_handshake(stream, make_server_config())
+            .await
+            .unwrap();
+
+        tls_stream
+            .send("Hello, world! This is plaintext from the server!".as_bytes())
+            .await
+            .unwrap();
+
+        let mut buf = vec![0_u8; 1024];
+        let n = tls_stream.recv(&mut buf).await.unwrap();
+
+        assert_eq!(
+            str::from_utf8(&buf[..n]).unwrap(),
+            "Hello, world! This is plaintext from the client!"
+        );
     })(acceptor));
 
     ex.spawn((async |ex: fiona::Executor, port: u16| {
@@ -216,8 +230,21 @@ fn tls_handshake() {
             make_client_config(),
             "localhost".try_into().unwrap(),
         )
-        .await;
-        let _tls_client = tls_client;
+        .await
+        .unwrap();
+
+        tls_client
+            .send("Hello, world! This is plaintext from the client!".as_bytes())
+            .await
+            .unwrap();
+
+        let mut buf = vec![0_u8; 1024];
+        let n = tls_client.recv(&mut buf).await.unwrap();
+
+        assert_eq!(
+            str::from_utf8(&buf[..n]).unwrap(),
+            "Hello, world! This is plaintext from the server!"
+        );
     })(ex.clone(), port));
 
     assert_eq!(ioc.run(), 2);
