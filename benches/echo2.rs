@@ -300,7 +300,7 @@ fn fiona_echo_client(
 
             let mut h = blake2::Blake2b512::new();
 
-            let stream = fiona::tcp::ClientBuilder::new(ex2)
+            let stream = fiona::tcp::Client::new(ex2)
                 .connect_ipv4(ipv4_addr, port)
                 .await
                 .unwrap();

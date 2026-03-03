@@ -6,19 +6,18 @@ extern crate liburing_rs;
 
 use crate::{
     BorrowedBufs, Executor, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
-    make_io_uring_op, release_impl, release_obj, reserve_sqes,
+    make_io_uring_op, release_impl, release_obj,
 };
 use core::panic;
 use liburing_rs::{
     __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
     IORING_RECVSEND_BUNDLE, IORING_TIMEOUT_MULTISHOT, IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS,
-    IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring_prep_cancel_fd, io_uring_prep_cancel64,
-    io_uring_prep_close, io_uring_prep_close_direct, io_uring_prep_connect,
-    io_uring_prep_link_timeout, io_uring_prep_multishot_accept_direct,
+    IOSQE_FIXED_FILE, io_uring_prep_cancel_fd, io_uring_prep_cancel64, io_uring_prep_close,
+    io_uring_prep_close_direct, io_uring_prep_multishot_accept_direct,
     io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_shutdown,
     io_uring_prep_socket_direct_alloc, io_uring_prep_timeout, io_uring_prep_timeout_remove,
-    io_uring_prep_timeout_update, io_uring_sqe_set_buf_group, io_uring_sqe_set_data,
-    io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    io_uring_prep_timeout_update, io_uring_sqe_set_buf_group, io_uring_sqe_set_data64,
+    io_uring_sqe_set_flags,
 };
 use nix::{
     errno::Errno,
@@ -757,461 +756,6 @@ impl Clone for Stream {
 
 //-----------------------------------------------------------------------------
 
-pub struct Client {
-    p: NonNull<ClientImpl>,
-}
-
-impl Client {
-    #[must_use]
-    pub fn new(ex: Executor) -> Client {
-        let layout = Layout::new::<ClientImpl>();
-        let p = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
-
-        let ref_count = RefCount {
-            obj_count: 1,
-            op_count: 0,
-            release_impl: release_impl::<ClientImpl>,
-            obj: p.as_ptr(),
-        };
-
-        let stream = StreamImpl {
-            fd_impl: FdImpl {
-                ref_count,
-                ex,
-                fd: -1,
-                close_pending: false,
-                cancel_pending: false,
-                was_closed: false,
-                is_fixed: true,
-            },
-            ts: Duration::from_secs(3).into(),
-            buf_group: u16::MAX,
-            send_pending: false,
-            recv_pending: false,
-            shutdown_pending: false,
-            last_send: Instant::now(),
-            last_recv: Instant::now(),
-            timeout_op: None,
-            recv_op: None,
-        };
-
-        let client_impl = ClientImpl {
-            stream,
-            connect_pending: false,
-        };
-
-        let p = p.cast::<ClientImpl>();
-        unsafe { std::ptr::write(p.as_ptr(), client_impl) };
-
-        let stream_impl = unsafe { &mut (*p.as_ptr()).stream };
-        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
-
-        let io_op = make_io_uring_op(
-            ref_count,
-            OpType::MultishotTimeout {
-                ts: stream_impl.ts,
-                stream: &raw mut *stream_impl,
-            },
-        );
-        let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
-        let key = io_ops.insert(io_op, &stream_impl.fd_impl.ex);
-
-        let op = io_ops.get_mut(key).unwrap();
-        let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
-            unreachable!()
-        };
-
-        let sqe = get_sqe(&stream_impl.fd_impl.ex);
-        let user_data = key.data().as_ffi();
-        unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
-        unsafe { io_uring_sqe_set_data64(sqe, user_data) };
-
-        stream_impl.timeout_op = Some(key.data().as_ffi());
-        unsafe { add_op_ref(ref_count) };
-
-        Client { p }
-    }
-
-    #[must_use]
-    pub fn connect_ipv4(&self, addr: Ipv4Addr, port: u16) -> ConnectFuture<'_> {
-        assert!(unsafe { !(*self.p.as_ptr()).connect_pending });
-
-        let client_impl = unsafe { &mut *self.p.as_ptr() };
-        client_impl.connect_pending = true;
-
-        let ref_count = &raw mut client_impl.stream.fd_impl.ref_count;
-        let addr = SocketAddrV4::new(addr, port);
-
-        let op = make_io_uring_op(
-            ref_count,
-            OpType::TcpConnect {
-                addr: SockaddrStorage::from(addr),
-                _port: port,
-                ts: client_impl.stream.ts,
-                needs_socket: false,
-                got_socket: false,
-                fd: -1,
-            },
-        );
-
-        let key = client_impl
-            .stream
-            .fd_impl
-            .ex
-            .p
-            .io_ops
-            .borrow_mut()
-            .insert(op, &client_impl.stream.fd_impl.ex);
-
-        ConnectFuture {
-            client: self,
-            completed: false,
-            op: Some(key.data().as_ffi()),
-            _pin: PhantomPinned,
-        }
-    }
-
-    #[must_use]
-    pub fn connect_ipv6(&self, addr: Ipv6Addr, port: u16) -> ConnectFuture<'_> {
-        assert!(unsafe { !(*self.p.as_ptr()).connect_pending });
-
-        let client_impl = unsafe { &mut *self.p.as_ptr() };
-        client_impl.connect_pending = true;
-
-        let ref_count = &raw mut client_impl.stream.fd_impl.ref_count;
-        let addr = SocketAddrV6::new(addr, port, 0, 0);
-
-        let op = make_io_uring_op(
-            ref_count,
-            OpType::TcpConnect {
-                addr: SockaddrStorage::from(addr),
-                _port: port,
-                ts: client_impl.stream.ts,
-                needs_socket: false,
-                got_socket: false,
-                fd: -1,
-            },
-        );
-
-        let key = client_impl
-            .stream
-            .fd_impl
-            .ex
-            .p
-            .io_ops
-            .borrow_mut()
-            .insert(op, &client_impl.stream.fd_impl.ex);
-
-        ConnectFuture {
-            client: self,
-            completed: false,
-            op: Some(key.data().as_ffi()),
-            _pin: PhantomPinned,
-        }
-    }
-
-    #[must_use]
-    pub fn as_stream(&self) -> Stream {
-        // we know this function is sound because of:
-        // https://play.rust-lang.org/?version=stable&mode=debug&edition=2024&gist=7a39da0d1b4c9d22b23ef0ffec238050
-
-        let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.fd_impl.ref_count };
-        unsafe { add_obj_ref(rc) };
-
-        let p = unsafe { &raw mut (*self.p.as_ptr()).stream };
-        Stream {
-            p: unsafe { NonNull::new_unchecked(p) },
-        }
-    }
-
-    #[must_use]
-    pub fn get_executor(&self) -> Executor {
-        let client_impl = unsafe { &mut *self.p.as_ptr() };
-        client_impl.stream.fd_impl.ex.clone()
-    }
-
-    pub fn set_buf_group(&self, bgid: u16) {
-        let stream_impl = unsafe { &mut (*self.p.as_ptr()).stream };
-        stream_impl.buf_group = bgid;
-    }
-
-    pub fn set_timeout(&self, dur: Duration) {
-        let stream = self.as_stream();
-        stream.set_timeout(dur);
-    }
-
-    pub async fn send(&self, buf: Vec<u8>) -> (Result<usize>, Vec<u8>) {
-        let stream = self.as_stream();
-        stream.send(buf).await
-    }
-
-    pub async fn recv(&self) -> Result<BorrowedBufs> {
-        let stream = self.as_stream();
-        stream.recv().await
-    }
-
-    pub async fn close(&self) -> Result<()> {
-        let stream = self.as_stream();
-        stream.close().await
-    }
-}
-
-impl Clone for Client {
-    fn clone(&self) -> Self {
-        let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.fd_impl.ref_count };
-        unsafe { add_obj_ref(rc) };
-        Self { p: self.p }
-    }
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        let rc = unsafe { &raw mut (*self.p.as_ptr()).stream.fd_impl.ref_count };
-        if unsafe { (*rc).obj_count } == 1 {
-            let stream_impl = unsafe { &mut (*self.p.as_ptr()).stream };
-
-            {
-                let key_data = stream_impl.timeout_op.take().unwrap();
-                let key = DefaultKey::from(KeyData::from_ffi(key_data));
-
-                let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
-                let op = io_ops.get_mut(key).unwrap();
-
-                let user_data = key_data;
-
-                // makes sure this gets cleaned up, not really an eager-dropped operation
-                op.eager_dropped = true;
-
-                let sqe = get_sqe(&stream_impl.fd_impl.ex);
-                unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
-                unsafe { io_uring_sqe_set_data64(sqe, 0) };
-                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-            }
-
-            if stream_impl.recv_op.is_some() {
-                let key_data = stream_impl.recv_op.take().unwrap();
-                let key = DefaultKey::from(KeyData::from_ffi(key_data));
-                let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
-                let op = io_ops.get_mut(key).unwrap();
-
-                stream_impl.recv_op = None;
-                if op.done {
-                    io_ops.remove(key).unwrap();
-                } else {
-                    let user_data = key_data;
-                    // makes sure this gets cleaned up, not really an eager-dropped operation
-                    op.eager_dropped = true;
-
-                    let sqe = get_sqe(&stream_impl.fd_impl.ex);
-                    unsafe { io_uring_prep_cancel64(sqe, user_data, 0) };
-                    unsafe { io_uring_sqe_set_data64(sqe, 0) };
-                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-                }
-            }
-        }
-
-        unsafe { release_obj(rc) };
-    }
-}
-
-//-----------------------------------------------------------------------------
-
-struct ClientImpl {
-    stream: StreamImpl,
-    connect_pending: bool,
-}
-
-//-----------------------------------------------------------------------------
-
-pub struct ConnectFuture<'a> {
-    client: &'a Client,
-    completed: bool,
-    op: Option<u64>,
-    _pin: PhantomPinned,
-}
-
-impl Future for ConnectFuture<'_> {
-    type Output = Result<()>;
-
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        assert!(!self.completed);
-
-        let client_impl = unsafe { &mut *self.client.p.as_ptr() };
-        let ex = client_impl.stream.fd_impl.ex.clone();
-
-        let key_data = self.op.unwrap();
-        let key = DefaultKey::from(KeyData::from_ffi(key_data));
-        let io_ops = &mut *ex.p.io_ops.borrow_mut();
-        let op = io_ops.get_mut(key).unwrap();
-
-        match (op.initiated, op.done) {
-            (false, true) => panic!(),
-            (true, false) => {
-                op.local_waker = Some(cx.local_waker().clone());
-                Poll::Pending
-            }
-            (false, false) => {
-                let user_data = key_data;
-
-                let OpType::TcpConnect {
-                    ref addr,
-                    ref mut needs_socket,
-                    ref mut ts,
-                    ..
-                } = op.op_type
-                else {
-                    unreachable!();
-                };
-
-                let (af, addrlen) = {
-                    if let Some(x) = addr.as_sockaddr_in() {
-                        (AF_INET, std::mem::size_of_val(x))
-                    } else if let Some(x) = addr.as_sockaddr_in6() {
-                        (AF_INET6, std::mem::size_of_val(x))
-                    } else {
-                        unreachable!();
-                    }
-                };
-
-                *needs_socket = client_impl.stream.fd_impl.fd < 0;
-
-                if *needs_socket {
-                    let sqe = get_sqe(&ex);
-                    let r#type = SOCK_STREAM;
-                    let protocol = IPPROTO_TCP;
-
-                    unsafe { io_uring_prep_socket_direct_alloc(sqe, af, r#type, protocol, 0) };
-                    unsafe { io_uring_sqe_set_data64(sqe, user_data) };
-                } else {
-                    unsafe { reserve_sqes(&ex, 2) };
-
-                    let sqe = get_sqe(&ex);
-                    unsafe {
-                        io_uring_prep_connect(
-                            sqe,
-                            client_impl.stream.fd_impl.fd,
-                            std::ptr::from_ref(addr).cast(),
-                            addrlen.try_into().unwrap(),
-                        );
-                    }
-                    unsafe { io_uring_sqe_set_data64(sqe, user_data) };
-                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK | IOSQE_FIXED_FILE) };
-
-                    let sqe = get_sqe(&ex);
-                    unsafe { io_uring_prep_link_timeout(sqe, std::ptr::from_mut(ts).cast(), 0) };
-                    unsafe { io_uring_sqe_set_data(sqe, std::ptr::null_mut()) };
-                    unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-                }
-
-                unsafe { add_op_ref(&raw mut client_impl.stream.fd_impl.ref_count) };
-
-                op.local_waker = Some(cx.local_waker().clone());
-                op.initiated = true;
-                Poll::Pending
-            }
-            (true, true) => {
-                unsafe { self.get_unchecked_mut().completed = true };
-
-                let OpType::TcpConnect {
-                    needs_socket,
-                    got_socket,
-                    fd,
-                    ..
-                } = op.op_type
-                else {
-                    unreachable!();
-                };
-
-                if needs_socket && got_socket && op.res >= 0 {
-                    assert!(client_impl.stream.fd_impl.fd < 0);
-                    client_impl.stream.fd_impl.fd = fd;
-                }
-
-                let res = op.res;
-                if res < 0 {
-                    Poll::Ready(Err(Errno::from_raw(-res)))
-                } else {
-                    Poll::Ready(Ok(()))
-                }
-            }
-        }
-    }
-}
-
-impl Drop for ConnectFuture<'_> {
-    fn drop(&mut self) {
-        let client_impl = unsafe { &mut *self.client.p.as_ptr() };
-        client_impl.connect_pending = false;
-
-        let op_cancel_key_data = self.op.unwrap();
-        let key = DefaultKey::from(KeyData::from_ffi(op_cancel_key_data));
-
-        let mut borrow_guard = client_impl.stream.fd_impl.ex.p.io_ops.borrow_mut();
-        let io_ops = &mut *borrow_guard;
-        let op = io_ops.get_mut(key).unwrap();
-
-        if op.initiated && !op.done {
-            op.eager_dropped = true;
-            op.local_waker = None;
-
-            let user_data = op_cancel_key_data;
-
-            let ref_count = &raw mut client_impl.stream.fd_impl.ref_count;
-            let key = io_ops.insert(
-                make_io_uring_op(ref_count, OpType::DropCancel),
-                &client_impl.stream.fd_impl.ex,
-            );
-
-            unsafe { add_op_ref(ref_count) };
-
-            let sqe = get_sqe(&client_impl.stream.fd_impl.ex);
-
-            unsafe { io_uring_prep_cancel64(sqe, user_data, IORING_ASYNC_CANCEL_ALL as i32) };
-            unsafe { io_uring_sqe_set_data64(sqe, key.data().as_ffi()) };
-
-            self.op = None;
-            return;
-        }
-
-        let OpType::TcpConnect {
-            needs_socket,
-            got_socket,
-            fd,
-            ..
-        } = op.op_type
-        else {
-            unreachable!();
-        };
-
-        if !self.completed && needs_socket && got_socket {
-            assert!(op.initiated);
-            assert!(op.done);
-
-            if fd >= 0 {
-                let fd = fd.try_into().unwrap();
-
-                io_ops.remove(key).unwrap();
-                drop(borrow_guard);
-
-                let ex = &client_impl.stream.fd_impl.ex;
-
-                let sqe = get_sqe(ex);
-                unsafe { io_uring_prep_close_direct(sqe, fd) };
-                unsafe { io_uring_sqe_set_data64(sqe, 0) };
-                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-            }
-
-            self.op = None;
-
-            return;
-        }
-
-        io_ops.remove(key).unwrap();
-    }
-}
-
-//-----------------------------------------------------------------------------
-
 pub struct SendFuture<'a> {
     stream: &'a Stream,
     completed: bool,
@@ -1747,22 +1291,24 @@ impl Future for RecvFuture<'_> {
     }
 }
 
-pub struct ClientBuilder {
+//-----------------------------------------------------------------------------
+
+pub struct Client {
     timeout: Duration,
     ex: Executor,
 }
 
-impl ClientBuilder {
+impl Client {
     #[must_use]
-    pub fn new(ex: Executor) -> ClientBuilder {
-        ClientBuilder {
+    pub fn new(ex: Executor) -> Client {
+        Client {
             ex,
             timeout: Duration::from_secs(3),
         }
     }
 
     #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> ClientBuilder {
+    pub fn with_timeout(mut self, timeout: Duration) -> Client {
         self.timeout = timeout;
         self
     }
@@ -1773,7 +1319,7 @@ impl ClientBuilder {
 
         let op = make_io_uring_op(
             ptr::null_mut(),
-            OpType::TcpConnectBuilder {
+            OpType::TcpConnect {
                 addr: SockaddrStorage::from(addr),
                 _port: port,
                 ts: self.timeout.into(),
@@ -1798,7 +1344,7 @@ impl ClientBuilder {
 
         let op = make_io_uring_op(
             ptr::null_mut(),
-            OpType::TcpConnectBuilder {
+            OpType::TcpConnect {
                 addr: SockaddrStorage::from(addr),
                 _port: port,
                 ts: self.timeout.into(),
@@ -1846,7 +1392,7 @@ impl Future for ConnectBuilderFuture {
             (false, false) => {
                 let user_data = key_data;
 
-                let OpType::TcpConnectBuilder { ref addr, .. } = op.op_type else {
+                let OpType::TcpConnect { ref addr, .. } = op.op_type else {
                     unreachable!();
                 };
 
@@ -1874,7 +1420,7 @@ impl Future for ConnectBuilderFuture {
             (true, true) => {
                 unsafe { self.get_unchecked_mut().completed = true };
 
-                let OpType::TcpConnectBuilder { fd, .. } = op.op_type else {
+                let OpType::TcpConnect { fd, .. } = op.op_type else {
                     unreachable!();
                 };
 
@@ -1915,7 +1461,7 @@ impl Drop for ConnectBuilderFuture {
             return;
         }
 
-        let OpType::TcpConnectBuilder {
+        let OpType::TcpConnect {
             needs_socket,
             got_socket,
             fd,

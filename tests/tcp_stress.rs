@@ -55,9 +55,11 @@ fn make_io_context(nr_files: u32) -> fiona::IoContext {
 async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: u16) {
     let mut generator = ByteGen::new();
 
-    let client = fiona::tcp::Client::new(ex);
-    client.set_timeout(Duration::from_secs(3));
-    client.connect_ipv4(ipv4_addr, port).await.unwrap();
+    let client = fiona::tcp::Client::new(ex)
+        .with_timeout(Duration::from_secs(3))
+        .connect_ipv4(ipv4_addr, port)
+        .await
+        .unwrap();
 
     client.set_buf_group(CLIENT_BGID);
 

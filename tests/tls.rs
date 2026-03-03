@@ -217,8 +217,7 @@ fn tls_handshake() {
     })(acceptor));
 
     ex.spawn((async |ex: fiona::Executor, port: u16| {
-        let client = fiona::tcp::Client::new(ex);
-        client
+        let client = fiona::tcp::Client::new(ex)
             .connect_ipv6(Ipv6Addr::LOCALHOST, port)
             .await
             .unwrap();

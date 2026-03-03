@@ -118,11 +118,11 @@ impl Stream {
 }
 
 pub async fn client_handshake(
-    client: tcp::Client, config: Arc<rustls::ClientConfig>,
+    stream: tcp::Stream, config: Arc<rustls::ClientConfig>,
     server_name: rustls_pki_types::ServerName<'static>,
 ) -> Result<Client, std::io::Error> {
     let tls_client = Client {
-        tcp_stream: client.as_stream(),
+        tcp_stream: stream,
         stream_impl: Rc::new(StreamImpl {
             tls_conn: RefCell::new(rustls::ClientConnection::new(config, server_name).unwrap()),
             buf: RefCell::new(Vec::new()),

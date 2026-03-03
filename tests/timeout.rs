@@ -35,15 +35,10 @@ fn tcp_recv_timeout() {
         let client_task = ex
             .clone() //
             .spawn(async move {
-                let ex = ex2;
-                let client = fiona::tcp::Client::new(ex.clone());
-
-                client
+                fiona::tcp::Client::new(ex2)
                     .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                     .await
-                    .unwrap();
-
-                client
+                    .unwrap()
             });
 
         let stream = acceptor.accept().await.unwrap();
@@ -100,15 +95,10 @@ fn tcp_recv_timeout() {
         let client_task = ex
             .clone() //
             .spawn(async move {
-                let ex = ex2;
-                let client = fiona::tcp::Client::new(ex.clone());
-
-                client
+                fiona::tcp::Client::new(ex2)
                     .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                     .await
-                    .unwrap();
-
-                client
+                    .unwrap()
             });
 
         let stream = acceptor.accept().await.unwrap();
