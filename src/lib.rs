@@ -32,8 +32,7 @@ use std::{
     hash::Hash,
     marker::PhantomData,
     mem::{ManuallyDrop, forget},
-    ops::Deref,
-    ops::Range,
+    ops::{Deref, Range},
     pin::Pin,
     ptr::{self, DynMetadata, NonNull, metadata},
     rc::Rc,
@@ -740,6 +739,14 @@ enum OpType {
         got_socket: bool,
         fd: i32,
     },
+    TcpConnectBuilder {
+        addr: SockaddrStorage,
+        _port: u16,
+        ts: __kernel_timespec,
+        needs_socket: bool,
+        got_socket: bool,
+        fd: i32,
+    },
     TcpSend {
         num_sent: usize,
         subspan: Range<usize>,
@@ -933,9 +940,10 @@ unsafe fn clear_completion_queue(io_ops: &RefCell<IoOpsMap>, ring: *mut io_uring
                 let key = DefaultKey::from(KeyData::from_ffi(user_data));
 
                 let op = io_ops.borrow_mut().remove(key).unwrap();
-
                 let rc = op.ref_count;
-                unsafe { release_op(rc) };
+                if !rc.is_null() {
+                    unsafe { release_op(rc) };
+                }
             }
         }
 
@@ -944,7 +952,6 @@ unsafe fn clear_completion_queue(io_ops: &RefCell<IoOpsMap>, ring: *mut io_uring
 }
 
 impl Drop for RunGuard {
-    #![allow(clippy::redundant_closure_call)]
     fn drop(&mut self) {
         {
             let local_tasks = &mut *self.p.local_task_queue.borrow_mut();
@@ -957,7 +964,11 @@ impl Drop for RunGuard {
             unsafe { clear_task_list(&self.p, self.preserve_head_and_tail) };
         }
 
-        let ring = (|| &raw mut *self.p.ioring.borrow_mut())();
+        let ring = {
+            let mut ioring = self.p.ioring.borrow_mut();
+            &raw mut *ioring
+        };
+
         unsafe { clear_completion_queue(&self.p.io_ops, ring) };
     }
 }
@@ -1193,6 +1204,7 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler {
         OpType::MultishotTimeout { .. } => on_timeout_multishot,
         OpType::MultishotTcpAccept { .. } => on_tcp_accept_multishot,
         OpType::TcpConnect { .. } => on_tcp_connect,
+        OpType::TcpConnectBuilder { .. } => on_tcp_connect_builder,
         OpType::TcpSend { .. } => on_tcp_send,
         OpType::MultishotTcpRecv { .. } => on_tcp_recv_multishot,
         OpType::TcpShutdown | OpType::TcpClose | OpType::TcpCancel => on_tcp_close,
@@ -1386,6 +1398,149 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe) {
 
     // we expect one more CQE after this, the result of the actual
     // connect() call
+    if *needs_socket && !*got_socket {
+        *fd = cqe.res;
+        *got_socket = true;
+
+        let (_af, addrlen) = {
+            if let Some(x) = addr.as_sockaddr_in() {
+                (AF_INET, std::mem::size_of_val(x))
+            } else if let Some(x) = addr.as_sockaddr_in6() {
+                (AF_INET6, std::mem::size_of_val(x))
+            } else {
+                unreachable!();
+            }
+        };
+
+        unsafe { reserve_sqes(ex, 2) };
+
+        let sqe = get_sqe(ex);
+        unsafe {
+            io_uring_prep_connect(
+                sqe,
+                *fd,
+                std::ptr::from_ref(addr).cast(),
+                addrlen.try_into().unwrap(),
+            );
+        }
+
+        let user_data = key_data;
+        unsafe { io_uring_sqe_set_data64(sqe, user_data) };
+        unsafe { io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK | IOSQE_FIXED_FILE) };
+
+        let sqe = get_sqe(ex);
+        unsafe { io_uring_prep_link_timeout(sqe, std::ptr::from_mut(ts).cast(), 0) };
+        unsafe { io_uring_sqe_set_data(sqe, std::ptr::null_mut()) };
+        unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+    }
+}
+
+fn on_tcp_connect_builder(ex: &Executor, cqe: &mut io_uring_cqe) {
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.get_mut(key).unwrap();
+
+    if op.eager_dropped {
+        // if the Future was eager-dropped:
+        // * we need to release the borrowed direct descriptor back to the pool
+        // * if the connect() succeeded, we need to close() it
+
+        let OpType::TcpConnectBuilder {
+            ref mut needs_socket,
+            ref mut got_socket,
+            ref mut fd,
+            ..
+        } = op.op_type
+        else {
+            unreachable!()
+        };
+
+        if *needs_socket && !*got_socket && cqe.res >= 0 {
+            *got_socket = true;
+            *fd = cqe.res;
+        }
+
+        let op = io_ops.remove(key).unwrap();
+        let OpType::TcpConnectBuilder {
+            needs_socket,
+            got_socket,
+            fd,
+            ..
+        } = op.op_type
+        else {
+            unreachable!()
+        };
+
+        drop(borrow_guard);
+
+        // if our connect() op is borrowing an FD from the runtime,
+        // we need to close it and return it
+        if needs_socket {
+            // this means our socket() call completed with a success
+            if got_socket {
+                let sqe = get_sqe(ex);
+
+                let fd = fd.try_into().unwrap();
+
+                unsafe { io_uring_prep_close_direct(sqe, fd) };
+                unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+            }
+        }
+
+        return;
+    }
+
+    let OpType::TcpConnectBuilder {
+        ref mut needs_socket,
+        ref mut got_socket,
+        ref mut fd,
+        ref addr,
+        ref mut ts,
+        ..
+    } = op.op_type
+    else {
+        unreachable!()
+    };
+
+    // If we hit an error, this is our last CQE.
+    // If we don't need a socket, this is our last CQE.
+    // If we've already gotten a socket, this is our last CQE.
+    if cqe.res < 0 || !*needs_socket || *got_socket {
+        op.res = cqe.res;
+        op.done = true;
+
+        if let Some(local_waker) = op.local_waker.take() {
+            local_waker.wake();
+        }
+
+        // If our connect() op is borrowing an FD from the runtime,
+        // we need to close it and return it.
+        if cqe.res < 0 && *needs_socket {
+            let reclaimed_fd = (*fd).try_into().unwrap();
+            *fd = -1;
+
+            // this means our socket() call completed with a success
+            if *got_socket {
+                drop(borrow_guard);
+
+                let sqe = get_sqe(ex);
+
+                unsafe { io_uring_prep_close_direct(sqe, reclaimed_fd) };
+                unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+            }
+        }
+
+        return;
+    }
+
+    // We expect one more CQE after this, the result of the actual
+    // connect() call.
     if *needs_socket && !*got_socket {
         *fd = cqe.res;
         *got_socket = true;

@@ -709,7 +709,7 @@ impl Drop for Stream {
                 let op = io_ops.get_mut(key).unwrap();
 
                 let user_data = key_data;
-                // makes sure this gets cleaned up, not really an eager-dropped operation
+                // Makes sure this gets cleaned up, not really an eager-dropped operation.
                 op.eager_dropped = true;
 
                 let sqe = get_sqe(&stream_impl.fd_impl.ex);
@@ -732,7 +732,7 @@ impl Drop for Stream {
                     io_ops.remove(key).unwrap();
                 } else {
                     let user_data = key_data;
-                    // makes sure this gets cleaned up, not really an eager-dropped operation
+                    // Makes sure this gets cleaned up, not really an eager-dropped operation.
                     op.eager_dropped = true;
 
                     let sqe = get_sqe(&stream_impl.fd_impl.ex);
@@ -1744,5 +1744,210 @@ impl Future for RecvFuture<'_> {
                 Poll::Pending
             }
         }
+    }
+}
+
+pub struct ClientBuilder {
+    timeout: Duration,
+    ex: Executor,
+}
+
+impl ClientBuilder {
+    #[must_use]
+    pub fn new(ex: Executor) -> ClientBuilder {
+        ClientBuilder {
+            ex,
+            timeout: Duration::from_secs(3),
+        }
+    }
+
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> ClientBuilder {
+        self.timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn connect_ipv4(self, addr: Ipv4Addr, port: u16) -> ConnectBuilderFuture {
+        let addr = SocketAddrV4::new(addr, port);
+
+        let op = make_io_uring_op(
+            ptr::null_mut(),
+            OpType::TcpConnectBuilder {
+                addr: SockaddrStorage::from(addr),
+                _port: port,
+                ts: self.timeout.into(),
+                needs_socket: true,
+                got_socket: false,
+                fd: -1,
+            },
+        );
+
+        let key = self.ex.p.io_ops.borrow_mut().insert(op, &self.ex);
+
+        ConnectBuilderFuture {
+            completed: false,
+            ex: self.ex,
+            op: Some(key.data().as_ffi()),
+        }
+    }
+
+    #[must_use]
+    pub fn connect_ipv6(self, addr: Ipv6Addr, port: u16) -> ConnectBuilderFuture {
+        let addr = SocketAddrV6::new(addr, port, 0, 0);
+
+        let op = make_io_uring_op(
+            ptr::null_mut(),
+            OpType::TcpConnectBuilder {
+                addr: SockaddrStorage::from(addr),
+                _port: port,
+                ts: self.timeout.into(),
+                needs_socket: true,
+                got_socket: false,
+                fd: -1,
+            },
+        );
+
+        let key = self.ex.p.io_ops.borrow_mut().insert(op, &self.ex);
+
+        ConnectBuilderFuture {
+            completed: false,
+            ex: self.ex,
+            op: Some(key.data().as_ffi()),
+        }
+    }
+}
+
+pub struct ConnectBuilderFuture {
+    completed: bool,
+    ex: Executor,
+    op: Option<u64>,
+}
+
+impl Future for ConnectBuilderFuture {
+    type Output = Result<Stream>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        assert!(!self.completed);
+
+        let ex = self.ex.clone();
+
+        let key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(key_data));
+        let mut io_ops = ex.p.io_ops.borrow_mut();
+        let op = io_ops.get_mut(key).unwrap();
+
+        match (op.initiated, op.done) {
+            (false, true) => panic!(),
+            (true, false) => {
+                op.local_waker = Some(cx.local_waker().clone());
+                Poll::Pending
+            }
+            (false, false) => {
+                let user_data = key_data;
+
+                let OpType::TcpConnectBuilder { ref addr, .. } = op.op_type else {
+                    unreachable!();
+                };
+
+                let (af, _addrlen) = {
+                    if let Some(x) = addr.as_sockaddr_in() {
+                        (AF_INET, std::mem::size_of_val(x))
+                    } else if let Some(x) = addr.as_sockaddr_in6() {
+                        (AF_INET6, std::mem::size_of_val(x))
+                    } else {
+                        unreachable!();
+                    }
+                };
+
+                let sqe = get_sqe(&ex);
+                let r#type = SOCK_STREAM;
+                let protocol = IPPROTO_TCP;
+
+                unsafe { io_uring_prep_socket_direct_alloc(sqe, af, r#type, protocol, 0) };
+                unsafe { io_uring_sqe_set_data64(sqe, user_data) };
+
+                op.local_waker = Some(cx.local_waker().clone());
+                op.initiated = true;
+                Poll::Pending
+            }
+            (true, true) => {
+                unsafe { self.get_unchecked_mut().completed = true };
+
+                let OpType::TcpConnectBuilder { fd, .. } = op.op_type else {
+                    unreachable!();
+                };
+
+                let res = op.res;
+                if res < 0 {
+                    Poll::Ready(Err(Errno::from_raw(-res)))
+                } else {
+                    drop(io_ops);
+                    Poll::Ready(Ok(Stream::new(ex, fd)))
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ConnectBuilderFuture {
+    fn drop(&mut self) {
+        let op_cancel_key_data = self.op.unwrap();
+        let key = DefaultKey::from(KeyData::from_ffi(op_cancel_key_data));
+
+        let mut borrow_guard = self.ex.p.io_ops.borrow_mut();
+        let io_ops = &mut *borrow_guard;
+        let op = io_ops.get_mut(key).unwrap();
+
+        if op.initiated && !op.done {
+            op.eager_dropped = true;
+            op.local_waker = None;
+
+            let user_data = op_cancel_key_data;
+
+            let sqe = get_sqe(&self.ex);
+
+            unsafe { io_uring_prep_cancel64(sqe, user_data, IORING_ASYNC_CANCEL_ALL as i32) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+
+            self.op = None;
+            return;
+        }
+
+        let OpType::TcpConnectBuilder {
+            needs_socket,
+            got_socket,
+            fd,
+            ..
+        } = op.op_type
+        else {
+            unreachable!();
+        };
+
+        if !self.completed && needs_socket && got_socket {
+            assert!(op.initiated);
+            assert!(op.done);
+
+            if fd >= 0 {
+                let fd = fd.try_into().unwrap();
+
+                io_ops.remove(key).unwrap();
+                drop(borrow_guard);
+
+                let ex = &self.ex;
+
+                let sqe = get_sqe(ex);
+                unsafe { io_uring_prep_close_direct(sqe, fd) };
+                unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+            }
+
+            self.op = None;
+
+            return;
+        }
+
+        io_ops.remove(key).unwrap();
     }
 }

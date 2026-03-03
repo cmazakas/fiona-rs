@@ -20,7 +20,7 @@ use std::{
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use nix::{
     errno::Errno,
-    libc::{EISCONN, SHUT_RD, SHUT_RDWR, SHUT_WR},
+    libc::{SHUT_RD, SHUT_RDWR, SHUT_WR},
 };
 use rand::SeedableRng;
 
@@ -89,9 +89,8 @@ fn tcp_acceptor_hello_world() {
         unsafe { NUM_RUNS += 1 };
     });
 
-    let client = fiona::tcp::Client::new(ex.clone());
-    ex.spawn(async move {
-        client
+    ex.clone().spawn(async move {
+        let _client = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -125,9 +124,8 @@ fn tcp_acceptor_hello_world_double_run() {
             unsafe { NUM_RUNS += 1 };
         });
 
-        let client = fiona::tcp::Client::new(ex.clone());
-        ex.spawn(async move {
-            client
+        ex.clone().spawn(async move {
+            let _client = fiona::tcp::ClientBuilder::new(ex.clone())
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -177,9 +175,9 @@ fn tcp_multiple_accepts() {
 
         for _ in 0..2 {
             for _ in 0..NUM_CLIENTS {
-                let client = fiona::tcp::Client::new(ex.clone());
-                ex.spawn(async move {
-                    client
+                let ex2 = ex.clone();
+                ex.clone().spawn(async move {
+                    let _client = fiona::tcp::ClientBuilder::new(ex2.clone())
                         .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                         .await
                         .unwrap();
@@ -233,9 +231,8 @@ fn tcp_send_hello_world() {
         unsafe { NUM_RUNS += 1 };
     });
 
-    let client = fiona::tcp::Client::new(ex.clone());
     ex.clone().spawn(async move {
-        client
+        let client = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -281,9 +278,8 @@ fn tcp_send_hello_world_throwing() {
         panic!("rawr");
     });
 
-    let client = fiona::tcp::Client::new(ex.clone());
     ex.clone().spawn(async move {
-        client
+        let _client = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -295,20 +291,6 @@ fn tcp_send_hello_world_throwing() {
     });
 
     let _n = ioc.run();
-}
-
-#[test]
-fn test_downcast_destruction() {
-    // Want to prove that we can destruct the Client object via the Stream one.
-
-    let ioc = fiona::IoContext::new();
-    let ex = ioc.get_executor();
-
-    let _stream;
-    {
-        let client = fiona::tcp::Client::new(ex);
-        _stream = client.as_stream();
-    }
 }
 
 #[test]
@@ -332,8 +314,7 @@ fn tcp_accept_select_ready_always() {
 
         // Test that our accept() op completes immediately, but the future is
         // eager-dropped before we even see the CQE.
-        let client = fiona::tcp::Client::new(ex.clone());
-        client
+        let _client = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -349,8 +330,7 @@ fn tcp_accept_select_ready_always() {
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
         // Test that we can accept a new connection and that it works correctly.
-        let client2 = fiona::tcp::Client::new(ex.clone());
-        client2
+        let _client2 = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -364,8 +344,7 @@ fn tcp_accept_select_ready_always() {
         // actually poll() the AcceptFuture to completion. Because we're using multishot
         // accept, our op is running in the background so we have no need to explicitly
         // poll().
-        let client3 = fiona::tcp::Client::new(ex.clone());
-        client3
+        let _client3 = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -394,10 +373,13 @@ fn tcp_connect_timeout() {
     let ex = ioc.get_executor();
 
     ex.clone().spawn(async move {
-        let client = fiona::tcp::Client::new(ex);
-        let m_ok = client.connect_ipv4(Ipv4Addr::new(192, 0, 2, 0), 3301).await;
-        assert!(m_ok.is_err());
-        assert_eq!(m_ok.unwrap_err(), Errno::ECANCELED);
+        let stream = fiona::tcp::ClientBuilder::new(ex)
+            .connect_ipv4(Ipv4Addr::new(192, 0, 2, 0), 3301)
+            .await;
+
+        assert!(stream.is_err());
+        let Err(err) = stream else { unreachable!() };
+        assert_eq!(err, Errno::ECANCELED);
 
         unsafe { NUM_RUNS += 1 };
     });
@@ -461,9 +443,7 @@ fn tcp_send_recv_hello_world() {
     async fn client(
         ex: fiona::Executor, port: u16, message: &'static str, bgid: u16, expected_bufs: usize,
     ) {
-        let client = fiona::tcp::Client::new(ex);
-
-        client
+        let client = fiona::tcp::ClientBuilder::new(ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -558,9 +538,7 @@ fn tcp_recv_buffer_replenishing() {
     {
         let message = message.clone();
         ex.clone().spawn(async move {
-            let client = fiona::tcp::Client::new(ex);
-
-            client
+            let client = fiona::tcp::ClientBuilder::new(ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -636,8 +614,7 @@ fn tcp_connection_stress_test_no_cq_overflow() {
                 .await
                 .unwrap();
 
-            let client = fiona::tcp::Client::new(ex);
-            client
+            let client = fiona::tcp::ClientBuilder::new(ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -778,8 +755,7 @@ fn tcp_connection_stress_test_cq_overflow() {
                 .await
                 .unwrap();
 
-            let client = fiona::tcp::Client::new(ex);
-            client
+            let client = fiona::tcp::ClientBuilder::new(ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -894,84 +870,29 @@ fn tcp_double_connect() {
         .spawn((async |acceptor: fiona::tcp::Acceptor, ex: fiona::Executor| {
             let ex2 = ex.clone();
             let acceptor2 = acceptor.clone();
-            ex //
-                .clone()
-                .spawn(async move {
-                    let ex = ex2;
-                    let acceptor = acceptor2;
+            ex.clone().spawn(async move {
+                let ex = ex2;
+                let acceptor = acceptor2;
 
-                    let timer = fiona::time::Timer::new(ex);
-                    timer.wait(Duration::from_millis(250)).await.unwrap();
+                let timer = fiona::time::Timer::new(ex);
+                timer.wait(Duration::from_millis(250)).await.unwrap();
 
-                    acceptor.cancel().await.unwrap();
-                });
+                acceptor.cancel().await.unwrap();
+            });
 
             let _stream = acceptor.accept().await;
         })(acceptor.clone(), ex.clone()));
 
-    // sequential double-connect
+    // Concurrent double-connect. Make sure our Future can handle being polled
+    // twice.
     {
         let ex = ex.clone();
         ex.clone().spawn(async move {
-            let client = fiona::tcp::Client::new(ex);
-            client
-                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                .await
-                .unwrap();
-
-            let err = client
-                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                .await
-                .unwrap_err();
-
-            assert_eq!(err, Errno::from_raw(EISCONN));
-        });
-    }
-
-    // concurrent double-connect
-    {
-        let ex = ex.clone();
-        ex.clone().spawn(async move {
-            let client = fiona::tcp::Client::new(ex);
+            let client = fiona::tcp::ClientBuilder::new(ex);
             let mut f1 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
 
-            assert!(futures::poll!(unsafe { std::pin::Pin::new_unchecked(&mut f1) }).is_pending());
-
-            {
-                let client = client.clone();
-                assert!(
-                    catch_unwind(AssertUnwindSafe(|| {
-                        let _f2 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
-                    }))
-                    .is_err()
-                );
-            }
-        });
-    }
-
-    // concurrent double-connect when already connected
-    {
-        let ex = ex.clone();
-        ex.clone().spawn(async move {
-            let client = fiona::tcp::Client::new(ex);
-            client
-                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
-                .await
-                .unwrap();
-
-            let mut f1 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
-
-            assert!(futures::poll!(unsafe { std::pin::Pin::new_unchecked(&mut f1) }).is_pending());
-
-            {
-                let client = client.clone();
-                assert!(
-                    catch_unwind(AssertUnwindSafe(|| {
-                        let _f2 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
-                    }))
-                    .is_err()
-                );
-            }
+            assert!(futures::poll!(&mut f1).is_pending());
+            assert!(futures::poll!(&mut f1).is_pending());
         });
     }
 
@@ -1046,15 +967,14 @@ fn tcp_concurrent_send_recv() {
 
     async fn client(ex: fiona::Executor, port: u16, messages: Rc<Vec<Vec<u8>>>) {
         for i in 0..NUM_CLIENTS {
-            let client = fiona::tcp::Client::new(ex.clone());
-            client
+            let client = fiona::tcp::ClientBuilder::new(ex.clone())
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
 
             client.set_buf_group(BGID);
-            ex.spawn(recv(client.as_stream(), messages.clone(), i as usize));
-            ex.spawn(send(client.as_stream(), messages.clone(), i as usize));
+            ex.spawn(recv(client.clone(), messages.clone(), i as usize));
+            ex.spawn(send(client.clone(), messages.clone(), i as usize));
         }
     }
 
@@ -1127,8 +1047,7 @@ fn tcp_select_drop_ready_recv_future() {
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::tcp::Client::new(ex.clone());
-        client
+        let client = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1174,22 +1093,18 @@ fn tcp_close() {
     async fn client(ex: fiona::Executor, port: u16) {
         let timer = fiona::time::Timer::new(ex.clone());
         {
-            let client = fiona::tcp::Client::new(ex.clone());
-            client
+            let client = fiona::tcp::ClientBuilder::new(ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
 
             timer.wait(Duration::from_millis(100)).await.unwrap();
 
-            let stream = client.as_stream();
+            let stream = client;
             let r = stream.close().await;
             assert!(r.is_ok());
 
             let (r, _) = stream.send(vec![0, 1, 2, 3, 4]).await;
-            assert_eq!(r.unwrap_err(), Errno::EBADF);
-
-            let r = client.connect_ipv4(Ipv4Addr::LOCALHOST, port).await;
             assert_eq!(r.unwrap_err(), Errno::EBADF);
         }
         // Time-slice at the end here so we do a full CQE processing loop for the
@@ -1230,8 +1145,7 @@ fn tcp_close_eager_drop() {
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::tcp::Client::new(ex.clone());
-        client
+        let client = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1239,7 +1153,7 @@ fn tcp_close_eager_drop() {
         let timer = fiona::time::Timer::new(ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
-        let stream = client.as_stream();
+        let stream = client;
         let r = stream.close().await;
         assert!(r.is_ok());
     }
@@ -1286,8 +1200,7 @@ fn tcp_shutdown() {
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::tcp::Client::new(ex.clone());
-        client
+        let client = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1295,7 +1208,7 @@ fn tcp_shutdown() {
         let timer = fiona::time::Timer::new(ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
-        let stream = client.as_stream();
+        let stream = client;
 
         let r = stream.shutdown(SHUT_RDWR).await;
         assert!(r.is_ok());
@@ -1340,8 +1253,7 @@ fn tcp_shutdown_eager_drop() {
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::tcp::Client::new(ex.clone());
-        client
+        let client = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1349,7 +1261,7 @@ fn tcp_shutdown_eager_drop() {
         let timer = fiona::time::Timer::new(ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
-        let stream = client.as_stream();
+        let stream = client;
 
         let r = stream.shutdown(SHUT_RDWR).await;
         assert!(r.is_ok());
@@ -1404,8 +1316,7 @@ fn tcp_cancel() {
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::tcp::Client::new(ex.clone());
-        client
+        let client = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1413,7 +1324,7 @@ fn tcp_cancel() {
         let timer = fiona::time::Timer::new(ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
-        let stream = client.as_stream();
+        let stream = client;
 
         stream
             .send(String::from("hello, world!").into_bytes())
@@ -1473,8 +1384,7 @@ fn tcp_eager_drop_send_ready() {
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::tcp::Client::new(ex.clone());
-        client
+        let client = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1482,7 +1392,7 @@ fn tcp_eager_drop_send_ready() {
         let timer = fiona::time::Timer::new(ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
-        let stream = client.as_stream();
+        let stream = client;
 
         stream.send(vec![0, 1, 2, 3, 4]).await.0.unwrap();
 
@@ -1516,8 +1426,9 @@ fn tcp_eager_drop_connect_ready() {
     assert_eq!(n, 2);
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::tcp::Client::new(ex);
-        let mut connect_future = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
+        let mut connect_future =
+            fiona::tcp::ClientBuilder::new(ex.clone()).connect_ipv4(Ipv4Addr::LOCALHOST, port);
+
         let w = WakerFuture.await;
         let mut cx = std::task::Context::from_waker(&w);
 
@@ -1527,13 +1438,13 @@ fn tcp_eager_drop_connect_ready() {
                 .is_pending()
         );
 
-        let timer = fiona::time::Timer::new(client.get_executor());
+        let timer = fiona::time::Timer::new(ex.clone());
         timer.wait(Duration::from_millis(250)).await.unwrap();
 
         drop(connect_future);
         timer.wait(Duration::from_millis(250)).await.unwrap();
 
-        client
+        fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1566,9 +1477,8 @@ fn tcp_connect_ipv6() {
         unsafe { NUM_RUNS += 1 };
     });
 
-    let client = fiona::tcp::Client::new(ex.clone());
-    ex.spawn(async move {
-        client
+    ex.clone().spawn(async move {
+        let _client = fiona::tcp::ClientBuilder::new(ex.clone())
             .connect_ipv6(Ipv6Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1638,13 +1548,14 @@ fn tcp_reuse_port_ipv4() {
     });
 
     let client_op = async |ex: fiona::Executor, port: u16| {
-        let client = fiona::tcp::Client::new(ex.clone());
-        let r = client.connect_ipv4(Ipv4Addr::LOCALHOST, port).await;
-        if r.is_err() {
+        let client = fiona::tcp::ClientBuilder::new(ex.clone())
+            .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+            .await;
+        if client.is_err() {
             return;
         }
 
-        let s = client.as_stream();
+        let s = client.unwrap();
         let _ = s.close().await;
     };
 
@@ -1715,13 +1626,15 @@ fn tcp_reuse_port_ipv6() {
     });
 
     let client_op = async |ex: fiona::Executor, port: u16| {
-        let client = fiona::tcp::Client::new(ex.clone());
-        let r = client.connect_ipv6(Ipv6Addr::LOCALHOST, port).await;
-        if r.is_err() {
+        let client = fiona::tcp::ClientBuilder::new(ex.clone())
+            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+            .await;
+
+        if client.is_err() {
             return;
         }
 
-        let s = client.as_stream();
+        let s = client.unwrap();
         let _ = s.close().await;
     };
 
@@ -1793,12 +1706,10 @@ fn tcp_send_subspan() {
         let port = acceptor.port();
 
         let h = ex.spawn((async |port: u16, ex: fiona::Executor| {
-            let client = fiona::tcp::Client::new(ex);
-            client
+            fiona::tcp::ClientBuilder::new(ex)
                 .connect_ipv6(Ipv6Addr::LOCALHOST, port)
                 .await
-                .unwrap();
-            client
+                .unwrap()
         })(port, ex.clone()));
 
         let stream = acceptor.accept().await.unwrap();
@@ -1881,9 +1792,7 @@ fn tcp_ephemeral_port_exhaustion_panic() {
 
             for _ in 0..25_000 {
                 ex.clone().spawn((async |ex: fiona::Executor, port: u16| {
-                    let client = fiona::tcp::Client::new(ex);
-
-                    client
+                    let client = fiona::tcp::ClientBuilder::new(ex)
                         .connect_ipv6(Ipv6Addr::LOCALHOST, port)
                         .await
                         .unwrap();
@@ -1994,11 +1903,9 @@ fn tcp_sockets_outlive_io_context() {
 
     async fn client(
         ex: fiona::Executor, port: u16, bgid: u16,
-        client_stream: Rc<RefCell<Option<fiona::tcp::Client>>>,
+        client_stream: Rc<RefCell<Option<fiona::tcp::Stream>>>,
     ) {
-        let client = fiona::tcp::Client::new(ex);
-
-        client
+        let client = fiona::tcp::ClientBuilder::new(ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
