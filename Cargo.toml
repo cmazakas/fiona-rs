@@ -35,15 +35,7 @@ inherits = "release"
 lto = "thin"
 
 [[bench]]
-name = "echo"
-harness = false
-
-[[bench]]
 name = "echo2"
-harness = false
-
-[[bench]]
-name = "echo3"
 harness = false
 
 [[bench]]
