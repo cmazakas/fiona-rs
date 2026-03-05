@@ -133,7 +133,11 @@ fn tokio_echo_client(
         join_set.join_all().await;
     });
 
-    println!("tokio client loop took: {:?} for {} connections", start.elapsed(), nr_files);
+    println!(
+        "tokio client loop took: {:?} for {} connections",
+        start.elapsed(),
+        nr_files * num_threads
+    );
 
     Ok(())
 }
@@ -300,6 +304,7 @@ fn fiona_echo_client(
                     let mut h = blake2::Blake2b512::new();
 
                     let stream = fiona::tcp::Client::new(ex2)
+                        .with_timeout(Duration::from_secs(10))
                         .connect_ipv4(ipv4_addr, port)
                         .await
                         .unwrap();
@@ -368,8 +373,6 @@ fn fiona_echo_server(
             ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)
                 .unwrap();
 
-            // unsafe { DURATION = Duration::new(0, 0) };
-
             {
                 let acceptor = acceptor.clone();
                 let cancel_token = cancel_token.clone();
@@ -392,8 +395,6 @@ fn fiona_echo_server(
                     let bytes = bytes.clone();
 
                     ex.clone().spawn(async move {
-                        // let start = Instant::now();
-
                         let mut h = blake2::Blake2b512::new();
 
                         stream.set_timeout(Duration::from_secs(120));
@@ -407,8 +408,6 @@ fn fiona_echo_server(
 
                         fiona_close(stream.clone()).await;
                         drop(stream);
-
-                        // unsafe { DURATION += start.elapsed() };
                     });
 
                     let n = total_conns.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -426,8 +425,6 @@ fn fiona_echo_server(
         t.join().unwrap();
     }
 
-    // let avg_dur = unsafe { DURATION / nr_files };
-    // println!("fiona average server duration: {avg_dur:?}");
     println!(
         "fiona accept loop took: {:?} for {} connections",
         start.elapsed(),
