@@ -516,10 +516,10 @@ fn timer_foreign_executor() {
     // execution contexts.
 
     {
-        // Intent here is to post the SQE and not see the completed operation. This
-        // means the TimerFuture should never resolve and also that the op from the
-        // backing slotmap shouldn't be released either, i.e. this test should leak I/O
-        // ops.
+        // Intent here is to post the SQE and not see the completed operation.
+        // This means the TimerFuture should never resolve and also that
+        // the op from the backing slotmap shouldn't be released either,
+        // i.e. this test should leak I/O ops.
 
         let ioc1 = Rc::new(RefCell::new(fiona::IoContext::new()));
         let ioc2 = Rc::new(RefCell::new(fiona::IoContext::new()));
@@ -589,5 +589,38 @@ fn timer_foreign_executor() {
         })(timer1.clone(), ioc1.clone(), ex2.clone()));
 
         ioc2.borrow_mut().run();
+    }
+
+    {
+        // Try to emulate a bit of existing practice with RunUntilQuit.
+
+        async fn run_until(ioc: Rc<RefCell<fiona::IoContext>>) {
+            let ex = ioc.borrow().get_executor();
+            ex.clone().spawn(async {
+                let timer = fiona::time::Timer::new(ex);
+                timer.wait(Duration::from_millis(100)).await.unwrap();
+            });
+            ioc.borrow_mut().run();
+        }
+
+        let ioc1 = Rc::new(RefCell::new(fiona::IoContext::new()));
+        let ioc2 = Rc::new(RefCell::new(fiona::IoContext::new()));
+
+        let ex1 = ioc1.borrow().get_executor();
+        let ex2 = ioc2.borrow().get_executor();
+
+        for _ in 0..2 {
+            ex1.spawn((async |ioc2: Rc<RefCell<fiona::IoContext>>| {
+                run_until(ioc2).await;
+            })(ioc2.clone()));
+
+            ioc1.borrow_mut().run();
+
+            ex2.spawn((async |ioc1: Rc<RefCell<fiona::IoContext>>| {
+                run_until(ioc1).await;
+            })(ioc1.clone()));
+
+            ioc2.borrow_mut().run();
+        }
     }
 }
