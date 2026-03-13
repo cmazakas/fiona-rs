@@ -11,6 +11,30 @@ use std::{
 
 use crate::tcp;
 
+#[derive(Debug)]
+pub enum Error {
+    Io(std::io::Error),
+    Tls(rustls::Error),
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::Io(err)
+    }
+}
+
+impl From<nix::Error> for Error {
+    fn from(err: nix::Error) -> Self {
+        Error::Io(err.into())
+    }
+}
+
+impl From<rustls::Error> for Error {
+    fn from(err: rustls::Error) -> Self {
+        Error::Tls(err)
+    }
+}
+
 struct StreamImpl<ConnectionType> {
     tls_conn: RefCell<ConnectionType>,
     buf: RefCell<Vec<u8>>,
@@ -30,8 +54,8 @@ pub struct Client {
 
 pub async fn server_handshake(
     stream: tcp::Stream, config: Arc<rustls::ServerConfig>,
-) -> Result<Stream, std::io::Error> {
-    let config = rustls::ServerConnection::new(config).unwrap();
+) -> Result<Stream, Error> {
+    let config = rustls::ServerConnection::new(config)?;
 
     let tls_stream = Stream {
         tcp_stream: stream,
@@ -68,7 +92,7 @@ pub async fn server_handshake(
             for mut b in &bufs {
                 tls_conn.borrow_mut().read_tls(&mut b)?;
             }
-            tls_conn.borrow_mut().process_new_packets().unwrap();
+            tls_conn.borrow_mut().process_new_packets()?;
         }
 
         if !is_handshaking {
@@ -82,7 +106,7 @@ pub async fn server_handshake(
 }
 
 impl Stream {
-    pub async fn send(&self, plaintext: &[u8]) -> Result<usize, std::io::Error> {
+    pub async fn send(&self, plaintext: &[u8]) -> Result<usize, Error> {
         self.stream_impl.send_pending.set(true);
 
         let mut buf = std::mem::take(&mut *self.stream_impl.buf.borrow_mut());
@@ -99,11 +123,15 @@ impl Stream {
         Ok(n?)
     }
 
-    pub async fn recv(&self, plaintext: &mut [u8]) -> Result<usize, std::io::Error> {
+    pub async fn recv(&self, plaintext: &mut [u8]) -> Result<usize, Error> {
         self.stream_impl.recv_pending.set(true);
         let tls_conn = &self.stream_impl.tls_conn;
         if !tls_conn.borrow().wants_read() {
-            return tls_conn.borrow_mut().reader().read(plaintext);
+            return tls_conn
+                .borrow_mut()
+                .reader()
+                .read(plaintext)
+                .map_err(Error::from);
         }
 
         let bufs = self.tcp_stream.recv().await?;
@@ -111,20 +139,24 @@ impl Stream {
         for mut b in &bufs {
             tls_conn.borrow_mut().read_tls(&mut b)?;
         }
-        tls_conn.borrow_mut().process_new_packets().unwrap();
+        tls_conn.borrow_mut().process_new_packets()?;
 
-        tls_conn.borrow_mut().reader().read(plaintext)
+        tls_conn
+            .borrow_mut()
+            .reader()
+            .read(plaintext)
+            .map_err(Error::from)
     }
 }
 
 pub async fn client_handshake(
     stream: tcp::Stream, config: Arc<rustls::ClientConfig>,
     server_name: rustls_pki_types::ServerName<'static>,
-) -> Result<Client, std::io::Error> {
+) -> Result<Client, Error> {
     let tls_client = Client {
         tcp_stream: stream,
         stream_impl: Rc::new(StreamImpl {
-            tls_conn: RefCell::new(rustls::ClientConnection::new(config, server_name).unwrap()),
+            tls_conn: RefCell::new(rustls::ClientConnection::new(config, server_name)?),
             buf: RefCell::new(Vec::new()),
             send_pending: Cell::new(false),
             recv_pending: Cell::new(false),
@@ -155,7 +187,7 @@ pub async fn client_handshake(
             for mut b in &bufs {
                 tls_conn.borrow_mut().read_tls(&mut b)?;
             }
-            tls_conn.borrow_mut().process_new_packets().unwrap();
+            tls_conn.borrow_mut().process_new_packets()?;
         }
 
         if !is_handshaking {
@@ -178,7 +210,7 @@ pub async fn client_handshake(
 }
 
 impl Client {
-    pub async fn send(&self, plaintext: &[u8]) -> Result<usize, std::io::Error> {
+    pub async fn send(&self, plaintext: &[u8]) -> Result<usize, Error> {
         self.stream_impl.send_pending.set(true);
 
         let mut buf = std::mem::take(&mut *self.stream_impl.buf.borrow_mut());
@@ -195,11 +227,15 @@ impl Client {
         Ok(n?)
     }
 
-    pub async fn recv(&self, plaintext: &mut [u8]) -> Result<usize, std::io::Error> {
+    pub async fn recv(&self, plaintext: &mut [u8]) -> Result<usize, Error> {
         self.stream_impl.recv_pending.set(true);
         let tls_conn = &self.stream_impl.tls_conn;
         if !tls_conn.borrow().wants_read() {
-            return tls_conn.borrow_mut().reader().read(plaintext);
+            return tls_conn
+                .borrow_mut()
+                .reader()
+                .read(plaintext)
+                .map_err(Error::from);
         }
 
         let bufs = self.tcp_stream.recv().await?;
@@ -207,8 +243,12 @@ impl Client {
         for mut b in &bufs {
             tls_conn.borrow_mut().read_tls(&mut b)?;
         }
-        tls_conn.borrow_mut().process_new_packets().unwrap();
+        tls_conn.borrow_mut().process_new_packets()?;
 
-        tls_conn.borrow_mut().reader().read(plaintext)
+        tls_conn
+            .borrow_mut()
+            .reader()
+            .read(plaintext)
+            .map_err(Error::from)
     }
 }
