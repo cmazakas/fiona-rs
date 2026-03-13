@@ -2,13 +2,7 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-#![feature(
-    ptr_metadata,
-    box_as_ptr,
-    local_waker,
-    sync_unsafe_cell,
-    range_bounds_is_empty
-)]
+#![feature(ptr_metadata, local_waker, sync_unsafe_cell)]
 #![warn(clippy::pedantic)]
 #![allow(
     clippy::mutable_key_type,
