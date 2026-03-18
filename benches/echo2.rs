@@ -235,9 +235,11 @@ async fn compio_send(stream: &mut compio::net::TcpStream, bytes: Arc<Vec<u8>>) {
             n += sent;
             total_sent += sent;
 
-            buf.rotate_left(sent);
+            buf.drain(0..sent);
             send_buf = buf;
         }
+
+        send_buf.resize(SEND_BUF_SIZE, 0);
     }
 }
 
