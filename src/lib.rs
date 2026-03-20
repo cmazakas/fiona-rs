@@ -1365,7 +1365,7 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe) {
 
         // If our connect() op is borrowing an FD from the runtime,
         // we need to close it and return it.
-        if cqe.res < 0 && *needs_socket {
+        if cqe.res < 0 && *needs_socket && *got_socket {
             let reclaimed_fd = (*fd).try_into().unwrap();
             *fd = -1;
 

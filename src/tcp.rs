@@ -307,7 +307,7 @@ impl Future for AcceptFuture<'_> {
     type Output = Result<Stream>;
 
     fn poll(
-        self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         assert!(!self.completed);
 
@@ -316,6 +316,11 @@ impl Future for AcceptFuture<'_> {
 
         match acceptor_impl.accept_op {
             None => {
+                if acceptor_impl.fd_impl.fd == -1 {
+                    self.completed = true;
+                    return Poll::Ready(Err(Errno::EBADF));
+                }
+
                 let ref_count = &raw mut acceptor_impl.fd_impl.ref_count;
 
                 let io_ops = &mut *ex.p.io_ops.borrow_mut();
@@ -809,13 +814,18 @@ impl Future for SendFuture<'_> {
             }
             (false, false) => {
                 let OpType::TcpSend {
-                    ref buf,
+                    ref mut buf,
                     ref subspan,
                     ..
                 } = op.op_type
                 else {
                     unreachable!()
                 };
+
+                if stream_impl.fd_impl.fd == -1 {
+                    self.completed = true;
+                    return Poll::Ready((Err(Errno::EBADF), mem::take(buf)));
+                }
 
                 {
                     let sqe = get_sqe(&stream_impl.fd_impl.ex);
@@ -878,6 +888,7 @@ impl Future for CloseFuture<'_> {
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> Poll<Self::Output> {
+        assert!(!self.completed);
         let fd_impl = unsafe { &mut *self.fd_impl };
 
         let key_data = self.op.unwrap();
@@ -894,12 +905,19 @@ impl Future for CloseFuture<'_> {
                 Poll::Pending
             }
             (false, false) => {
+                if fd_impl.fd == -1 {
+                    self.completed = true;
+                    return Poll::Ready(Err(Errno::EBADF));
+                }
+
                 let OpType::TcpClose = op.op_type else {
                     unreachable!()
                 };
 
                 let sqe = get_sqe(&fd_impl.ex);
                 let fd = fd_impl.fd as u32;
+
+                fd_impl.fd = -1;
 
                 if fd_impl.is_fixed {
                     unsafe { io_uring_prep_close_direct(sqe, fd) };
@@ -976,6 +994,8 @@ impl Future for ShutdownFuture<'_> {
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> Poll<Self::Output> {
+        assert!(!self.completed);
+
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
 
         let key_data = self.op.unwrap();
@@ -992,6 +1012,11 @@ impl Future for ShutdownFuture<'_> {
                 Poll::Pending
             }
             (false, false) => {
+                if stream_impl.fd_impl.fd == -1 {
+                    self.completed = true;
+                    return Poll::Ready(Err(Errno::EBADF));
+                }
+
                 let OpType::TcpShutdown = op.op_type else {
                     unreachable!()
                 };
@@ -1072,10 +1097,11 @@ impl Future for CancelFuture<'_> {
     ) -> Poll<Self::Output> {
         assert!(!self.completed);
 
+        let fd_impl = unsafe { &mut *self.fd_impl };
+
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
 
-        let fd_impl = unsafe { &mut *self.fd_impl };
         let mut io_ops = fd_impl.ex.p.io_ops.borrow_mut();
         let op = io_ops.get_mut(key).unwrap();
 
@@ -1088,6 +1114,11 @@ impl Future for CancelFuture<'_> {
                 Poll::Pending
             }
             (false, false) => {
+                if fd_impl.fd == -1 {
+                    self.completed = true;
+                    return Poll::Ready(Err(Errno::EBADF));
+                }
+
                 let OpType::TcpCancel = op.op_type else {
                     unreachable!()
                 };
@@ -1174,6 +1205,11 @@ impl Future for RecvFuture<'_> {
 
         match stream_impl.recv_op {
             None => {
+                if stream_impl.fd_impl.fd == -1 {
+                    self.completed = true;
+                    return Poll::Ready(Err(Errno::EBADF));
+                }
+
                 let ioprio = u16::try_from(IORING_RECVSEND_BUNDLE).unwrap();
 
                 let ref_count = &raw mut stream_impl.fd_impl.ref_count;

@@ -1938,3 +1938,144 @@ fn tcp_sockets_outlive_io_context() {
     assert!(Pin::new(&mut close1).poll(&mut ctx).is_pending());
     assert!(Pin::new(&mut close2).poll(&mut ctx).is_pending());
 }
+
+#[test]
+fn tcp_socket_reuse() {
+    let params = fiona::IoContextParams {
+        sq_entries: 256,
+        cq_entries: 4 * 1024,
+        nr_files: 1024,
+    };
+
+    let mut ioc = fiona::IoContext::with_params(&params);
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor2 = acceptor.clone();
+    let port = acceptor.port();
+
+    const NUM_CONNS: u32 = 500;
+
+    ex.clone().spawn(async move {
+        let mut closed_streams = Vec::new();
+        for _ in 0..NUM_CONNS {
+            let s = acceptor.accept().await.unwrap();
+            closed_streams.push(s.clone());
+            s.close().await.unwrap();
+        }
+
+        let mut streams = Vec::new();
+        for _ in 0..NUM_CONNS {
+            let s = acceptor.accept().await.unwrap();
+            streams.push(s.clone());
+        }
+
+        for s in &closed_streams {
+            let (n, _buf) = s.send(vec![0, 1, 2, 3, 4]).await;
+            assert!(n.is_err());
+            assert_eq!(n.unwrap_err(), Errno::EBADF);
+        }
+
+        for s in &streams {
+            let (n, _buf) = s.send(vec![0, 1, 2, 3, 4]).await;
+            assert!(n.is_ok());
+        }
+    });
+
+    ex.clone().spawn(async move {
+        let mut closed_streams = Vec::new();
+        for _ in 0..NUM_CONNS {
+            let s = fiona::tcp::Client::new(ex.clone())
+                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            closed_streams.push(s.clone());
+            s.close().await.unwrap();
+        }
+
+        let mut streams = Vec::new();
+        for _ in 0..NUM_CONNS {
+            let s = fiona::tcp::Client::new(ex.clone())
+                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            streams.push(s.clone());
+        }
+
+        for s in &closed_streams {
+            let (n, _buf) = s.send(vec![0, 1, 2, 3, 4]).await;
+            assert!(n.is_err());
+            assert_eq!(n.unwrap_err(), Errno::EBADF);
+        }
+
+        for s in &streams {
+            let (n, _buf) = s.send(vec![0, 1, 2, 3, 4]).await;
+            assert!(n.is_ok());
+        }
+    });
+
+    ioc.run();
+
+    let ex = ioc.get_executor();
+    let acceptor = acceptor2;
+
+    ex.clone().spawn(async move {
+        let mut closed_streams = Vec::new();
+        let mut streams = Vec::new();
+
+        for i in 0..2 * NUM_CONNS {
+            let s = acceptor.accept().await.unwrap();
+            if i % 2 == 0 {
+                closed_streams.push(s.clone());
+                s.close().await.unwrap();
+            } else {
+                streams.push(s.clone());
+            }
+        }
+
+        for s in &closed_streams {
+            let (n, _buf) = s.send(vec![0, 1, 2, 3, 4]).await;
+            assert!(n.is_err());
+            assert_eq!(n.unwrap_err(), Errno::EBADF);
+        }
+
+        for s in &streams {
+            let (n, _buf) = s.send(vec![0, 1, 2, 3, 4]).await;
+            assert!(n.is_ok());
+        }
+    });
+
+    ex.clone().spawn(async move {
+        let mut closed_streams = Vec::new();
+        let mut streams = Vec::new();
+
+        for i in 0..2 * NUM_CONNS {
+            let s = fiona::tcp::Client::new(ex.clone())
+                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            if i % 2 == 0 {
+                closed_streams.push(s.clone());
+                s.close().await.unwrap();
+            } else {
+                streams.push(s.clone());
+            }
+        }
+
+        for s in &closed_streams {
+            let (n, _buf) = s.send(vec![0, 1, 2, 3, 4]).await;
+            assert!(n.is_err());
+            assert_eq!(n.unwrap_err(), Errno::EBADF);
+        }
+
+        for s in &streams {
+            let (n, _buf) = s.send(vec![0, 1, 2, 3, 4]).await;
+            assert!(n.is_ok());
+        }
+    });
+
+    ioc.run();
+}
