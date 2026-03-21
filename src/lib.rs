@@ -20,7 +20,7 @@
 use std::{
     alloc::Layout,
     cell::{RefCell, SyncUnsafeCell, UnsafeCell},
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     fmt::Debug,
     future::Future,
     hash::Hash,
@@ -51,9 +51,9 @@ use liburing_rs::{
     IORING_SETUP_CQSIZE, IORING_SETUP_DEFER_TASKRUN, IORING_SETUP_SINGLE_ISSUER,
     IORING_TIMEOUT_MULTISHOT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring,
     io_uring_buf_ring, io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask,
-    io_uring_cq_advance, io_uring_cqe, io_uring_cqe_seen, io_uring_for_each_cqe,
-    io_uring_free_buf_ring, io_uring_get_events, io_uring_get_sqe, io_uring_params,
-    io_uring_peek_cqe, io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_connect,
+    io_uring_cq_advance, io_uring_cqe, io_uring_for_each_cqe, io_uring_free_buf_ring,
+    io_uring_get_events, io_uring_get_sqe, io_uring_params, io_uring_peek_cqe,
+    io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_connect,
     io_uring_prep_link_timeout, io_uring_prep_msg_ring, io_uring_prep_timeout, io_uring_queue_exit,
     io_uring_queue_init_params, io_uring_register_files_sparse, io_uring_register_ring_fd,
     io_uring_register_sync_msg, io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe,
@@ -836,17 +836,6 @@ struct RunGuard {
     preserve_head_and_tail: bool,
 }
 
-struct CQESeenGuard<'a> {
-    ring: *mut io_uring,
-    cqe: &'a mut io_uring_cqe,
-}
-
-impl Drop for CQESeenGuard<'_> {
-    fn drop(&mut self) {
-        unsafe { io_uring_cqe_seen(self.ring, self.cqe) };
-    }
-}
-
 struct CQEAdvanceGuard {
     ring: *mut io_uring,
     n: usize,
@@ -902,43 +891,15 @@ unsafe fn clear_task_list(p: &Rc<IoContextFrame>, preserve_head_and_tail: bool) 
     }
 }
 
-unsafe fn clear_completion_queue(io_ops: &RefCell<IoOpsMap>, ring: *mut io_uring) {
-    let mut blacklist = HashSet::<u64>::new();
+unsafe fn clear_completion_queue(ex: &Executor) {
+    let ring = ex.ring();
 
     unsafe { submit_ring(ring) };
     unsafe { io_uring_get_events(ring) };
 
     let mut cqe = std::ptr::null_mut::<io_uring_cqe>();
     while unsafe { io_uring_peek_cqe(ring, &raw mut cqe) } == 0 {
-        let cqe = unsafe { &mut *cqe };
-        let user_data = cqe.user_data;
-
-        {
-            let _g = CQESeenGuard { ring, cqe };
-
-            if user_data != 0 && user_data != 1 {
-                if blacklist.contains(&user_data) {
-                    continue;
-                }
-
-                blacklist.insert(user_data);
-
-                let key = DefaultKey::from(KeyData::from_ffi(user_data));
-
-                let was_eager_dropped = io_ops.borrow().get(key).unwrap().eager_dropped;
-                let rc = if was_eager_dropped {
-                    let op = io_ops.borrow_mut().remove(key).unwrap();
-                    op.ref_count
-                } else {
-                    io_ops.borrow().get(key).unwrap().ref_count
-                };
-
-                if !rc.is_null() {
-                    unsafe { release_op(rc) };
-                }
-            }
-        }
-
+        process_cqes(ex);
         unsafe { io_uring_get_events(ring) };
     }
 }
@@ -956,12 +917,8 @@ impl Drop for RunGuard {
             unsafe { clear_task_list(&self.p, self.preserve_head_and_tail) };
         }
 
-        let ring = {
-            let mut ioring = self.p.ioring.borrow_mut();
-            &raw mut *ioring
-        };
-
-        unsafe { clear_completion_queue(&self.p.io_ops, ring) };
+        let ex = Executor { p: self.p.clone() };
+        unsafe { clear_completion_queue(&ex) };
     }
 }
 
@@ -1120,18 +1077,23 @@ impl IoContext {
             }
 
             unsafe { io_uring_submit_and_wait(ring, 1) };
-
-            let mut guard = CQEAdvanceGuard { ring, n: 0 };
-
-            let f = |cqe: *mut io_uring_cqe| {
-                unsafe { on_cqe(&ex, cqe, &mut guard) };
-            };
-
-            unsafe { io_uring_for_each_cqe(ring, f) };
+            process_cqes(&ex);
         }
 
         num_completed
     }
+}
+
+fn process_cqes(ex: &Executor) {
+    let ring = ex.ring();
+
+    let mut guard = CQEAdvanceGuard { ring, n: 0 };
+
+    let f = |cqe: *mut io_uring_cqe| {
+        unsafe { on_cqe(ex, cqe, &mut guard) };
+    };
+
+    unsafe { io_uring_for_each_cqe(ring, f) };
 }
 
 unsafe fn on_cqe(ex: &Executor, cqe: *mut io_uring_cqe, guard: &mut CQEAdvanceGuard) {

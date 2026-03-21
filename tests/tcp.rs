@@ -1850,6 +1850,9 @@ fn tcp_acceptor_outlives_io_context() {
     assert!(Pin::new(&mut fut).poll(&mut ctx).is_pending());
     assert!(Pin::new(&mut fut).poll(&mut ctx).is_pending());
 
+    // This should panic because when our IoContext goes out of scope, we deallocate
+    // all of the task queues so in this case, calling spawn() needs to panic to
+    // ensure soundness as the dangling task head/tail have been freed.
     let r = catch_unwind(AssertUnwindSafe(|| {
         let string = String::from("hello, world!");
         ex.spawn(async move {

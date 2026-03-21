@@ -517,9 +517,6 @@ fn timer_foreign_executor() {
 
     {
         // Intent here is to post the SQE and not see the completed operation.
-        // This means the TimerFuture should never resolve and also that
-        // the op from the backing slotmap shouldn't be released either,
-        // i.e. this test should leak I/O ops.
 
         let ioc1 = Rc::new(RefCell::new(fiona::IoContext::new()));
         let ioc2 = Rc::new(RefCell::new(fiona::IoContext::new()));
@@ -548,8 +545,7 @@ fn timer_foreign_executor() {
             timer1.get_executor().spawn(async move {});
             ioc1.borrow_mut().run();
 
-            assert!(Pin::new(&mut f1).poll(&mut cx).is_pending());
-            assert!(Pin::new(&mut f1).poll(&mut cx).is_pending());
+            assert!(Pin::new(&mut f1).poll(&mut cx).is_ready());
         })(timer1.clone(), ioc1.clone(), ex2.clone()));
 
         ioc2.borrow_mut().run();
