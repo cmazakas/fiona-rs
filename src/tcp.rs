@@ -1340,7 +1340,7 @@ impl Client {
     }
 
     #[must_use]
-    pub fn connect_ipv4(self, addr: Ipv4Addr, port: u16) -> ConnectBuilderFuture {
+    pub fn connect_ipv4(self, addr: Ipv4Addr, port: u16) -> ConnectFuture {
         let addr = SocketAddrV4::new(addr, port);
 
         let op = make_io_uring_op(
@@ -1357,7 +1357,7 @@ impl Client {
 
         let key = self.ex.p.io_ops.borrow_mut().insert(op, &self.ex);
 
-        ConnectBuilderFuture {
+        ConnectFuture {
             completed: false,
             ex: self.ex,
             op: Some(key.data().as_ffi()),
@@ -1365,7 +1365,7 @@ impl Client {
     }
 
     #[must_use]
-    pub fn connect_ipv6(self, addr: Ipv6Addr, port: u16) -> ConnectBuilderFuture {
+    pub fn connect_ipv6(self, addr: Ipv6Addr, port: u16) -> ConnectFuture {
         let addr = SocketAddrV6::new(addr, port, 0, 0);
 
         let op = make_io_uring_op(
@@ -1382,7 +1382,7 @@ impl Client {
 
         let key = self.ex.p.io_ops.borrow_mut().insert(op, &self.ex);
 
-        ConnectBuilderFuture {
+        ConnectFuture {
             completed: false,
             ex: self.ex,
             op: Some(key.data().as_ffi()),
@@ -1390,13 +1390,13 @@ impl Client {
     }
 }
 
-pub struct ConnectBuilderFuture {
+pub struct ConnectFuture {
     completed: bool,
     ex: Executor,
     op: Option<u64>,
 }
 
-impl Future for ConnectBuilderFuture {
+impl Future for ConnectFuture {
     type Output = Result<Stream>;
 
     fn poll(
@@ -1464,7 +1464,7 @@ impl Future for ConnectBuilderFuture {
     }
 }
 
-impl Drop for ConnectBuilderFuture {
+impl Drop for ConnectFuture {
     fn drop(&mut self) {
         let op_cancel_key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(op_cancel_key_data));
