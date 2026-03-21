@@ -272,7 +272,14 @@ fn compio_echo_client(
 
     let bytes = Arc::new(bytes);
 
-    let rt = compio::runtime::RuntimeBuilder::new().build().unwrap();
+    let mut proactor = compio::driver::ProactorBuilder::new();
+    proactor.capacity(2 * nr_files);
+
+    let rt = compio::runtime::RuntimeBuilder::new()
+        .with_proactor(proactor)
+        .build()
+        .unwrap();
+
     rt.block_on(async move {
         unsafe { DURATION = Duration::new(0, 0) };
 
@@ -335,7 +342,13 @@ fn compio_echo_server(
 ) -> Result<(), String> {
     let bytes = Arc::new(bytes);
 
-    let rt = compio::runtime::RuntimeBuilder::new().build().unwrap();
+    let mut proactor = compio::driver::ProactorBuilder::new();
+    proactor.capacity(2 * nr_files);
+
+    let rt = compio::runtime::RuntimeBuilder::new()
+        .with_proactor(proactor)
+        .build()
+        .unwrap();
 
     rt.block_on(async move {
         unsafe { DURATION = Duration::new(0, 0) };
