@@ -354,8 +354,7 @@ fn compio_echo_server(
         unsafe { DURATION = Duration::new(0, 0) };
         let start = Instant::now();
 
-        let socket_opts = compio::net::SocketOpts::new();
-        socket_opts.reuse_address(true);
+        let socket_opts = compio::net::SocketOpts::new().reuse_address(true);
 
         let listener = compio::net::TcpListener::bind_with_options(
             SocketAddrV4::new(ipv4_addr, port),
