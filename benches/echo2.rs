@@ -93,6 +93,9 @@ async fn tokio_recv(h: &mut blake2::Blake2b512, stream: &mut TcpStream) {
 
 async fn tokio_close(stream: &mut TcpStream) {
     stream.shutdown().await.unwrap();
+    let mut buf = [0_u8; 4];
+    let n = stream.read(&mut buf).await.unwrap();
+    assert_eq!(n, 0);
 }
 
 fn tokio_echo_client(
@@ -444,6 +447,8 @@ async fn fiona_recv(h: &mut blake2::Blake2b512, stream: fiona::tcp::Stream) {
 
 async fn fiona_close(stream: fiona::tcp::Stream) {
     stream.shutdown(SHUT_WR).await.unwrap();
+    let bufs = stream.recv().await.unwrap();
+    assert!(bufs.is_empty());
     stream.close().await.unwrap();
 }
 
