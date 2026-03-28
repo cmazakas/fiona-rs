@@ -149,22 +149,17 @@ fn tcp_multiple_accepts() {
 
     static mut NUM_RUNS: u64 = 0;
 
-    let params = &fiona::IoContextParams {
-        sq_entries: 256,
-        cq_entries: 1024,
-        // We use 3 * NUM_CLIENTS because releasing the fds
-        // back to the runtime is deferred by
-        // cancelling the timeout op associated with each
-        // socket object. Our test should
-        // still properly test recycling of the fds because we
-        // have 2 * NUM_CLIENTS sockets per
-        // iteration, and we iterate twice meaning we have 2 *
-        // 2 * NUM_CLIENTS total sockets being
+    let mut ioc = fiona::IoContext::builder()
+        .sq_entries(256)
+        .cq_entries(1024)
+        // We use 3 * NUM_CLIENTS because releasing the fds back to the runtime is deferred by
+        // cancelling the timeout op associated with each socket object. Our test should still
+        // properly test recycling of the fds because we have 2 * NUM_CLIENTS sockets per
+        // iteration, and we iterate twice meaning we have 2 *  2 * NUM_CLIENTS total sockets being
         // used by the entire test over its lifetime.
-        nr_files: (1 + 3 * NUM_CLIENTS).try_into().unwrap(),
-    };
+        .num_files((1 + 3 * NUM_CLIENTS).try_into().unwrap())
+        .build();
 
-    let mut ioc = fiona::IoContext::with_params(params);
     let ex = ioc.get_executor();
 
     let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
@@ -591,13 +586,11 @@ fn tcp_connection_stress_test_no_cq_overflow() {
     const TOTAL_CONNS: u32 = 3 * NR_FILES;
 
     fn make_io_context() -> fiona::IoContext {
-        let params = &fiona::IoContextParams {
-            sq_entries: 256,
-            cq_entries: CQ_ENTRIES,
-            nr_files: 2 * NR_FILES,
-        };
-
-        fiona::IoContext::with_params(params)
+        fiona::IoContext::builder()
+            .sq_entries(256)
+            .cq_entries(CQ_ENTRIES)
+            .num_files(2 * NR_FILES)
+            .build()
     }
 
     fn client(port: u16) {
@@ -732,13 +725,11 @@ fn tcp_connection_stress_test_cq_overflow() {
     const TOTAL_CONNS: u32 = 3 * NR_FILES;
 
     fn make_io_context() -> fiona::IoContext {
-        let params = &fiona::IoContextParams {
-            sq_entries: 256,
-            cq_entries: CQ_ENTRIES,
-            nr_files: 2 * NR_FILES,
-        };
-
-        fiona::IoContext::with_params(params)
+        fiona::IoContext::builder()
+            .sq_entries(256)
+            .cq_entries(CQ_ENTRIES)
+            .num_files(2 * NR_FILES)
+            .build()
     }
 
     fn client(port: u16) {
@@ -909,12 +900,11 @@ fn tcp_concurrent_send_recv() {
     const MESSAGE_LEN: usize = 64 * 1024;
     const BGID: u16 = 14;
 
-    let params = fiona::IoContextParams {
-        sq_entries: 256,
-        cq_entries: 4 * 1024,
-        nr_files: 3 * NUM_CLIENTS as u32,
-    };
-    let mut ioc = fiona::IoContext::with_params(&params);
+    let mut ioc = fiona::IoContext::builder()
+        .sq_entries(256)
+        .cq_entries(4 * 1024)
+        .num_files(3 * NUM_CLIENTS as u32)
+        .build();
 
     let ex = ioc.get_executor();
     let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
@@ -1743,11 +1733,11 @@ fn tcp_send_subspan() {
 
 #[test]
 fn tcp_ephemeral_port_exhaustion_panic() {
-    let mut params = fiona::IoContextParams::new();
-    params.nr_files = 100_000;
-    params.cq_entries = 32 * 1024;
+    let mut ioc = fiona::IoContext::builder()
+        .cq_entries(32 * 1024)
+        .num_files(100_000)
+        .build();
 
-    let mut ioc = fiona::IoContext::with_params(&params);
     let ex = ioc.get_executor();
 
     let acceptor = fiona::tcp::Acceptor::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
@@ -1779,11 +1769,11 @@ fn tcp_ephemeral_port_exhaustion_panic() {
     let mut threads = Vec::new();
     for _ in 0..4 {
         let thread = std::thread::spawn(move || {
-            let mut params = fiona::IoContextParams::new();
-            params.nr_files = 25_000;
-            params.cq_entries = 32 * 1024;
+            let mut ioc = fiona::IoContext::builder()
+                .cq_entries(32 * 1024)
+                .num_files(25_000)
+                .build();
 
-            let mut ioc = fiona::IoContext::with_params(&params);
             let ex = ioc.get_executor();
 
             for _ in 0..25_000 {
@@ -1944,13 +1934,12 @@ fn tcp_sockets_outlive_io_context() {
 
 #[test]
 fn tcp_socket_reuse() {
-    let params = fiona::IoContextParams {
-        sq_entries: 256,
-        cq_entries: 4 * 1024,
-        nr_files: 1024,
-    };
+    let mut ioc = fiona::IoContext::builder()
+        .sq_entries(256)
+        .cq_entries(4 * 1024)
+        .num_files(1024)
+        .build();
 
-    let mut ioc = fiona::IoContext::with_params(&params);
     let ex = ioc.get_executor();
 
     let acceptor = fiona::tcp::Acceptor::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();

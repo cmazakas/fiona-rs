@@ -43,13 +43,11 @@ impl ByteGen {
 }
 
 fn make_io_context(nr_files: u32) -> fiona::IoContext {
-    let params = &fiona::IoContextParams {
-        sq_entries: 256,
-        cq_entries: CQ_ENTRIES,
-        nr_files: 2 * nr_files,
-    };
-
-    fiona::IoContext::with_params(params)
+    fiona::IoContext::builder()
+        .sq_entries(256)
+        .cq_entries(CQ_ENTRIES)
+        .num_files(2 * nr_files)
+        .build()
 }
 
 async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: u16) {

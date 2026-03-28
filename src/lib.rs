@@ -23,7 +23,6 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
     future::Future,
-    hash::Hash,
     marker::PhantomData,
     mem::{ManuallyDrop, forget},
     ops::{Deref, Range},
@@ -74,7 +73,7 @@ pub type Result<T> = std::result::Result<T, nix::Error>;
 
 //-----------------------------------------------------------------------------
 
-#[repr(C, align(64))]
+#[repr(C, align(128))]
 struct AlignedAtomicU64(AtomicU64);
 
 impl Deref for AlignedAtomicU64 {
@@ -84,7 +83,7 @@ impl Deref for AlignedAtomicU64 {
     }
 }
 
-#[repr(C, align(64))]
+#[repr(C, align(128))]
 struct AlignedAtomicBool(AtomicBool);
 
 impl Deref for AlignedAtomicBool {
@@ -264,20 +263,6 @@ impl Clone for Task {
     }
 }
 
-impl PartialEq for Task {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::addr_eq(self.p.as_ptr(), other.p.as_ptr())
-    }
-}
-
-impl Eq for Task {}
-
-impl Hash for Task {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.p.hash(state);
-    }
-}
-
 //-----------------------------------------------------------------------------
 
 struct Weak {
@@ -303,8 +288,8 @@ impl Weak {
         unsafe { &*self.p.as_ptr().cast::<TaskHeader>() }
     }
 
-    // cannot be safely upgraded across thread boundaries
-    // must only be upgraded on the main thread running the ring
+    // Cannot be safely upgraded across thread boundaries.
+    // Must only be upgraded on the main thread running the ring.
     unsafe fn upgrade(&self) -> Option<Task> {
         let c = unsafe { *self.task_header().strong.get() };
         if c == 0 {
@@ -780,6 +765,128 @@ pub struct IoContext {
     p: Rc<IoContextFrame>,
 }
 
+impl IoContext {
+    #[must_use]
+    pub fn builder() -> IoContextBuilder {
+        IoContextBuilder {
+            params: IoContextParams::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self::builder().build()
+    }
+
+    #[must_use]
+    pub fn get_executor(&self) -> Executor {
+        Executor { p: self.p.clone() }
+    }
+
+    fn process_task_queues(&mut self, num_completed: &mut u64) -> bool {
+        loop {
+            let next = unsafe { self.p.head.get_next().get_inner() };
+            let tail = unsafe { self.p.tail.get_inner() };
+            if next == tail {
+                return true;
+            }
+
+            let (local_task, task) = (
+                self.p.local_task_queue.borrow_mut().pop_front(),
+                self.p.receiver.borrow_mut().try_recv(),
+            );
+
+            match (local_task, task) {
+                (Some(weak1), Ok(weak2)) => {
+                    *num_completed += on_work_item(weak1);
+                    *num_completed += on_work_item(weak2);
+                }
+                (Some(weak1), Err(_)) => {
+                    *num_completed += on_work_item(weak1);
+                }
+                (None, Ok(weak2)) => {
+                    *num_completed += on_work_item(weak2);
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+    }
+
+    fn init_task_list(&self) {
+        #[allow(clippy::unused_async)]
+        async fn empty() {
+            unreachable!()
+        }
+
+        let head = &self.p.head;
+        let tail = &self.p.tail;
+
+        if !unsafe { head.is_null() } {
+            assert!(unsafe { !tail.is_null() });
+            return;
+        }
+
+        let ex = self.get_executor();
+
+        let dummy_task_head =
+            DanglingTask(SyncUnsafeCell::new(Task::into_raw(ex.spawn_impl_helper(empty()))));
+        let dummy_task_tail =
+            DanglingTask(SyncUnsafeCell::new(Task::into_raw(ex.spawn_impl_helper(empty()))));
+
+        unsafe { head.set_inner(&dummy_task_head) };
+        unsafe { tail.set_inner(&dummy_task_tail) };
+
+        unsafe { head.set_next(tail) };
+        unsafe { tail.set_prev(head) };
+    }
+
+    pub fn run(&mut self) -> u64 {
+        let _guard = RunGuard {
+            p: self.p.clone(),
+            preserve_head_and_tail: true,
+        };
+
+        let mut num_completed = 0;
+
+        let ex = self.get_executor();
+        let ring = ex.ring();
+
+        loop {
+            if self.process_task_queues(&mut num_completed) {
+                break;
+            }
+
+            self.p.needs_wake.store(true, Release);
+
+            if self.process_task_queues(&mut num_completed) {
+                break;
+            }
+
+            unsafe { io_uring_submit_and_wait(ring, 1) };
+            process_cqes(&ex);
+        }
+
+        num_completed
+    }
+}
+
+impl Drop for IoContext {
+    fn drop(&mut self) {
+        drop(RunGuard {
+            p: self.p.clone(),
+            preserve_head_and_tail: false,
+        });
+    }
+}
+
+impl Default for IoContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 //-----------------------------------------------------------------------------
 
 pub struct IoContextParams {
@@ -790,7 +897,7 @@ pub struct IoContextParams {
 
 impl IoContextParams {
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             sq_entries: 256,
             cq_entries: 1024,
@@ -802,6 +909,84 @@ impl IoContextParams {
 impl Default for IoContextParams {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+pub struct IoContextBuilder {
+    params: IoContextParams,
+}
+
+impl IoContextBuilder {
+    #[must_use]
+    pub fn sq_entries(mut self, n: u32) -> Self {
+        self.params.sq_entries = n;
+        self
+    }
+
+    #[must_use]
+    pub fn cq_entries(mut self, n: u32) -> Self {
+        self.params.cq_entries = n;
+        self
+    }
+
+    #[must_use]
+    pub fn num_files(mut self, n: u32) -> Self {
+        self.params.nr_files = n;
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> IoContext {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let IoContextParams {
+            sq_entries,
+            cq_entries,
+            nr_files,
+        } = self.params;
+
+        let mut params = unsafe { std::mem::zeroed::<io_uring_params>() };
+        params.sq_entries = sq_entries;
+        params.cq_entries = cq_entries;
+        params.flags |= IORING_SETUP_CQSIZE;
+        params.flags |= IORING_SETUP_SINGLE_ISSUER;
+        params.flags |= IORING_SETUP_DEFER_TASKRUN;
+        params.flags |= IORING_SETUP_COOP_TASKRUN;
+
+        let ioring = unsafe { std::mem::zeroed::<io_uring>() };
+
+        let ioc_frame = IoContextFrame {
+            params: RefCell::new(params),
+            receiver: RefCell::new(rx),
+            sender: RefCell::new(tx),
+            ioring: RefCell::new(ioring),
+            buf_groups: RefCell::new(HashMap::new()),
+            local_task_queue: RefCell::new(VecDeque::new()),
+            io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
+            needs_wake: Arc::new(AlignedAtomicBool(AtomicBool::new(true))),
+            head: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
+            tail: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
+        };
+
+        let p = Rc::new(ioc_frame);
+
+        {
+            let ring = &raw mut *p.ioring.borrow_mut();
+            let ret = unsafe { io_uring_queue_init_params(sq_entries, ring, &raw mut params) };
+            assert_eq!(ret, 0);
+
+            let ret = unsafe { io_uring_register_ring_fd(ring) };
+            assert_eq!(ret, 1);
+
+            let ret = unsafe { io_uring_register_files_sparse(ring, nr_files) };
+            assert_eq!(ret, 0);
+        }
+
+        let ioc = IoContext { p };
+        ioc.init_task_list();
+        ioc
     }
 }
 
@@ -919,168 +1104,6 @@ impl Drop for RunGuard {
 
         let ex = Executor { p: self.p.clone() };
         unsafe { clear_completion_queue(&ex) };
-    }
-}
-
-impl IoContext {
-    #[must_use]
-    pub fn new() -> Self {
-        let sq_entries = 256;
-        let cq_entries = 4 * 1024;
-        let nr_files = 1024; // Matches the default for Linux processes.
-
-        let params = IoContextParams {
-            sq_entries,
-            cq_entries,
-            nr_files,
-        };
-
-        Self::with_params(&params)
-    }
-
-    #[must_use]
-    pub fn with_params(params: &IoContextParams) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        let IoContextParams {
-            sq_entries,
-            cq_entries,
-            nr_files,
-        } = *params;
-
-        let mut params = unsafe { std::mem::zeroed::<io_uring_params>() };
-        params.sq_entries = sq_entries;
-        params.cq_entries = cq_entries;
-        params.flags |= IORING_SETUP_CQSIZE;
-        params.flags |= IORING_SETUP_SINGLE_ISSUER;
-        params.flags |= IORING_SETUP_DEFER_TASKRUN;
-        params.flags |= IORING_SETUP_COOP_TASKRUN;
-
-        let ioring = unsafe { std::mem::zeroed::<io_uring>() };
-
-        let ioc_frame = IoContextFrame {
-            params: RefCell::new(params),
-            receiver: RefCell::new(rx),
-            sender: RefCell::new(tx),
-            ioring: RefCell::new(ioring),
-            buf_groups: RefCell::new(HashMap::new()),
-            local_task_queue: RefCell::new(VecDeque::new()),
-            io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
-            needs_wake: Arc::new(AlignedAtomicBool(AtomicBool::new(true))),
-            head: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
-            tail: DanglingTask(SyncUnsafeCell::new(ptr::null_mut())),
-        };
-
-        let p = Rc::new(ioc_frame);
-
-        {
-            let ring = &raw mut *p.ioring.borrow_mut();
-            let ret = unsafe { io_uring_queue_init_params(sq_entries, ring, &raw mut params) };
-            assert_eq!(ret, 0);
-
-            let ret = unsafe { io_uring_register_ring_fd(ring) };
-            assert_eq!(ret, 1);
-
-            let ret = unsafe { io_uring_register_files_sparse(ring, nr_files) };
-            assert_eq!(ret, 0);
-        }
-
-        let ioc = Self { p };
-        ioc.init_task_list();
-        ioc
-    }
-
-    #[must_use]
-    pub fn get_executor(&self) -> Executor {
-        Executor { p: self.p.clone() }
-    }
-
-    fn process_task_queues(&mut self, num_completed: &mut u64) -> bool {
-        loop {
-            let next = unsafe { self.p.head.get_next().get_inner() };
-            let tail = unsafe { self.p.tail.get_inner() };
-            if next == tail {
-                return true;
-            }
-
-            let (local_task, task) = (
-                self.p.local_task_queue.borrow_mut().pop_front(),
-                self.p.receiver.borrow_mut().try_recv(),
-            );
-
-            match (local_task, task) {
-                (Some(weak1), Ok(weak2)) => {
-                    *num_completed += on_work_item(weak1);
-                    *num_completed += on_work_item(weak2);
-                }
-                (Some(weak1), Err(_)) => {
-                    *num_completed += on_work_item(weak1);
-                }
-                (None, Ok(weak2)) => {
-                    *num_completed += on_work_item(weak2);
-                }
-                _ => {
-                    return false;
-                }
-            }
-        }
-    }
-
-    fn init_task_list(&self) {
-        #[allow(clippy::unused_async)]
-        async fn empty() {
-            unreachable!()
-        }
-
-        let head = &self.p.head;
-        let tail = &self.p.tail;
-
-        if !unsafe { head.is_null() } {
-            assert!(unsafe { !tail.is_null() });
-            return;
-        }
-
-        let ex = self.get_executor();
-
-        let dummy_task_head =
-            DanglingTask(SyncUnsafeCell::new(Task::into_raw(ex.spawn_impl_helper(empty()))));
-        let dummy_task_tail =
-            DanglingTask(SyncUnsafeCell::new(Task::into_raw(ex.spawn_impl_helper(empty()))));
-
-        unsafe { head.set_inner(&dummy_task_head) };
-        unsafe { tail.set_inner(&dummy_task_tail) };
-
-        unsafe { head.set_next(tail) };
-        unsafe { tail.set_prev(head) };
-    }
-
-    pub fn run(&mut self) -> u64 {
-        let _guard = RunGuard {
-            p: self.p.clone(),
-            preserve_head_and_tail: true,
-        };
-
-        let mut num_completed = 0;
-
-        let ex = self.get_executor();
-        let ring = ex.ring();
-
-        loop {
-            if self.process_task_queues(&mut num_completed) {
-                break;
-            }
-
-            self.p.needs_wake.store(true, Release);
-
-            if self.process_task_queues(&mut num_completed) {
-                break;
-            }
-
-            unsafe { io_uring_submit_and_wait(ring, 1) };
-            process_cqes(&ex);
-        }
-
-        num_completed
     }
 }
 
@@ -1644,21 +1667,6 @@ unsafe fn append_recv_buffers(
             buf_headers[bg_bid as usize].next = bid_map[bid as usize] as isize;
             buf_headers[bid_map[bid as usize] as usize].prev = bg_bid as isize;
         }
-    }
-}
-
-impl Drop for IoContext {
-    fn drop(&mut self) {
-        drop(RunGuard {
-            p: self.p.clone(),
-            preserve_head_and_tail: false,
-        });
-    }
-}
-
-impl Default for IoContext {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

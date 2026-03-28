@@ -21,13 +21,11 @@ async fn timer_op(ex: fiona::Executor, anums: Arc<AtomicI32>) {
 }
 
 fn fiona_timer() -> Result<(), String> {
-    let params = fiona::IoContextParams {
-        sq_entries: 16 * 1024,
-        cq_entries: 16 * 1024,
-        ..Default::default()
-    };
+    let mut ioc = fiona::IoContext::builder()
+        .sq_entries(16 * 1024)
+        .cq_entries(16 * 1024)
+        .build();
 
-    let mut ioc = fiona::IoContext::with_params(&params);
     let ex = ioc.get_executor();
 
     let anums = Arc::new(AtomicI32::new(0));

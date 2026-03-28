@@ -15,11 +15,11 @@ fn slotmap_stable_submit() {
 
     const TOTAL_OPS: u64 = 1024 * 16;
 
-    let mut ioc = fiona::IoContext::with_params(&fiona::IoContextParams {
-        sq_entries: 16 * 1024,
-        cq_entries: 32 * 1024,
-        nr_files: 1024,
-    });
+    let mut ioc = fiona::IoContext::builder()
+        .sq_entries(16 * 1024)
+        .cq_entries(16 * 1024)
+        .num_files(1024)
+        .build();
 
     let ex = ioc.get_executor();
 
