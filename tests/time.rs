@@ -60,8 +60,8 @@ impl Future for WakerFuture {
 //-----------------------------------------------------------------------------
 
 #[test]
-fn timer_simple() {
-    // we should be able to await the most simple timeout operation
+fn time_simple() {
+    // We should be able to await the most simple timeout operation.
 
     static mut NUM_RUNS: u64 = 0;
 
@@ -86,8 +86,8 @@ fn timer_simple() {
 }
 
 #[test]
-fn timer_multi() {
-    // we should be able to reuse the timer object for multiple waits
+fn time_multi() {
+    // We should be able to reuse the timer object for multiple waits.
 
     static mut NUM_RUNS: u64 = 0;
 
@@ -114,9 +114,9 @@ fn timer_multi() {
 }
 
 #[test]
-fn timer_early_drop() {
-    // dropping the timeout Future early should schedule a cancel.
-    // we should then be able to immediately reuse the io object
+fn time_early_drop() {
+    // Dropping the timeout Future early should schedule a cancel.
+    // We should then be able to immediately reuse the I/O object.
 
     static mut NUM_RUNS: u64 = 0;
 
@@ -155,8 +155,8 @@ fn timer_early_drop() {
 
 #[test]
 #[should_panic = "assertion failed: !timer_impl.timeout_pending"]
-fn timer_shared_panic() {
-    // we use interior mutability for an ergonomic API but we should never
+fn time_shared_panic() {
+    // We use interior mutability for an ergonomic API but we should never
     // permit more than one concurrent timeout operation on the Timer object.
 
     async fn f1(timer: fiona::time::Timer) {
@@ -177,7 +177,7 @@ fn timer_shared_panic() {
 #[test]
 #[inline(never)]
 #[should_panic = "assertion failed: !timer_impl.timeout_pending"]
-fn timer_forget_expired() {
+fn time_forget_expired() {
     // This function must be marked inline(never) because if its name disappears,
     // it's cumbersome to ignore it in an lsan suppression file preventing it from
     // being inlined ensures that its name is always visible for the purposes of
@@ -224,13 +224,13 @@ fn timer_forget_expired() {
 }
 
 #[test]
-fn timer_multiple_eager_drops() {
-    // want to test creating a Future, poll()'ing then immediately drop()'ing
+fn time_multiple_eager_drops() {
+    // Want to test creating a Future, poll()'ing then immediately drop()'ing
     // it multiple times.
-    // this can create an odd sequence of SQEs in the SQ:
+    // This can create an odd sequence of SQEs in the SQ:
     // SQ: { timeout, timeout_remove, timeout, timeout_remove, timeout }
     //
-    // our code needs to be sound under such a scenario
+    // Our code needs to be sound under such a scenario.
 
     static mut NUM_RUNS: u64 = 0;
 
@@ -284,9 +284,9 @@ async fn wait_for<T>(ex: fiona::Executor, dur: Duration, t: T) -> T {
 }
 
 #[test]
-fn timer_futures_unordered() {
-    // we should be able to use a wrapper library like the futures crate and have
-    // things complete in the proper unordered order
+fn time_futures_unordered() {
+    // We should be able to use a wrapper library like the futures crate and have
+    // things complete in the proper unordered order.
 
     {
         async fn launch_timers(ex: fiona::Executor) {
@@ -351,10 +351,10 @@ fn timer_futures_unordered() {
 }
 
 #[test]
-fn timer_futures_select() {
-    // test that our io object works with select!, which relies on cancel-on-drop
+fn time_futures_select() {
+    // Test that our io object works with select!, which relies on cancel-on-drop
     // quite heavily.
-    // also test that our waker is correctly implemented as well.
+    // Also test that our waker is correctly implemented as well.
 
     async fn f1(ex: fiona::Executor) {
         let timer1 = fiona::time::Timer::new(ex.clone());
@@ -402,7 +402,7 @@ fn timer_futures_select() {
 }
 
 #[test]
-fn timer_random() {
+fn time_random() {
     // Test random destruction order of tasks in the runtime.
 
     async fn timer_task(ex: fiona::Executor, rng: Rc<RefCell<rand::rngs::ThreadRng>>) {
@@ -424,7 +424,7 @@ fn timer_random() {
 }
 
 #[test]
-fn timer_double_run() {
+fn time_double_run() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
@@ -448,7 +448,7 @@ fn timer_double_run() {
 }
 
 #[test]
-fn timer_double_run_panic_reuse() {
+fn time_double_run_panic_reuse() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
@@ -477,7 +477,7 @@ fn timer_double_run_panic_reuse() {
 }
 
 #[test]
-fn timer_relocate_future() {
+fn time_relocate_future() {
     // Test that our Futures are safe to relocate before we eventually .await them.
 
     let mut ioc = fiona::IoContext::new();
@@ -511,7 +511,7 @@ fn timer_relocate_future() {
 }
 
 #[test]
-fn timer_foreign_executor() {
+fn time_foreign_executor() {
     // Test what happens when we start migrating I/O objects across different
     // execution contexts.
 
