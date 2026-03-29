@@ -2071,3 +2071,49 @@ fn tcp_socket_reuse() {
 
     ioc.run();
 }
+
+#[test]
+fn tcp_graceful_shutdown() {
+    // Want to demonstrate that our TCP layer is capable of doing a graceful TCP
+    // close which involves shutting down the write side of the connection followed
+    // by receiving an EOF from the peer before finally closing the socket itself.
+
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+    ex.register_buf_group(0, 128, 256).unwrap();
+
+    let acceptor = fiona::tcp::Acceptor::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.clone().spawn(async move {
+        let stream = acceptor.accept().await.unwrap();
+        stream.set_buf_group(0);
+
+        let (n, _buf) = stream.send(vec![1, 2, 3, 4]).await;
+        assert!(n.is_ok());
+
+        stream.shutdown(SHUT_WR).await.unwrap();
+        let bufs = stream.recv().await.unwrap();
+        assert!(bufs.is_empty());
+        stream.close().await.unwrap();
+    });
+
+    ex.clone().spawn(async move {
+        let stream = fiona::tcp::Client::new(ex)
+            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        stream.set_buf_group(0);
+
+        let _bufs = stream.recv().await.unwrap();
+
+        stream.shutdown(SHUT_WR).await.unwrap();
+        let bufs = stream.recv().await.unwrap();
+        assert!(bufs.is_empty());
+        stream.close().await.unwrap();
+    });
+
+    ioc.run();
+}
