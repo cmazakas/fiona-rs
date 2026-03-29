@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use fiona::tcp::AcceptorOpts;
+use fiona::net::TcpListenerOpts;
 use nix::{errno::Errno, libc::ENOBUFS};
 use rand::SeedableRng;
 
@@ -53,7 +53,7 @@ fn make_io_context(nr_files: u32) -> fiona::IoContext {
 async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: u16) {
     let mut generator = ByteGen::new();
 
-    let client = fiona::tcp::Client::new(ex)
+    let client = fiona::net::TcpClient::new(ex)
         .with_timeout(Duration::from_secs(3))
         .connect_ipv4(ipv4_addr, port)
         .await
@@ -133,7 +133,7 @@ fn fiona_echo_client(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     Ok(())
 }
 
-async fn fiona_echo_server_impl(stream: fiona::tcp::Stream) {
+async fn fiona_echo_server_impl(stream: fiona::net::TcpStream) {
     stream.set_timeout(Duration::from_secs(3));
     stream.set_buf_group(SERVER_BGID);
 
@@ -194,12 +194,12 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
     ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)
         .unwrap();
 
-    let opts = &AcceptorOpts {
+    let opts = &TcpListenerOpts {
         reuse_addr: true,
         reuse_port: true,
     };
     let acceptor =
-        fiona::tcp::Acceptor::bind_ipv4_with_params(ex.clone(), ipv4_addr, port, opts).unwrap();
+        fiona::net::TcpListener::bind_ipv4_with_params(ex.clone(), ipv4_addr, port, opts).unwrap();
 
     ex.clone().spawn(async move {
         loop {

@@ -219,7 +219,7 @@ fn tokio_echo_server(
     Ok(())
 }
 
-async fn fiona_send(stream: fiona::tcp::Stream, bytes: Arc<Vec<u8>>) {
+async fn fiona_send(stream: fiona::net::TcpStream, bytes: Arc<Vec<u8>>) {
     let mut total_sent = 0;
     let mut send_buf = vec![0_u8; SEND_BUF_SIZE];
 
@@ -240,7 +240,7 @@ async fn fiona_send(stream: fiona::tcp::Stream, bytes: Arc<Vec<u8>>) {
     }
 }
 
-async fn fiona_recv(h: &mut blake2::Blake2b512, stream: fiona::tcp::Stream) {
+async fn fiona_recv(h: &mut blake2::Blake2b512, stream: fiona::net::TcpStream) {
     let mut total_received = 0;
     while total_received < BUF_SIZE {
         let mbufs = stream.recv().await;
@@ -263,7 +263,7 @@ async fn fiona_recv(h: &mut blake2::Blake2b512, stream: fiona::tcp::Stream) {
     }
 }
 
-async fn fiona_close(stream: fiona::tcp::Stream) {
+async fn fiona_close(stream: fiona::net::TcpStream) {
     stream.shutdown(SHUT_WR).await.unwrap();
     stream.close().await.unwrap();
 }
@@ -301,7 +301,7 @@ fn fiona_echo_client(
                 ex.clone().spawn(async move {
                     let mut h = blake2::Blake2b512::new();
 
-                    let stream = fiona::tcp::Client::new(ex2)
+                    let stream = fiona::net::TcpClient::new(ex2)
                         .with_timeout(Duration::from_secs(10))
                         .connect_ipv4(ipv4_addr, port)
                         .await
@@ -359,13 +359,13 @@ fn fiona_echo_server(
             let mut ioc = make_io_context(nr_files);
             let ex = ioc.get_executor();
 
-            let opts = fiona::tcp::AcceptorOpts {
+            let opts = fiona::net::TcpListenerOpts {
                 reuse_port: true,
                 reuse_addr: true,
             };
 
             let acceptor =
-                fiona::tcp::Acceptor::bind_ipv4_with_params(ex.clone(), ipv4_addr, port, &opts)
+                fiona::net::TcpListener::bind_ipv4_with_params(ex.clone(), ipv4_addr, port, &opts)
                     .unwrap();
 
             ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)

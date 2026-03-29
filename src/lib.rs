@@ -60,14 +60,14 @@ use liburing_rs::{
     io_uring_submit_and_get_events, io_uring_submit_and_wait, io_uring_unregister_buf_ring,
 };
 
-pub mod tcp;
+pub mod net;
 pub mod time;
 pub mod tls;
 
+use net::tcp::StreamImpl;
 use slotmap::{DefaultKey, KeyData};
-use tcp::StreamImpl;
 
-use crate::{io_ops::IoOpsMap, tcp::Stream};
+use crate::{io_ops::IoOpsMap, net::tcp::TcpStream};
 
 pub type Result<T> = std::result::Result<T, nix::Error>;
 
@@ -708,7 +708,7 @@ enum OpType {
         stream: *mut StreamImpl,
     },
     MultishotTcpAccept {
-        streams: VecDeque<Stream>,
+        streams: VecDeque<TcpStream>,
     },
     TcpConnect {
         addr: SockaddrStorage,
@@ -1216,7 +1216,7 @@ fn on_timeout(ex: &Executor, cqe: &mut io_uring_cqe) {
 fn on_tcp_accept_multishot(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut stream = None;
     if cqe.res >= 0 {
-        stream = Some(Stream::new(ex.clone(), cqe.res));
+        stream = Some(TcpStream::new(ex.clone(), cqe.res));
     }
 
     let mut borrow_guard = ex.p.io_ops.borrow_mut();

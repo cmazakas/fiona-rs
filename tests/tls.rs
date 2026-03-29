@@ -188,13 +188,14 @@ fn tls_handshake() {
     let mut ioc = fiona::IoContext::new();
 
     let ex = ioc.get_executor();
-    let acceptor = fiona::tcp::Acceptor::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let acceptor =
+        fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.register_buf_group(1234, 1024, 256).unwrap();
     ex.register_buf_group(4321, 1024, 256).unwrap();
 
-    ex.spawn((async |acceptor: fiona::tcp::Acceptor| {
+    ex.spawn((async |acceptor: fiona::net::TcpListener| {
         let stream = acceptor.accept().await.unwrap();
         stream.set_buf_group(1234);
 
@@ -217,7 +218,7 @@ fn tls_handshake() {
     })(acceptor));
 
     ex.spawn((async |ex: fiona::Executor, port: u16| {
-        let client = fiona::tcp::Client::new(ex)
+        let client = fiona::net::TcpClient::new(ex)
             .connect_ipv6(Ipv6Addr::LOCALHOST, port)
             .await
             .unwrap();

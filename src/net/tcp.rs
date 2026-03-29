@@ -46,12 +46,12 @@ use std::{
 //-----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
-pub struct AcceptorOpts {
+pub struct TcpListenerOpts {
     pub reuse_addr: bool,
     pub reuse_port: bool,
 }
 
-impl Default for AcceptorOpts {
+impl Default for TcpListenerOpts {
     fn default() -> Self {
         Self {
             reuse_addr: true,
@@ -75,16 +75,16 @@ pub(crate) struct FdImpl {
 //-----------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub struct Acceptor {
-    p: NonNull<AcceptorImpl>,
+pub struct TcpListener {
+    p: NonNull<ListenerImpl>,
 }
 
-impl Acceptor {
+impl TcpListener {
     const DEFAULT_BACKLOG: i32 = 2 * 1024;
 
     fn bind_ip_impl(
-        ex: Executor, ip_addr: &dyn SockaddrLike, opts: &AcceptorOpts, af: AddressFamily,
-    ) -> Result<Acceptor> {
+        ex: Executor, ip_addr: &dyn SockaddrLike, opts: &TcpListenerOpts, af: AddressFamily,
+    ) -> Result<TcpListener> {
         let socket = socket(af, SockType::Stream, SockFlag::empty(), SockProtocol::Tcp)?;
 
         if opts.reuse_addr {
@@ -98,20 +98,20 @@ impl Acceptor {
         bind(socket.as_raw_fd(), ip_addr)?;
         listen(&socket, Backlog::new(Self::DEFAULT_BACKLOG).unwrap())?;
 
-        let layout = Layout::new::<AcceptorImpl>();
+        let layout = Layout::new::<ListenerImpl>();
         let p = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
 
         let ref_count = RefCount {
             obj_count: 1,
             op_count: 0,
-            release_impl: release_impl::<AcceptorImpl>,
+            release_impl: release_impl::<ListenerImpl>,
             obj: p.as_ptr(),
         };
 
         // We need to do this for when `port == 0` (the wildcard port).
         let addr = getsockname::<SockaddrStorage>(socket.as_raw_fd())?;
 
-        let acceptor_impl = AcceptorImpl {
+        let acceptor_impl = ListenerImpl {
             fd_impl: FdImpl {
                 ref_count,
                 ex,
@@ -126,32 +126,32 @@ impl Acceptor {
             accept_op: None,
         };
 
-        let p = p.cast::<AcceptorImpl>();
+        let p = p.cast::<ListenerImpl>();
         unsafe { std::ptr::write(p.as_ptr(), acceptor_impl) };
 
-        Ok(Acceptor { p })
+        Ok(TcpListener { p })
     }
 
     pub fn bind_ipv4_with_params(
-        ex: Executor, ipv4_addr: Ipv4Addr, port: u16, opts: &AcceptorOpts,
-    ) -> Result<Acceptor> {
+        ex: Executor, ipv4_addr: Ipv4Addr, port: u16, opts: &TcpListenerOpts,
+    ) -> Result<TcpListener> {
         let addr = SockaddrIn::from(SocketAddrV4::new(ipv4_addr, port));
         Self::bind_ip_impl(ex, &addr, opts, AddressFamily::Inet)
     }
 
-    pub fn bind_ipv4(ex: Executor, ipv4_addr: Ipv4Addr, port: u16) -> Result<Acceptor> {
+    pub fn bind_ipv4(ex: Executor, ipv4_addr: Ipv4Addr, port: u16) -> Result<TcpListener> {
         let addr = SockaddrIn::from(SocketAddrV4::new(ipv4_addr, port));
-        Self::bind_ip_impl(ex, &addr, &AcceptorOpts::default(), AddressFamily::Inet)
+        Self::bind_ip_impl(ex, &addr, &TcpListenerOpts::default(), AddressFamily::Inet)
     }
 
-    pub fn bind_ipv6(ex: Executor, ipv6_addr: Ipv6Addr, port: u16) -> Result<Acceptor> {
+    pub fn bind_ipv6(ex: Executor, ipv6_addr: Ipv6Addr, port: u16) -> Result<TcpListener> {
         let addr = SockaddrIn6::from(SocketAddrV6::new(ipv6_addr, port, 0, 0));
-        Self::bind_ip_impl(ex, &addr, &AcceptorOpts::default(), AddressFamily::Inet6)
+        Self::bind_ip_impl(ex, &addr, &TcpListenerOpts::default(), AddressFamily::Inet6)
     }
 
     pub fn bind_ipv6_with_params(
-        ex: Executor, ipv6_addr: Ipv6Addr, port: u16, opts: &AcceptorOpts,
-    ) -> Result<Acceptor> {
+        ex: Executor, ipv6_addr: Ipv6Addr, port: u16, opts: &TcpListenerOpts,
+    ) -> Result<TcpListener> {
         let addr = SockaddrIn6::from(SocketAddrV6::new(ipv6_addr, port, 0, 0));
         Self::bind_ip_impl(ex, &addr, opts, AddressFamily::Inet6)
     }
@@ -237,7 +237,7 @@ impl Acceptor {
     }
 }
 
-impl Clone for Acceptor {
+impl Clone for TcpListener {
     fn clone(&self) -> Self {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
         unsafe { add_obj_ref(rc) };
@@ -245,7 +245,7 @@ impl Clone for Acceptor {
     }
 }
 
-impl Drop for Acceptor {
+impl Drop for TcpListener {
     fn drop(&mut self) {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
 
@@ -281,14 +281,14 @@ impl Drop for Acceptor {
 
 //-----------------------------------------------------------------------------
 
-struct AcceptorImpl {
+struct ListenerImpl {
     fd_impl: FdImpl,
     addr: SockaddrStorage,
     accept_pending: bool,
     accept_op: Option<u64>,
 }
 
-impl Drop for AcceptorImpl {
+impl Drop for ListenerImpl {
     fn drop(&mut self) {
         if self.fd_impl.fd >= 0 {
             unsafe { close(self.fd_impl.fd) };
@@ -299,12 +299,12 @@ impl Drop for AcceptorImpl {
 //-----------------------------------------------------------------------------
 
 pub struct AcceptFuture<'a> {
-    acceptor: &'a Acceptor,
+    acceptor: &'a TcpListener,
     completed: bool,
 }
 
 impl Future for AcceptFuture<'_> {
-    type Output = Result<Stream>;
+    type Output = Result<TcpStream>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
@@ -434,13 +434,13 @@ impl Drop for StreamImpl {
 
 //-----------------------------------------------------------------------------
 
-pub struct Stream {
+pub struct TcpStream {
     p: NonNull<StreamImpl>,
 }
 
-impl Stream {
+impl TcpStream {
     #[must_use]
-    pub(crate) fn new(ex: Executor, fd: i32) -> Stream {
+    pub(crate) fn new(ex: Executor, fd: i32) -> TcpStream {
         let layout = Layout::new::<StreamImpl>();
         let p;
 
@@ -509,7 +509,7 @@ impl Stream {
         stream_impl.timeout_op = Some(key.data().as_ffi());
         unsafe { add_op_ref(ref_count) };
 
-        Stream { p }
+        TcpStream { p }
     }
 
     #[must_use]
@@ -690,7 +690,7 @@ impl Stream {
     }
 }
 
-impl Drop for Stream {
+impl Drop for TcpStream {
     fn drop(&mut self) {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
         if unsafe { (*rc).obj_count } == 1 {
@@ -742,7 +742,7 @@ impl Drop for Stream {
     }
 }
 
-impl Clone for Stream {
+impl Clone for TcpStream {
     fn clone(&self) -> Self {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
         unsafe { add_obj_ref(rc) };
@@ -753,7 +753,7 @@ impl Clone for Stream {
 //-----------------------------------------------------------------------------
 
 pub struct SendFuture<'a> {
-    stream: &'a Stream,
+    stream: &'a TcpStream,
     completed: bool,
     op: Option<u64>,
 }
@@ -982,7 +982,7 @@ impl Drop for CloseFuture<'_> {
 //-----------------------------------------------------------------------------
 
 pub struct ShutdownFuture<'a> {
-    stream: &'a Stream,
+    stream: &'a TcpStream,
     completed: bool,
     op: Option<u64>,
     how: i32,
@@ -1181,7 +1181,7 @@ impl Drop for CancelFuture<'_> {
 //-----------------------------------------------------------------------------
 
 pub struct RecvFuture<'a> {
-    stream: &'a Stream,
+    stream: &'a TcpStream,
     completed: bool,
 }
 
@@ -1319,22 +1319,22 @@ impl Future for RecvFuture<'_> {
 
 //-----------------------------------------------------------------------------
 
-pub struct Client {
+pub struct TcpClient {
     timeout: Duration,
     ex: Executor,
 }
 
-impl Client {
+impl TcpClient {
     #[must_use]
-    pub fn new(ex: Executor) -> Client {
-        Client {
+    pub fn new(ex: Executor) -> TcpClient {
+        TcpClient {
             ex,
             timeout: Duration::from_secs(3),
         }
     }
 
     #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Client {
+    pub fn with_timeout(mut self, timeout: Duration) -> TcpClient {
         self.timeout = timeout;
         self
     }
@@ -1397,7 +1397,7 @@ pub struct ConnectFuture {
 }
 
 impl Future for ConnectFuture {
-    type Output = Result<Stream>;
+    type Output = Result<TcpStream>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
@@ -1457,7 +1457,7 @@ impl Future for ConnectFuture {
                     Poll::Ready(Err(Errno::from_raw(-res)))
                 } else {
                     drop(io_ops);
-                    Poll::Ready(Ok(Stream::new(ex, fd)))
+                    Poll::Ready(Ok(TcpStream::new(ex, fd)))
                 }
             }
         }

@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::tcp;
+use crate::net::tcp;
 
 #[derive(Debug)]
 pub enum Error {
@@ -43,17 +43,17 @@ struct StreamImpl<ConnectionType> {
 }
 
 pub struct Stream {
-    tcp_stream: tcp::Stream,
+    tcp_stream: tcp::TcpStream,
     stream_impl: Rc<StreamImpl<rustls::ServerConnection>>,
 }
 
 pub struct Client {
-    tcp_stream: tcp::Stream,
+    tcp_stream: tcp::TcpStream,
     stream_impl: Rc<StreamImpl<rustls::ClientConnection>>,
 }
 
 pub async fn server_handshake(
-    stream: tcp::Stream, config: Arc<rustls::ServerConfig>,
+    stream: tcp::TcpStream, config: Arc<rustls::ServerConfig>,
 ) -> Result<Stream, Error> {
     let config = rustls::ServerConnection::new(config)?;
 
@@ -150,7 +150,7 @@ impl Stream {
 }
 
 pub async fn client_handshake(
-    stream: tcp::Stream, config: Arc<rustls::ClientConfig>,
+    stream: tcp::TcpStream, config: Arc<rustls::ClientConfig>,
     server_name: rustls_pki_types::ServerName<'static>,
 ) -> Result<Client, Error> {
     let tls_client = Client {
