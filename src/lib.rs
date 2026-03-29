@@ -67,7 +67,7 @@ pub mod tls;
 use net::tcp::StreamImpl;
 use slotmap::{DefaultKey, KeyData};
 
-use crate::{io_ops::IoOpsMap, net::tcp::TcpStream};
+use crate::{io_ops::IoOpsMap, net::TcpStream};
 
 pub type Result<T> = std::result::Result<T, nix::Error>;
 
