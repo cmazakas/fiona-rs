@@ -35,6 +35,12 @@ debug = "full"
 [profile.lto]
 inherits = "release"
 lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
 
 [[bench]]
 name = "echo2"
