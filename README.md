@@ -40,6 +40,22 @@ Fiona is actively developed primarily on Ubuntu machines. The following steps se
 
 Note, the above commands permit the user to potentially `mlock` _all_ available memory which can be undesireable. `unlimited` which can instead be replaced with a numeric value which is KB.
 
+## Running Benchmarks
+
+Right now Fiona has one main benchmark: `echo2`. This benchmark simply spawns a number of concurrent clients and sends 1 MiB both directions, hashing the entirety of the message and comparing it against a known sentinel value. To run benchmarks with Fiona it's recommended to use two physical machines connected by a high-quality ethernet cable.
+
+To run the server:
+```bash
+cargo bench --bench echo2 -- --ipv4-addr 192.168.10.12 --port 8016 --fiona --server --nr-files 6000
+```
+
+To run the client:
+```bash
+cargo bench --bench echo2 -- --ipv4-addr 192.168.10.12 --port 8016 --fiona --client --nr-files 6000
+```
+
+`--fiona` can be replaced with `--tokio` or `--compio` to use those runtimes instead.
+
 ## Dev Scripts
 
 For local dev testing, a script like this is useful:
