@@ -159,6 +159,7 @@ fn tls_hello_world() {
 
     buf.clear();
     client_session.send_close_notify();
+    assert!(client_session.wants_write());
     while client_session.wants_write() {
         client_session.write_tls(&mut buf).unwrap();
     }
@@ -169,6 +170,7 @@ fn tls_hello_world() {
 
     buf.clear();
     server_session.send_close_notify();
+    assert!(server_session.wants_write());
     while server_session.wants_write() {
         server_session.write_tls(&mut buf).unwrap();
     }
@@ -188,8 +190,7 @@ fn tls_handshake() {
     let mut ioc = fiona::IoContext::new();
 
     let ex = ioc.get_executor();
-    let acceptor =
-        fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.register_buf_group(1234, 1024, 256).unwrap();
