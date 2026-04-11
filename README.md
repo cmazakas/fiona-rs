@@ -14,6 +14,32 @@ A Rust port of some C++ I had written which was a port of some Rust code I origi
 
 Aims to be a competitively fast I/O runtime using io_uring and all of its features.
 
+## Working Around RLIMIT_MEMLOCK Limits
+
+By default, Fiona uses io_uring's zero-copy TCP send. In order to do this, the kernel has to lock pages of memory in order to perform the direct memory access.
+
+Linux distributions will oftentimes limit the amount of memory a user can lock. This is done for myriad reasons but it can prevent Fiona from scaling properly, as TCP sends will be returning `ENOMEM`. The limit used by most distributions is relatively small, and can be verified locally by using `ulimit -l`.
+
+Fiona is actively developed primarily on Ubuntu machines. The following steps seem to be sufficient for modern installs of Ubuntu 25.04/25.10:
+
+1. Edit `/etc/security/limits.conf` by appending:
+   ```bash
+   <yourusername> soft memlock unlimited
+   <yourusername> hard memlock unlimited
+   ```
+2. Make sure the following two files:
+   ```
+   /etc/pam.d/common-session
+   /etc/pam.d/common-session-noninteractive
+   ```
+   contain the following line:
+   ```
+   session required pam_limits.so
+   ```
+3. Reboot. Upon logging in, `ulimit -l` should now show `unlimited`.
+
+Note, the above commands permit the user to potentially `mlock` _all_ available memory which can be undesireable. `unlimited` which can instead be replaced with a numeric value which is KB.
+
 ## Dev Scripts
 
 For local dev testing, a script like this is useful:
