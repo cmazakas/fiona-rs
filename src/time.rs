@@ -39,7 +39,8 @@ pub struct TimerFuture<'a> {
 
 impl Timer {
     #[must_use]
-    pub fn new(ex: Executor) -> Self {
+    pub fn new(ex: &Executor) -> Self {
+        let ex = ex.clone();
         let layout = std::alloc::Layout::new::<TimerImpl>();
         let p = unsafe { std::alloc::alloc(layout) };
 

@@ -892,7 +892,7 @@ fn await_rayon_stress_test() {
     }
 
     async fn timer_task(ex: fiona::Executor) {
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         for _ in 0..50_000 {
             timer.wait(Duration::from_micros(10)).await.unwrap();
         }

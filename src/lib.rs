@@ -482,10 +482,10 @@ pub struct BorrowedBufsIterator<'a> {
 }
 
 impl BorrowedBufs {
-    fn new(ex: Executor, buf_group: *mut BufGroup) -> BorrowedBufs {
+    fn new(ex: &Executor, buf_group: *mut BufGroup) -> BorrowedBufs {
         BorrowedBufs {
             buf_group,
-            ex,
+            ex: ex.clone(),
             head: -1,
             tail: -1,
         }
@@ -1216,7 +1216,7 @@ fn on_timeout(ex: &Executor, cqe: &mut io_uring_cqe) {
 fn on_tcp_accept_multishot(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut stream = None;
     if cqe.res >= 0 {
-        stream = Some(TcpStream::new(ex.clone(), cqe.res));
+        stream = Some(TcpStream::new(ex, cqe.res));
     }
 
     let mut borrow_guard = ex.p.io_ops.borrow_mut();

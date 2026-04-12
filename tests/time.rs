@@ -66,7 +66,7 @@ fn time_simple() {
     static mut NUM_RUNS: u64 = 0;
 
     async fn f1(ex: fiona::Executor) {
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         let dur = Duration::from_millis(250);
 
         let _guard = DurationGuard::new(dur);
@@ -92,7 +92,7 @@ fn time_multi() {
     static mut NUM_RUNS: u64 = 0;
 
     async fn f1(ex: fiona::Executor) {
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         for _ in 0..3 {
             let dur = Duration::from_millis(250);
             let _guard = DurationGuard::new(dur);
@@ -122,7 +122,7 @@ fn time_early_drop() {
 
     async fn f1(ex: fiona::Executor) {
         let dur = Duration::from_millis(200);
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
 
         let _guard = DurationGuard::new(dur);
         for _ in 0..5 {
@@ -166,7 +166,7 @@ fn time_shared_panic() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let timer = fiona::time::Timer::new(ex.clone());
+    let timer = fiona::time::Timer::new(&ex);
 
     ex.clone().spawn(f1(timer.clone()));
     ex.clone().spawn(f1(timer.clone()));
@@ -190,7 +190,7 @@ fn time_forget_expired() {
     static mut NUM_RUNS: u64 = 0;
 
     async fn f1(ex: fiona::Executor) {
-        let timer = fiona::time::Timer::new(ex.clone());
+        let timer = fiona::time::Timer::new(&ex);
         let mut f = timer.wait(Duration::from_millis(100));
         {
             let w = WakerFuture.await;
@@ -205,7 +205,7 @@ fn time_forget_expired() {
 
         {
             let _guard = DurationGuard::new(Duration::from_millis(100));
-            let timer2 = fiona::time::Timer::new(ex);
+            let timer2 = fiona::time::Timer::new(&ex);
             timer2.wait(Duration::from_millis(100)).await.unwrap();
         }
 
@@ -235,7 +235,7 @@ fn time_multiple_eager_drops() {
     static mut NUM_RUNS: u64 = 0;
 
     async fn f1(ex: fiona::Executor) {
-        let timer = fiona::time::Timer::new(ex.clone());
+        let timer = fiona::time::Timer::new(&ex);
         let w = WakerFuture.await;
         let mut cx = std::task::Context::from_waker(&w);
 
@@ -278,7 +278,7 @@ fn time_multiple_eager_drops() {
 //-----------------------------------------------------------------------------
 
 async fn wait_for<T>(ex: fiona::Executor, dur: Duration, t: T) -> T {
-    let timer = fiona::time::Timer::new(ex);
+    let timer = fiona::time::Timer::new(&ex);
     timer.wait(dur).await.unwrap();
     t
 }
@@ -357,11 +357,11 @@ fn time_futures_select() {
     // Also test that our waker is correctly implemented as well.
 
     async fn f1(ex: fiona::Executor) {
-        let timer1 = fiona::time::Timer::new(ex.clone());
-        let timer2 = fiona::time::Timer::new(ex.clone());
-        let timer3 = fiona::time::Timer::new(ex.clone());
-        let timer4 = fiona::time::Timer::new(ex.clone());
-        let timer5 = fiona::time::Timer::new(ex.clone());
+        let timer1 = fiona::time::Timer::new(&ex);
+        let timer2 = fiona::time::Timer::new(&ex);
+        let timer3 = fiona::time::Timer::new(&ex);
+        let timer4 = fiona::time::Timer::new(&ex);
+        let timer5 = fiona::time::Timer::new(&ex);
 
         {
             let _guard = DurationGuard::new(Duration::from_millis(100));
@@ -407,7 +407,7 @@ fn time_random() {
 
     async fn timer_task(ex: fiona::Executor, rng: Rc<RefCell<rand::rngs::ThreadRng>>) {
         let dur = Duration::from_millis(rng.borrow_mut().random_range(100..=500));
-        Timer::new(ex).wait(dur).await.unwrap();
+        Timer::new(&ex).wait(dur).await.unwrap();
     }
 
     let rng = Rc::new(RefCell::new(rand::rng()));
@@ -430,7 +430,7 @@ fn time_double_run() {
 
     for _ in 0..2 {
         ex.spawn((async |ex: fiona::Executor| {
-            let timer = fiona::time::Timer::new(ex);
+            let timer = fiona::time::Timer::new(&ex);
             timer.wait(Duration::from_millis(100)).await.unwrap();
         })(ex.clone()));
     }
@@ -439,7 +439,7 @@ fn time_double_run() {
 
     for _ in 0..2 {
         ex.spawn((async |ex: fiona::Executor| {
-            let timer = fiona::time::Timer::new(ex);
+            let timer = fiona::time::Timer::new(&ex);
             timer.wait(Duration::from_millis(100)).await.unwrap();
         })(ex.clone()));
     }
@@ -453,7 +453,7 @@ fn time_double_run_panic_reuse() {
     let ex = ioc.get_executor();
 
     ex.spawn((async |ex: fiona::Executor| {
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
     })(ex.clone()));
 
@@ -468,7 +468,7 @@ fn time_double_run_panic_reuse() {
 
     for _ in 0..2 {
         ex.spawn((async |ex: fiona::Executor| {
-            let timer = fiona::time::Timer::new(ex);
+            let timer = fiona::time::Timer::new(&ex);
             timer.wait(Duration::from_millis(100)).await.unwrap();
         })(ex.clone()));
     }
@@ -485,7 +485,7 @@ fn time_relocate_future() {
 
     let ex2 = ex.clone();
     ex.clone().spawn(async move {
-        let timer = fiona::time::Timer::new(ex2);
+        let timer = fiona::time::Timer::new(&ex2);
         let f = timer.wait(Duration::from_millis(100));
         let original_address = &raw const f;
 
@@ -496,7 +496,7 @@ fn time_relocate_future() {
     });
 
     ex.clone().spawn(async move {
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         let mut f = timer.wait(Duration::from_millis(100));
         let original_address = &raw const f;
         assert!(futures::poll!(&mut f).is_pending());
@@ -524,7 +524,7 @@ fn time_foreign_executor() {
         let ex1 = ioc1.borrow().get_executor();
         let ex2 = ioc2.borrow().get_executor();
 
-        let timer1 = fiona::time::Timer::new(ex1);
+        let timer1 = fiona::time::Timer::new(&ex1);
 
         ex2.spawn((async |timer1: fiona::time::Timer,
                           ioc1: Rc<RefCell<fiona::IoContext>>,
@@ -539,7 +539,7 @@ fn time_foreign_executor() {
 
             assert!(Pin::new(&mut f1).poll(&mut cx).is_pending());
 
-            let timer2 = fiona::time::Timer::new(ex2);
+            let timer2 = fiona::time::Timer::new(&ex2);
             timer2.wait(Duration::from_millis(100)).await.unwrap();
 
             timer1.get_executor().spawn(async move {});
@@ -561,7 +561,7 @@ fn time_foreign_executor() {
         let ex1 = ioc1.borrow().get_executor();
         let ex2 = ioc2.borrow().get_executor();
 
-        let timer1 = fiona::time::Timer::new(ex1);
+        let timer1 = fiona::time::Timer::new(&ex1);
 
         ex2.spawn((async |timer1: fiona::time::Timer,
                           ioc1: Rc<RefCell<fiona::IoContext>>,
@@ -573,12 +573,12 @@ fn time_foreign_executor() {
 
             let ex1_copy = timer1.get_executor();
             timer1.get_executor().spawn(async move {
-                let timer1_2 = fiona::time::Timer::new(ex1_copy);
+                let timer1_2 = fiona::time::Timer::new(&ex1_copy);
                 timer1_2.wait(Duration::from_millis(125)).await.unwrap();
             });
             ioc1.borrow_mut().run();
 
-            let timer2 = fiona::time::Timer::new(ex2);
+            let timer2 = fiona::time::Timer::new(&ex2);
             timer2.wait(Duration::from_millis(100)).await.unwrap();
 
             assert!(Pin::new(&mut f1).poll(&mut cx).is_ready());
@@ -592,8 +592,8 @@ fn time_foreign_executor() {
 
         async fn run_until(ioc: Rc<RefCell<fiona::IoContext>>) {
             let ex = ioc.borrow().get_executor();
-            ex.clone().spawn(async {
-                let timer = fiona::time::Timer::new(ex);
+            ex.clone().spawn(async move {
+                let timer = fiona::time::Timer::new(&ex);
                 timer.wait(Duration::from_millis(100)).await.unwrap();
             });
             ioc.borrow_mut().run();

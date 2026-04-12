@@ -486,7 +486,7 @@ fn fiona_echo_client(
 
             let mut h = blake2::Blake2b512::new();
 
-            let stream = fiona::net::TcpClient::new(ex2)
+            let stream = fiona::net::TcpClient::new(&ex2)
                 .connect_ipv4(ipv4_addr, port)
                 .await
                 .unwrap();
@@ -539,7 +539,7 @@ fn fiona_echo_server(
     let mut ioc = make_io_context(nr_files);
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), ipv4_addr, port).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, ipv4_addr, port).unwrap();
 
     ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)
         .unwrap();

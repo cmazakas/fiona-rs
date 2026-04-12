@@ -24,7 +24,7 @@ fn slotmap_stable_submit() {
     let ex = ioc.get_executor();
 
     async fn timer_op(ex: fiona::Executor) -> u64 {
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(250)).await.unwrap();
         1
     }

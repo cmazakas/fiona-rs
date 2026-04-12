@@ -22,8 +22,7 @@ fn tcp_recv_timeout() {
     // Test that our recv operation can timeout and then be restarted.
 
     async fn server_timeout(ex: fiona::Executor) {
-        let acceptor =
-            fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+        let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
         let port = acceptor.port();
 
         let bgid = 0;
@@ -36,7 +35,7 @@ fn tcp_recv_timeout() {
         let client_task = ex
             .clone() //
             .spawn(async move {
-                fiona::net::TcpClient::new(ex2)
+                fiona::net::TcpClient::new(&ex2)
                     .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                     .await
                     .unwrap()
@@ -83,8 +82,7 @@ fn tcp_recv_timeout() {
     }
 
     async fn client_timeout(ex: fiona::Executor) {
-        let acceptor =
-            fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+        let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
         let port = acceptor.port();
 
         let bgid = 1;
@@ -97,7 +95,7 @@ fn tcp_recv_timeout() {
         let client_task = ex
             .clone() //
             .spawn(async move {
-                fiona::net::TcpClient::new(ex2)
+                fiona::net::TcpClient::new(&ex2)
                     .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                     .await
                     .unwrap()

@@ -48,7 +48,7 @@ fn tcp_acceptor_eager_drop() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     assert!(acceptor.port() != 0);
 
     ex.spawn(async move {
@@ -79,7 +79,7 @@ fn tcp_acceptor_hello_world() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     assert!(acceptor.port() != 0);
 
     let port = acceptor.port();
@@ -90,7 +90,7 @@ fn tcp_acceptor_hello_world() {
     });
 
     ex.clone().spawn(async move {
-        let _client = fiona::net::TcpClient::new(ex.clone())
+        let _client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -114,8 +114,7 @@ fn tcp_acceptor_hello_world_double_run() {
     for _ in 0..2 {
         let ex = ioc.get_executor();
 
-        let acceptor =
-            fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+        let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
         assert!(acceptor.port() != 0);
 
         let port = acceptor.port();
@@ -126,7 +125,7 @@ fn tcp_acceptor_hello_world_double_run() {
         });
 
         ex.clone().spawn(async move {
-            let _client = fiona::net::TcpClient::new(ex.clone())
+            let _client = fiona::net::TcpClient::new(&ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -163,7 +162,7 @@ fn tcp_multiple_accepts() {
 
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     assert!(acceptor.port() != 0);
 
     async fn async_main(acceptor: fiona::net::TcpListener, ex: fiona::Executor) {
@@ -173,7 +172,7 @@ fn tcp_multiple_accepts() {
             for _ in 0..NUM_CLIENTS {
                 let ex2 = ex.clone();
                 ex.clone().spawn(async move {
-                    let _client = fiona::net::TcpClient::new(ex2.clone())
+                    let _client = fiona::net::TcpClient::new(&ex2)
                         .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                         .await
                         .unwrap();
@@ -190,7 +189,7 @@ fn tcp_multiple_accepts() {
             assert_eq!(streams.len(), NUM_CLIENTS.try_into().unwrap());
         }
 
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
         unsafe { NUM_RUNS += 1 };
@@ -212,7 +211,7 @@ fn tcp_send_hello_world() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     assert!(acceptor.port() != 0);
 
     let port = acceptor.port();
@@ -228,7 +227,7 @@ fn tcp_send_hello_world() {
     });
 
     ex.clone().spawn(async move {
-        let client = fiona::net::TcpClient::new(ex.clone())
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -237,7 +236,7 @@ fn tcp_send_hello_world() {
         let (num_sent, buf) = client.send(buf.into_bytes()).await;
         assert_eq!(num_sent.unwrap(), buf.len());
 
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(250)).await.unwrap();
 
         unsafe { NUM_RUNS += 1 };
@@ -260,7 +259,7 @@ fn tcp_send_hello_world_throwing() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     assert!(acceptor.port() != 0);
 
     let port = acceptor.port();
@@ -275,12 +274,12 @@ fn tcp_send_hello_world_throwing() {
     });
 
     ex.clone().spawn(async move {
-        let _client = fiona::net::TcpClient::new(ex.clone())
+        let _client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
 
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(250)).await.unwrap();
 
         unsafe { NUM_RUNS += 1 };
@@ -303,15 +302,14 @@ fn tcp_accept_select_ready_always() {
     let ex = ioc.get_executor();
 
     ex.clone().spawn(async move {
-        let acceptor =
-            fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+        let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
         assert!(acceptor.port() != 0);
 
         let port = acceptor.port();
 
         // Test that our accept() op completes immediately, but the future is
         // eager-dropped before we even see the CQE.
-        let _client = fiona::net::TcpClient::new(ex.clone())
+        let _client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -323,11 +321,11 @@ fn tcp_accept_select_ready_always() {
 
         assert_eq!(x, 1234);
 
-        let timer = fiona::time::Timer::new(ex.clone());
+        let timer = fiona::time::Timer::new(&ex.clone());
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
         // Test that we can accept a new connection and that it works correctly.
-        let _client2 = fiona::net::TcpClient::new(ex.clone())
+        let _client2 = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -341,7 +339,7 @@ fn tcp_accept_select_ready_always() {
         // actually poll() the AcceptFuture to completion. Because we're using multishot
         // accept, our op is running in the background so we have no need to explicitly
         // poll().
-        let _client3 = fiona::net::TcpClient::new(ex.clone())
+        let _client3 = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -370,7 +368,7 @@ fn tcp_connect_timeout() {
     let ex = ioc.get_executor();
 
     ex.clone().spawn(async move {
-        let stream = fiona::net::TcpClient::new(ex)
+        let stream = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::new(192, 0, 2, 0), 3301)
             .await;
 
@@ -398,7 +396,7 @@ fn tcp_send_recv_hello_world() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     let bgid = 0;
@@ -440,7 +438,7 @@ fn tcp_send_recv_hello_world() {
     async fn client(
         ex: fiona::Executor, port: u16, message: &'static str, bgid: u16, expected_bufs: usize,
     ) {
-        let client = fiona::net::TcpClient::new(ex)
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -494,7 +492,7 @@ fn tcp_recv_buffer_replenishing() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     let bgid = 0;
@@ -535,7 +533,7 @@ fn tcp_recv_buffer_replenishing() {
     {
         let message = message.clone();
         ex.clone().spawn(async move {
-            let client = fiona::net::TcpClient::new(ex)
+            let client = fiona::net::TcpClient::new(&ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -603,13 +601,13 @@ fn tcp_connection_stress_test_no_cq_overflow() {
                 rand::RngCore::fill_bytes(&mut rng, &mut message);
             }
 
-            let timer = fiona::time::Timer::new(ex.clone());
+            let timer = fiona::time::Timer::new(&ex.clone());
             timer
                 .wait(Duration::from_millis(message[0].into()))
                 .await
                 .unwrap();
 
-            let client = fiona::net::TcpClient::new(ex)
+            let client = fiona::net::TcpClient::new(&ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -699,7 +697,7 @@ fn tcp_connection_stress_test_no_cq_overflow() {
     let mut ioc = make_io_context();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.clone().spawn(server(ex, acceptor));
@@ -742,13 +740,13 @@ fn tcp_connection_stress_test_cq_overflow() {
                 rand::RngCore::fill_bytes(&mut rng, &mut message);
             }
 
-            let timer = fiona::time::Timer::new(ex.clone());
+            let timer = fiona::time::Timer::new(&ex.clone());
             timer
                 .wait(Duration::from_millis(message[0].into()))
                 .await
                 .unwrap();
 
-            let client = fiona::net::TcpClient::new(ex)
+            let client = fiona::net::TcpClient::new(&ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -838,7 +836,7 @@ fn tcp_connection_stress_test_cq_overflow() {
     let mut ioc = make_io_context();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.clone().spawn(server(ex, acceptor));
@@ -856,7 +854,7 @@ fn tcp_double_connect() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.clone()
@@ -867,7 +865,7 @@ fn tcp_double_connect() {
                 let ex = ex2;
                 let acceptor = acceptor2;
 
-                let timer = fiona::time::Timer::new(ex);
+                let timer = fiona::time::Timer::new(&ex);
                 timer.wait(Duration::from_millis(250)).await.unwrap();
 
                 acceptor.cancel().await.unwrap();
@@ -881,7 +879,7 @@ fn tcp_double_connect() {
     {
         let ex = ex.clone();
         ex.clone().spawn(async move {
-            let client = fiona::net::TcpClient::new(ex);
+            let client = fiona::net::TcpClient::new(&ex);
             let mut f1 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
 
             assert!(futures::poll!(&mut f1).is_pending());
@@ -909,7 +907,7 @@ fn tcp_concurrent_send_recv() {
         .build();
 
     let ex = ioc.get_executor();
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
 
     let port = acceptor.port();
 
@@ -959,7 +957,7 @@ fn tcp_concurrent_send_recv() {
 
     async fn client(ex: fiona::Executor, port: u16, messages: Rc<Vec<Vec<u8>>>) {
         for i in 0..NUM_CLIENTS {
-            let client = fiona::net::TcpClient::new(ex.clone())
+            let client = fiona::net::TcpClient::new(&ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -989,14 +987,14 @@ fn tcp_select_drop_ready_recv_future() {
 
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.register_buf_group(0, 4 * 1024, 128).unwrap();
 
     async fn server(acceptor: fiona::net::TcpListener) {
         let ex = acceptor.get_executor();
-        let timer = fiona::time::Timer::new(ex.clone());
+        let timer = fiona::time::Timer::new(&ex.clone());
 
         let stream = acceptor.accept().await.unwrap();
         stream.set_buf_group(0);
@@ -1014,7 +1012,7 @@ fn tcp_select_drop_ready_recv_future() {
         let num_ops = 17 + ex.get_params().sq_entries;
 
         for _ in 0..num_ops {
-            let timer = fiona::time::Timer::new(ex.clone());
+            let timer = fiona::time::Timer::new(&ex.clone());
             timers.push(timer);
         }
 
@@ -1039,7 +1037,7 @@ fn tcp_select_drop_ready_recv_future() {
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::net::TcpClient::new(ex.clone())
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1050,7 +1048,7 @@ fn tcp_select_drop_ready_recv_future() {
 
         assert_eq!(num_sent.unwrap(), msg.len());
 
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
     }
 
@@ -1067,7 +1065,7 @@ fn tcp_close() {
 
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     async fn server(acceptor: fiona::net::TcpListener) {
@@ -1083,9 +1081,9 @@ fn tcp_close() {
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let timer = fiona::time::Timer::new(ex.clone());
+        let timer = fiona::time::Timer::new(&ex.clone());
         {
-            let client = fiona::net::TcpClient::new(ex)
+            let client = fiona::net::TcpClient::new(&ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -1121,7 +1119,7 @@ fn tcp_close_eager_drop() {
 
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     async fn server(acceptor: fiona::net::TcpListener) {
@@ -1132,17 +1130,17 @@ fn tcp_close_eager_drop() {
         drop(f);
 
         let ex = stream.get_executor();
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::net::TcpClient::new(ex.clone())
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
 
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
         let stream = client;
@@ -1163,7 +1161,7 @@ fn tcp_shutdown() {
 
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.register_buf_group(0, 128, 16).unwrap();
@@ -1192,12 +1190,12 @@ fn tcp_shutdown() {
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::net::TcpClient::new(ex.clone())
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
 
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
         let stream = client;
@@ -1229,7 +1227,7 @@ fn tcp_shutdown_eager_drop() {
 
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     async fn server(acceptor: fiona::net::TcpListener) {
@@ -1245,12 +1243,12 @@ fn tcp_shutdown_eager_drop() {
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::net::TcpClient::new(ex.clone())
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
 
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
         let stream = client;
@@ -1275,7 +1273,7 @@ fn tcp_cancel() {
 
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.register_buf_group(0, 128, 256).unwrap();
@@ -1301,19 +1299,19 @@ fn tcp_cancel() {
 
         ex.spawn(recv_op(stream.clone()));
 
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(10)).await.unwrap();
 
         stream.cancel().await.unwrap();
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::net::TcpClient::new(ex.clone())
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
 
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
         let stream = client;
@@ -1344,7 +1342,7 @@ fn tcp_eager_drop_send_ready() {
 
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.register_buf_group(0, 128, 8).unwrap();
@@ -1362,7 +1360,7 @@ fn tcp_eager_drop_send_ready() {
         let ex = stream.get_executor();
         ex.spawn(recv_op(stream.clone()));
 
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(10)).await.unwrap();
 
         let mut f = stream.send(vec![0, 1, 2, 3, 4]);
@@ -1376,12 +1374,12 @@ fn tcp_eager_drop_send_ready() {
     }
 
     async fn client(ex: fiona::Executor, port: u16) {
-        let client = fiona::net::TcpClient::new(ex.clone())
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
 
-        let timer = fiona::time::Timer::new(ex);
+        let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
         let stream = client;
@@ -1408,7 +1406,7 @@ fn tcp_eager_drop_connect_ready() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.clone().spawn(server(acceptor));
@@ -1419,20 +1417,20 @@ fn tcp_eager_drop_connect_ready() {
 
     async fn client(ex: fiona::Executor, port: u16) {
         let mut connect_future =
-            fiona::net::TcpClient::new(ex.clone()).connect_ipv4(Ipv4Addr::LOCALHOST, port);
+            fiona::net::TcpClient::new(&ex).connect_ipv4(Ipv4Addr::LOCALHOST, port);
 
         let w = WakerFuture.await;
         let mut cx = std::task::Context::from_waker(&w);
 
         assert!(Pin::new(&mut connect_future).poll(&mut cx).is_pending());
 
-        let timer = fiona::time::Timer::new(ex.clone());
+        let timer = fiona::time::Timer::new(&ex.clone());
         timer.wait(Duration::from_millis(250)).await.unwrap();
 
         drop(connect_future);
         timer.wait(Duration::from_millis(250)).await.unwrap();
 
-        fiona::net::TcpClient::new(ex.clone())
+        fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1440,7 +1438,7 @@ fn tcp_eager_drop_connect_ready() {
 
     async fn server(acceptor: fiona::net::TcpListener) {
         let stream = acceptor.accept().await.unwrap();
-        let timer = fiona::time::Timer::new(stream.get_executor());
+        let timer = fiona::time::Timer::new(&stream.get_executor());
         timer.wait(Duration::from_millis(500)).await.unwrap();
 
         let stream = acceptor.accept().await.unwrap();
@@ -1455,7 +1453,7 @@ fn tcp_connect_ipv6() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
     assert!(acceptor.port() != 0);
 
     let port = acceptor.port();
@@ -1466,7 +1464,7 @@ fn tcp_connect_ipv6() {
     });
 
     ex.clone().spawn(async move {
-        let _client = fiona::net::TcpClient::new(ex.clone())
+        let _client = fiona::net::TcpClient::new(&ex)
             .connect_ipv6(Ipv6Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1491,11 +1489,10 @@ fn tcp_reuse_port_ipv4() {
         reuse_port: true,
     };
     let acceptor =
-        fiona::net::TcpListener::bind_ipv4_with_params(ex.clone(), Ipv4Addr::LOCALHOST, 0, opts)
-            .unwrap();
+        fiona::net::TcpListener::bind_ipv4_with_params(&ex, Ipv4Addr::LOCALHOST, 0, opts).unwrap();
     let port = acceptor.port();
 
-    let failed = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, port);
+    let failed = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, port);
     assert_eq!(failed.unwrap_err(), Errno::EADDRINUSE);
 
     let t = std::thread::spawn(move || {
@@ -1508,13 +1505,9 @@ fn tcp_reuse_port_ipv4() {
             reuse_addr: true,
             reuse_port: true,
         };
-        let acceptor = fiona::net::TcpListener::bind_ipv4_with_params(
-            ex.clone(),
-            Ipv4Addr::LOCALHOST,
-            port,
-            opts,
-        )
-        .unwrap();
+        let acceptor =
+            fiona::net::TcpListener::bind_ipv4_with_params(&ex, Ipv4Addr::LOCALHOST, port, opts)
+                .unwrap();
 
         ex.spawn(async move {
             let s = acceptor.accept().await.unwrap();
@@ -1536,7 +1529,7 @@ fn tcp_reuse_port_ipv4() {
     });
 
     let client_op = async |ex: fiona::Executor, port: u16| {
-        let client = fiona::net::TcpClient::new(ex.clone())
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await;
         if client.is_err() {
@@ -1569,11 +1562,10 @@ fn tcp_reuse_port_ipv6() {
         reuse_port: true,
     };
     let acceptor =
-        fiona::net::TcpListener::bind_ipv6_with_params(ex.clone(), Ipv6Addr::LOCALHOST, 0, opts)
-            .unwrap();
+        fiona::net::TcpListener::bind_ipv6_with_params(&ex, Ipv6Addr::LOCALHOST, 0, opts).unwrap();
     let port = acceptor.port();
 
-    let failed = fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, port);
+    let failed = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, port);
     assert_eq!(failed.unwrap_err(), Errno::EADDRINUSE);
 
     let t = std::thread::spawn(move || {
@@ -1586,13 +1578,9 @@ fn tcp_reuse_port_ipv6() {
             reuse_addr: true,
             reuse_port: true,
         };
-        let acceptor = fiona::net::TcpListener::bind_ipv6_with_params(
-            ex.clone(),
-            Ipv6Addr::LOCALHOST,
-            port,
-            opts,
-        )
-        .unwrap();
+        let acceptor =
+            fiona::net::TcpListener::bind_ipv6_with_params(&ex, Ipv6Addr::LOCALHOST, port, opts)
+                .unwrap();
 
         ex.spawn(async move {
             let s = acceptor.accept().await.unwrap();
@@ -1614,7 +1602,7 @@ fn tcp_reuse_port_ipv6() {
     });
 
     let client_op = async |ex: fiona::Executor, port: u16| {
-        let client = fiona::net::TcpClient::new(ex.clone())
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv6(Ipv6Addr::LOCALHOST, port)
             .await;
 
@@ -1641,7 +1629,7 @@ fn tcp_acceptor_cancel() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
     ex.clone()
         .spawn((async |acceptor: fiona::net::TcpListener| {
             match acceptor.accept().await {
@@ -1664,7 +1652,7 @@ fn tcp_acceptor_close() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
     ex.clone()
         .spawn((async |acceptor: fiona::net::TcpListener| {
             match acceptor.accept().await {
@@ -1694,12 +1682,11 @@ fn tcp_send_subspan() {
     let ex = ioc.get_executor();
 
     async fn task(ex: fiona::Executor) {
-        let acceptor =
-            fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+        let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
         let port = acceptor.port();
 
         let h = ex.spawn((async |port: u16, ex: fiona::Executor| {
-            fiona::net::TcpClient::new(ex)
+            fiona::net::TcpClient::new(&ex)
                 .connect_ipv6(Ipv6Addr::LOCALHOST, port)
                 .await
                 .unwrap()
@@ -1747,7 +1734,7 @@ fn tcp_ephemeral_port_exhaustion_panic() {
 
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.clone()
@@ -1761,14 +1748,14 @@ fn tcp_ephemeral_port_exhaustion_panic() {
                 let stream = stream.unwrap();
                 let _ = stream;
 
-                let timer = fiona::time::Timer::new(stream.get_executor());
+                let timer = fiona::time::Timer::new(&stream.get_executor());
                 timer.wait(Duration::from_millis(100)).await.unwrap();
             }
         })(acceptor.clone()));
 
     ex.clone()
         .spawn((async |acceptor: fiona::net::TcpListener| {
-            let timer = fiona::time::Timer::new(acceptor.get_executor());
+            let timer = fiona::time::Timer::new(&acceptor.get_executor());
             timer.wait(Duration::from_millis(15_000)).await.unwrap();
 
             acceptor.cancel().await.unwrap();
@@ -1787,12 +1774,12 @@ fn tcp_ephemeral_port_exhaustion_panic() {
 
             for _ in 0..25_000 {
                 ex.clone().spawn((async |ex: fiona::Executor, port: u16| {
-                    let client = fiona::net::TcpClient::new(ex)
+                    let client = fiona::net::TcpClient::new(&ex)
                         .connect_ipv6(Ipv6Addr::LOCALHOST, port)
                         .await
                         .unwrap();
 
-                    let timer = fiona::time::Timer::new(client.get_executor());
+                    let timer = fiona::time::Timer::new(&client.get_executor());
                     timer.wait(Duration::from_millis(100)).await.unwrap();
                 })(ex.clone(), port));
             }
@@ -1826,7 +1813,7 @@ fn tcp_acceptor_outlives_io_context() {
 
     let ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex, Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
 
     drop(ioc);
 
@@ -1870,7 +1857,7 @@ fn tcp_sockets_outlive_io_context() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     let bgid = 0;
@@ -1895,7 +1882,7 @@ fn tcp_sockets_outlive_io_context() {
         ex: fiona::Executor, port: u16, bgid: u16,
         client_stream: Rc<RefCell<Option<fiona::net::TcpStream>>>,
     ) {
-        let client = fiona::net::TcpClient::new(ex)
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -1951,7 +1938,7 @@ fn tcp_socket_reuse() {
 
     let ex = ioc.get_executor();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv4(ex.clone(), Ipv4Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
     let acceptor2 = acceptor.clone();
     let port = acceptor.port();
 
@@ -1986,7 +1973,7 @@ fn tcp_socket_reuse() {
     ex.clone().spawn(async move {
         let mut closed_streams = Vec::new();
         for _ in 0..NUM_CONNS {
-            let s = fiona::net::TcpClient::new(ex.clone())
+            let s = fiona::net::TcpClient::new(&ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -1997,7 +1984,7 @@ fn tcp_socket_reuse() {
 
         let mut streams = Vec::new();
         for _ in 0..NUM_CONNS {
-            let s = fiona::net::TcpClient::new(ex.clone())
+            let s = fiona::net::TcpClient::new(&ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -2053,7 +2040,7 @@ fn tcp_socket_reuse() {
         let mut streams = Vec::new();
 
         for i in 0..2 * NUM_CONNS {
-            let s = fiona::net::TcpClient::new(ex.clone())
+            let s = fiona::net::TcpClient::new(&ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
@@ -2092,7 +2079,7 @@ fn tcp_graceful_shutdown() {
     let ex = ioc.get_executor();
     ex.register_buf_group(0, 128, 256).unwrap();
 
-    let acceptor = fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.clone().spawn(async move {
@@ -2109,7 +2096,7 @@ fn tcp_graceful_shutdown() {
     });
 
     ex.clone().spawn(async move {
-        let stream = fiona::net::TcpClient::new(ex)
+        let stream = fiona::net::TcpClient::new(&ex)
             .connect_ipv6(Ipv6Addr::LOCALHOST, port)
             .await
             .unwrap();

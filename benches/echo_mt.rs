@@ -301,7 +301,7 @@ fn fiona_echo_client(
                 ex.clone().spawn(async move {
                     let mut h = blake2::Blake2b512::new();
 
-                    let stream = fiona::net::TcpClient::new(ex2)
+                    let stream = fiona::net::TcpClient::new(&ex2)
                         .with_timeout(Duration::from_secs(10))
                         .connect_ipv4(ipv4_addr, port)
                         .await
@@ -365,7 +365,7 @@ fn fiona_echo_server(
             };
 
             let acceptor =
-                fiona::net::TcpListener::bind_ipv4_with_params(ex.clone(), ipv4_addr, port, &opts)
+                fiona::net::TcpListener::bind_ipv4_with_params(&ex, ipv4_addr, port, &opts)
                     .unwrap();
 
             ex.register_buf_group(SERVER_BGID, NUM_BUFS, RECV_BUF_SIZE)

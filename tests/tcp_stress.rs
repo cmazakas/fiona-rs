@@ -53,7 +53,7 @@ fn make_io_context(nr_files: u32) -> fiona::IoContext {
 async fn fiona_echo_client_impl(ex: fiona::Executor, ipv4_addr: Ipv4Addr, port: u16) {
     let mut generator = ByteGen::new();
 
-    let client = fiona::net::TcpClient::new(ex)
+    let client = fiona::net::TcpClient::new(&ex)
         .with_timeout(Duration::from_secs(3))
         .connect_ipv4(ipv4_addr, port)
         .await
@@ -199,7 +199,7 @@ fn fiona_echo_server(ipv4_addr: Ipv4Addr, port: u16, nr_files: u32) -> Result<()
         reuse_port: true,
     };
     let acceptor =
-        fiona::net::TcpListener::bind_ipv4_with_params(ex.clone(), ipv4_addr, port, opts).unwrap();
+        fiona::net::TcpListener::bind_ipv4_with_params(&ex, ipv4_addr, port, opts).unwrap();
 
     ex.clone().spawn(async move {
         loop {

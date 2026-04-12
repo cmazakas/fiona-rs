@@ -83,8 +83,9 @@ impl TcpListener {
     const DEFAULT_BACKLOG: i32 = 2 * 1024;
 
     fn bind_ip_impl(
-        ex: Executor, ip_addr: &dyn SockaddrLike, opts: &TcpListenerOpts, af: AddressFamily,
+        ex: &Executor, ip_addr: &dyn SockaddrLike, opts: &TcpListenerOpts, af: AddressFamily,
     ) -> Result<TcpListener> {
+        let ex = ex.clone();
         let socket = socket(af, SockType::Stream, SockFlag::empty(), SockProtocol::Tcp)?;
 
         if opts.reuse_addr {
@@ -133,24 +134,24 @@ impl TcpListener {
     }
 
     pub fn bind_ipv4_with_params(
-        ex: Executor, ipv4_addr: Ipv4Addr, port: u16, opts: &TcpListenerOpts,
+        ex: &Executor, ipv4_addr: Ipv4Addr, port: u16, opts: &TcpListenerOpts,
     ) -> Result<TcpListener> {
         let addr = SockaddrIn::from(SocketAddrV4::new(ipv4_addr, port));
         Self::bind_ip_impl(ex, &addr, opts, AddressFamily::Inet)
     }
 
-    pub fn bind_ipv4(ex: Executor, ipv4_addr: Ipv4Addr, port: u16) -> Result<TcpListener> {
+    pub fn bind_ipv4(ex: &Executor, ipv4_addr: Ipv4Addr, port: u16) -> Result<TcpListener> {
         let addr = SockaddrIn::from(SocketAddrV4::new(ipv4_addr, port));
         Self::bind_ip_impl(ex, &addr, &TcpListenerOpts::default(), AddressFamily::Inet)
     }
 
-    pub fn bind_ipv6(ex: Executor, ipv6_addr: Ipv6Addr, port: u16) -> Result<TcpListener> {
+    pub fn bind_ipv6(ex: &Executor, ipv6_addr: Ipv6Addr, port: u16) -> Result<TcpListener> {
         let addr = SockaddrIn6::from(SocketAddrV6::new(ipv6_addr, port, 0, 0));
         Self::bind_ip_impl(ex, &addr, &TcpListenerOpts::default(), AddressFamily::Inet6)
     }
 
     pub fn bind_ipv6_with_params(
-        ex: Executor, ipv6_addr: Ipv6Addr, port: u16, opts: &TcpListenerOpts,
+        ex: &Executor, ipv6_addr: Ipv6Addr, port: u16, opts: &TcpListenerOpts,
     ) -> Result<TcpListener> {
         let addr = SockaddrIn6::from(SocketAddrV6::new(ipv6_addr, port, 0, 0));
         Self::bind_ip_impl(ex, &addr, opts, AddressFamily::Inet6)
@@ -440,7 +441,8 @@ pub struct TcpStream {
 
 impl TcpStream {
     #[must_use]
-    pub(crate) fn new(ex: Executor, fd: i32) -> TcpStream {
+    pub(crate) fn new(ex: &Executor, fd: i32) -> TcpStream {
+        let ex = ex.clone();
         let layout = Layout::new::<StreamImpl>();
         let p;
 
@@ -1232,7 +1234,7 @@ impl Future for RecvFuture<'_> {
                     make_io_uring_op(
                         ref_count,
                         OpType::MultishotTcpRecv {
-                            bufs: BorrowedBufs::new(ex.clone(), buf_group),
+                            bufs: BorrowedBufs::new(&ex, buf_group),
                             buf_group,
                             last_recv,
                         },
@@ -1279,7 +1281,7 @@ impl Future for RecvFuture<'_> {
                 if !bufs.is_empty() {
                     self.completed = true;
 
-                    let mut user_bufs = BorrowedBufs::new(ex.clone(), buf_group);
+                    let mut user_bufs = BorrowedBufs::new(&ex, buf_group);
                     mem::swap(&mut user_bufs, bufs);
 
                     if op.done {
@@ -1297,7 +1299,7 @@ impl Future for RecvFuture<'_> {
                         stream_impl.recv_op = None;
                         io_ops.remove(key).unwrap();
                     }
-                    return Poll::Ready(Ok(BorrowedBufs::new(ex.clone(), buf_group)));
+                    return Poll::Ready(Ok(BorrowedBufs::new(&ex, buf_group)));
                 }
 
                 if op.res < 0 {
@@ -1326,9 +1328,9 @@ pub struct TcpClient {
 
 impl TcpClient {
     #[must_use]
-    pub fn new(ex: Executor) -> TcpClient {
+    pub fn new(ex: &Executor) -> TcpClient {
         TcpClient {
-            ex,
+            ex: ex.clone(),
             timeout: Duration::from_secs(3),
         }
     }
@@ -1457,7 +1459,7 @@ impl Future for ConnectFuture {
                     Poll::Ready(Err(Errno::from_raw(-res)))
                 } else {
                     drop(io_ops);
-                    Poll::Ready(Ok(TcpStream::new(ex, fd)))
+                    Poll::Ready(Ok(TcpStream::new(&ex, fd)))
                 }
             }
         }

@@ -190,7 +190,7 @@ fn tls_handshake() {
     let mut ioc = fiona::IoContext::new();
 
     let ex = ioc.get_executor();
-    let acceptor = fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.register_buf_group(1234, 1024, 256).unwrap();
@@ -219,7 +219,7 @@ fn tls_handshake() {
     })(acceptor));
 
     ex.spawn((async |ex: fiona::Executor, port: u16| {
-        let client = fiona::net::TcpClient::new(ex.clone())
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv6(Ipv6Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -234,7 +234,7 @@ fn tls_handshake() {
         .await
         .unwrap();
 
-        let client = fiona::net::TcpClient::new(ex)
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv6(Ipv6Addr::LOCALHOST, port)
             .await
             .unwrap();
@@ -265,7 +265,7 @@ fn tls_send_recv() {
     let mut ioc = fiona::IoContext::new();
 
     let ex = ioc.get_executor();
-    let acceptor = fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
     ex.register_buf_group(1234, 1024, 256).unwrap();
@@ -294,7 +294,7 @@ fn tls_send_recv() {
     })(acceptor));
 
     ex.spawn((async |ex: fiona::Executor, port: u16| {
-        let client = fiona::net::TcpClient::new(ex)
+        let client = fiona::net::TcpClient::new(&ex)
             .connect_ipv6(Ipv6Addr::LOCALHOST, port)
             .await
             .unwrap();
