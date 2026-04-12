@@ -106,6 +106,11 @@ impl TlsStream {
         conn.process_new_packets()?;
         conn.reader().read(plaintext).map_err(Error::from)
     }
+
+    #[allow(clippy::unused_async)]
+    pub async fn shutdown(&self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub struct TlsClient {
@@ -194,6 +199,10 @@ pub async fn server_handshake(
 
         if is_handshaking && wants_read {
             let bufs = tls_stream.tcp_stream.recv().await?;
+            if bufs.is_empty() {
+                return Err(Error::Tls(rustls::Error::HandshakeNotComplete));
+            }
+
             for mut b in &bufs {
                 tls_conn.borrow_mut().read_tls(&mut b)?;
             }
@@ -245,6 +254,10 @@ pub async fn client_handshake(
 
         if is_handshaking && wants_read {
             let bufs = tls_client.tcp_stream.recv().await?;
+            if bufs.is_empty() {
+                return Err(Error::Tls(rustls::Error::HandshakeNotComplete));
+            }
+
             for mut b in &bufs {
                 tls_conn.borrow_mut().read_tls(&mut b)?;
             }

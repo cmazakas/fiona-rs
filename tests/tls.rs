@@ -200,6 +200,81 @@ fn tls_handshake() {
         let stream = acceptor.accept().await.unwrap();
         stream.set_buf_group(1234);
 
+        let _tls_stream = fiona::tls::server_handshake(stream, make_server_config())
+            .await
+            .unwrap();
+
+        let stream2 = acceptor.accept().await.unwrap();
+        stream2.set_buf_group(1234);
+
+        let Err(tls_error) = fiona::tls::server_handshake(stream2, make_server_config()).await
+        else {
+            unreachable!()
+        };
+
+        let fiona::tls::Error::Tls(rustls::Error::HandshakeNotComplete) = tls_error else {
+            eprintln!("{tls_error:?}");
+            unreachable!()
+        };
+    })(acceptor));
+
+    ex.spawn((async |ex: fiona::Executor, port: u16| {
+        let client = fiona::net::TcpClient::new(ex.clone())
+            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        client.set_buf_group(4321);
+
+        let _tls_client = fiona::tls::client_handshake(
+            client,
+            make_client_config(),
+            "localhost".try_into().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let client = fiona::net::TcpClient::new(ex)
+            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        client.set_buf_group(4321);
+
+        let Err(tls_error) = fiona::tls::client_handshake(
+            client,
+            make_client_config(),
+            "www.google.com".try_into().unwrap(),
+        )
+        .await
+        else {
+            unreachable!()
+        };
+
+        let fiona::tls::Error::Tls(rustls::Error::InvalidCertificate(_)) = tls_error else {
+            eprintln!("{:?}", tls_error);
+            unreachable!()
+        };
+    })(ex.clone(), port));
+
+    assert_eq!(ioc.run(), 2);
+}
+
+#[test]
+fn tls_send_recv() {
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+    let acceptor = fiona::net::TcpListener::bind_ipv6(ex.clone(), Ipv6Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.register_buf_group(1234, 1024, 256).unwrap();
+    ex.register_buf_group(4321, 1024, 256).unwrap();
+
+    ex.spawn((async |acceptor: fiona::net::TcpListener| {
+        let stream = acceptor.accept().await.unwrap();
+        stream.set_buf_group(1234);
+
         let tls_stream = fiona::tls::server_handshake(stream, make_server_config())
             .await
             .unwrap();
