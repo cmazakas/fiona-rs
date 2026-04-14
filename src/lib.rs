@@ -511,7 +511,7 @@ impl Drop for BorrowedBufs {
         let mut count = 0;
 
         let mut buf_id = self.head;
-        while buf_id > 0 {
+        while buf_id >= 0 {
             let addr = buf_group.buf_as_ptr(buf_id as u16).cast();
             let tail = &mut buf_group.tail;
             let len = buf_group.buf_len as _;
@@ -532,7 +532,7 @@ impl Drop for BorrowedBufs {
         }
 
         unsafe { io_uring_buf_ring_advance(br, count) };
-        let _ = self.ex; // suppress unused warnings
+        let _ = self.ex; // Suppress unused warnings.
     }
 }
 

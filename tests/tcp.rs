@@ -533,20 +533,20 @@ fn tcp_recv_buffer_replenishing() {
     {
         let message = message.clone();
         ex.clone().spawn(async move {
-            let client = fiona::net::TcpClient::new(&ex)
+            let stream = fiona::net::TcpClient::new(&ex)
                 .connect_ipv4(Ipv4Addr::LOCALHOST, port)
                 .await
                 .unwrap();
 
-            client.set_buf_group(bgid);
+            stream.set_buf_group(bgid);
 
             let mut acc_msg = Vec::new();
 
             for chunk in message.chunks(chunk_size) {
                 let msg = chunk.to_vec();
-                client.send(msg).await.0.unwrap();
+                stream.send(msg).await.0.unwrap();
 
-                let bufs = client.recv().await.unwrap();
+                let bufs = stream.recv().await.unwrap();
 
                 for buf in bufs.iter() {
                     acc_msg.extend_from_slice(buf);
@@ -563,12 +563,89 @@ fn tcp_recv_buffer_replenishing() {
     assert_eq!(unsafe { NUM_RUNS }, n);
 }
 
-fn _flatten_bufs(bufs: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut v = Vec::new();
-    for buf in bufs {
-        v.extend_from_slice(buf.as_slice());
+#[test]
+fn tcp_recv_buffer_no_starvation() {
+    // Want to test that all buffers are properly returned to the buf ring.
+
+    static mut NUM_RUNS: u64 = 0;
+
+    let server_bgid = 0;
+    let client_bgid = 1;
+    let num_bufs = 64;
+    let buf_len = 8;
+    let total_bytes = usize::try_from(num_bufs).unwrap() * buf_len;
+
+    let message_len = total_bytes;
+    let mut rng = rand::rngs::StdRng::from_os_rng();
+    let mut message = vec![0; message_len];
+    rand::RngCore::fill_bytes(&mut rng, &mut message);
+
+    let message = message;
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.register_buf_group(server_bgid, num_bufs, buf_len)
+        .unwrap();
+    ex.register_buf_group(client_bgid, num_bufs, buf_len)
+        .unwrap();
+
+    {
+        let message = message.clone();
+        ex.clone().spawn(async move {
+            let stream = acceptor.accept().await.unwrap();
+            stream.set_buf_group(server_bgid);
+
+            for _ in 0..2 {
+                let mut acc_msg = Vec::new();
+                let bufs = stream.recv().await.unwrap();
+
+                for buf in bufs.iter() {
+                    acc_msg.extend_from_slice(buf);
+                }
+                assert_eq!(acc_msg, message);
+
+                stream.send(acc_msg).await.0.unwrap();
+            }
+
+            unsafe { NUM_RUNS += 1 };
+        });
     }
-    v
+
+    {
+        let mut message = message.clone();
+        ex.clone().spawn(async move {
+            let stream = fiona::net::TcpClient::new(&ex)
+                .connect_ipv4(Ipv4Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            stream.set_buf_group(client_bgid);
+
+            for _ in 0..2 {
+                let (n, buf) = stream.send(message).await;
+                assert_eq!(n.unwrap(), message_len);
+
+                message = buf;
+
+                let mut acc_msg = Vec::new();
+                let bufs = stream.recv().await.unwrap();
+                for buf in bufs.iter() {
+                    acc_msg.extend_from_slice(buf);
+                }
+                assert_eq!(acc_msg, message);
+            }
+
+            unsafe { NUM_RUNS += 1 };
+        });
+    }
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+    assert_eq!(unsafe { NUM_RUNS }, n);
 }
 
 #[test]
