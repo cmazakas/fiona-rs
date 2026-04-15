@@ -540,7 +540,7 @@ impl Debug for BorrowedBufs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let iter = self.iter();
         for buf in iter {
-            write!(f, "{buf:?}").unwrap();
+            write!(f, "{buf:?}")?;
         }
         Ok(())
     }
