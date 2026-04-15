@@ -1293,12 +1293,10 @@ impl Future for RecvFuture<'_> {
                 }
 
                 if op.res == 0 {
-                    self.completed = true;
                     assert!(op.done);
-                    if op.done {
-                        stream_impl.recv_op = None;
-                        io_ops.remove(key).unwrap();
-                    }
+                    self.completed = true;
+                    stream_impl.recv_op = None;
+                    io_ops.remove(key).unwrap();
                     return Poll::Ready(Ok(BorrowedBufs::new(&ex, buf_group)));
                 }
 
