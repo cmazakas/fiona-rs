@@ -625,7 +625,7 @@ mod io_ops {
 
 struct IoContextFrame {
     ioring: RefCell<io_uring>,
-    params: RefCell<io_uring_params>,
+    params: RefCell<IoContextParams>,
     receiver: RefCell<Receiver<Weak>>,
     sender: RefCell<Sender<Weak>>,
     buf_groups: RefCell<HashMap<u16, Box<UnsafeCell<BufGroup>>>>,
@@ -889,10 +889,11 @@ impl Default for IoContext {
 
 //-----------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 pub struct IoContextParams {
-    pub sq_entries: u32,
-    pub cq_entries: u32,
-    pub nr_files: u32,
+    sq_entries: u32,
+    cq_entries: u32,
+    nr_files: u32,
 }
 
 impl IoContextParams {
@@ -903,6 +904,21 @@ impl IoContextParams {
             cq_entries: 1024,
             nr_files: 1024,
         }
+    }
+
+    #[must_use]
+    pub fn sq_entries(&self) -> u32 {
+        self.sq_entries
+    }
+
+    #[must_use]
+    pub fn cq_entries(&self) -> u32 {
+        self.cq_entries
+    }
+
+    #[must_use]
+    pub fn num_files(&self) -> u32 {
+        self.nr_files
     }
 }
 
@@ -958,7 +974,7 @@ impl IoContextBuilder {
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 
         let ioc_frame = IoContextFrame {
-            params: RefCell::new(params),
+            params: RefCell::new(self.params),
             receiver: RefCell::new(rx),
             sender: RefCell::new(tx),
             ioring: RefCell::new(ioring),
@@ -1761,13 +1777,7 @@ impl Executor {
 
     #[must_use]
     pub fn get_params(&self) -> IoContextParams {
-        let ring_params = &*self.p.params.borrow();
-        let nr_files = 0;
-        IoContextParams {
-            sq_entries: ring_params.sq_entries,
-            cq_entries: ring_params.cq_entries,
-            nr_files,
-        }
+        *self.p.params.borrow()
     }
 
     pub fn register_buf_group(&self, bgid: u16, num_bufs: u32, buf_len: usize) -> Result<()> {

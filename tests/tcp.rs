@@ -1086,7 +1086,7 @@ fn tcp_select_drop_ready_recv_future() {
         let mut timers = Vec::<fiona::time::Timer>::new();
         let mut timeouts = Vec::<fiona::time::TimerFuture>::new();
 
-        let num_ops = 17 + ex.get_params().sq_entries;
+        let num_ops = 17 + ex.get_params().sq_entries();
 
         for _ in 0..num_ops {
             let timer = fiona::time::Timer::new(&ex.clone());
@@ -1898,7 +1898,7 @@ fn tcp_acceptor_outlives_io_context() {
     let ex = acceptor.get_executor();
 
     let params = ex.get_params();
-    assert!(params.sq_entries > 0);
+    assert!(params.sq_entries() > 0);
 
     ex.register_buf_group(1234, 256, 1024).unwrap();
 
