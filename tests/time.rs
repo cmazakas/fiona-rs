@@ -425,6 +425,8 @@ fn time_random() {
 
 #[test]
 fn time_double_run() {
+    // Test that we can run call IoContext::run multiple times.
+
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
@@ -449,6 +451,8 @@ fn time_double_run() {
 
 #[test]
 fn time_double_run_panic_reuse() {
+    // Test that we can call IoContext::run
+
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
