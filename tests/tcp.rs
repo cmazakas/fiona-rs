@@ -593,13 +593,15 @@ fn tcp_recv_buffer_no_starvation() {
     ex.register_buf_group(client_bgid, num_bufs, buf_len)
         .unwrap();
 
+    let num_iters = 10;
+
     {
         let message = message.clone();
         ex.clone().spawn(async move {
             let stream = acceptor.accept().await.unwrap();
             stream.set_buf_group(server_bgid);
 
-            for _ in 0..2 {
+            for _ in 0..num_iters {
                 let mut acc_msg = Vec::new();
                 let bufs = stream.recv().await.unwrap();
 
@@ -607,6 +609,7 @@ fn tcp_recv_buffer_no_starvation() {
                     acc_msg.extend_from_slice(buf);
                 }
                 assert_eq!(acc_msg, message);
+                drop(bufs);
 
                 stream.send(acc_msg).await.0.unwrap();
             }
@@ -625,7 +628,7 @@ fn tcp_recv_buffer_no_starvation() {
 
             stream.set_buf_group(client_bgid);
 
-            for _ in 0..2 {
+            for _ in 0..num_iters {
                 let (n, buf) = stream.send(message).await;
                 assert_eq!(n.unwrap(), message_len);
 
@@ -2189,4 +2192,74 @@ fn tcp_graceful_shutdown() {
     });
 
     ioc.run();
+}
+
+#[test]
+fn test_tcp_double_run() {
+    // Test that we're able to support small testing utilities that require
+    // multiple IoContext::run calls.
+
+    let mut ioc = fiona::IoContext::new();
+
+    fn make_socket_pair(
+        ioc: &mut fiona::IoContext,
+    ) -> (fiona::net::TcpStream, fiona::net::TcpStream) {
+        let ex = ioc.get_executor();
+
+        ex.register_buf_group(1234, 1024, 1024).unwrap();
+
+        let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
+        let port = acceptor.port();
+
+        let server = Rc::new(RefCell::new(None));
+        let client = Rc::new(RefCell::new(None));
+
+        let server_cpy = server.clone();
+        ex.clone().spawn(async move {
+            let stream = acceptor.accept().await.unwrap();
+            stream.set_buf_group(1234);
+
+            *server_cpy.borrow_mut() = Some(stream.clone());
+        });
+
+        let client_cpy = client.clone();
+        ex.clone().spawn(async move {
+            let stream = fiona::net::TcpClient::new(&ex)
+                .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            stream.set_buf_group(1234);
+
+            *client_cpy.borrow_mut() = Some(stream.clone());
+        });
+
+        let n = ioc.run();
+        assert_eq!(n, 2);
+
+        (server.borrow_mut().take().unwrap(), client.borrow_mut().take().unwrap())
+    }
+
+    let (server, client) = make_socket_pair(&mut ioc);
+
+    let ex = ioc.get_executor();
+
+    ex.spawn(async move {
+        let (n, _buf) = server.send(vec![0, 1, 2, 3, 4]).await;
+        assert!(n.is_ok());
+
+        let bufs = server.recv().await.unwrap();
+        assert!(!bufs.is_empty());
+    });
+
+    ex.spawn(async move {
+        let (n, _buf) = client.send(vec![0, 1, 2, 3, 4]).await;
+        assert!(n.is_ok());
+
+        let bufs = client.recv().await.unwrap();
+        assert!(!bufs.is_empty());
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
 }
