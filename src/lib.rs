@@ -1291,9 +1291,9 @@ fn on_tcp_connect(ex: &Executor, cqe: &mut io_uring_cqe) {
     let op = io_ops.get_mut(key).unwrap();
 
     if op.eager_dropped {
-        // if the Future was eager-dropped:
-        // * we need to release the borrowed direct descriptor back to the pool
-        // * if the connect() succeeded, we need to close() it
+        // If the Future was eager-dropped:
+        // * We need to release the borrowed direct descriptor back to the pool.
+        // * If the connect() succeeded, we need to close() it.
 
         let OpType::TcpConnect {
             ref mut needs_socket,
