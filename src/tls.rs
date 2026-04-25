@@ -3,7 +3,7 @@
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     io::{ErrorKind, Read, Write},
     rc::Rc,
     sync::Arc,
@@ -38,25 +38,6 @@ impl From<rustls::Error> for Error {
 struct StreamImpl<TlsConnection> {
     tls_conn: RefCell<TlsConnection>,
     buf: RefCell<Vec<u8>>,
-    send_pending: Cell<bool>,
-    recv_pending: Cell<bool>,
-}
-
-struct PendingDropGuard<'a> {
-    pending: &'a Cell<bool>,
-}
-
-impl<'a> PendingDropGuard<'a> {
-    fn new(pending: &'a Cell<bool>) -> Self {
-        pending.set(true);
-        Self { pending }
-    }
-}
-
-impl Drop for PendingDropGuard<'_> {
-    fn drop(&mut self) {
-        self.pending.set(false);
-    }
 }
 
 pub struct TlsStream {
@@ -142,53 +123,6 @@ impl TlsStream {
         }
 
         Ok(n)
-    }
-
-    pub async fn send(&self, plaintext: &[u8]) -> Result<usize, Error> {
-        let _guard = PendingDropGuard::new(&self.stream_impl.send_pending);
-
-        let mut buf = std::mem::take(&mut *self.stream_impl.buf.borrow_mut());
-
-        let tls_conn = &self.stream_impl.tls_conn;
-        tls_conn.borrow_mut().writer().write_all(plaintext)?;
-        tls_conn.borrow_mut().write_tls(&mut buf)?;
-
-        let (n, send_buf) = self.tcp_stream.send(buf).await;
-        buf = send_buf;
-        buf.clear();
-        *self.stream_impl.buf.borrow_mut() = buf;
-
-        Ok(n?)
-    }
-
-    pub async fn recv(&self, plaintext: &mut [u8]) -> Result<usize, Error> {
-        let _guard = PendingDropGuard::new(&self.stream_impl.recv_pending);
-
-        let tls_conn = &self.stream_impl.tls_conn;
-
-        let has_pending_plaintext = !tls_conn.borrow().wants_read();
-        if has_pending_plaintext {
-            return tls_conn
-                .borrow_mut()
-                .reader()
-                .read(plaintext)
-                .map_err(Error::from);
-        }
-
-        let bufs = self.tcp_stream.recv().await?;
-
-        let conn = &mut *tls_conn.borrow_mut();
-        for mut b in &bufs {
-            conn.read_tls(&mut b)?;
-        }
-
-        conn.process_new_packets()?;
-        conn.reader().read(plaintext).map_err(Error::from)
-    }
-
-    #[allow(clippy::unused_async)]
-    pub async fn shutdown(&self) -> Result<(), Error> {
-        Ok(())
     }
 }
 
@@ -276,48 +210,6 @@ impl TlsClient {
 
         Ok(n)
     }
-
-    pub async fn send(&self, plaintext: &[u8]) -> Result<usize, Error> {
-        let _guard = PendingDropGuard::new(&self.stream_impl.send_pending);
-
-        let mut buf = std::mem::take(&mut *self.stream_impl.buf.borrow_mut());
-
-        let tls_conn = &self.stream_impl.tls_conn;
-        tls_conn.borrow_mut().writer().write_all(plaintext)?;
-        tls_conn.borrow_mut().write_tls(&mut buf)?;
-
-        let (n, send_buf) = self.tcp_stream.send(buf).await;
-        buf = send_buf;
-        buf.clear();
-        *self.stream_impl.buf.borrow_mut() = buf;
-
-        Ok(n?)
-    }
-
-    pub async fn recv(&self, plaintext: &mut [u8]) -> Result<usize, Error> {
-        let _guard = PendingDropGuard::new(&self.stream_impl.recv_pending);
-
-        let tls_conn = &self.stream_impl.tls_conn;
-
-        let has_pending_plaintext = !tls_conn.borrow().wants_read();
-        if has_pending_plaintext {
-            return tls_conn
-                .borrow_mut()
-                .reader()
-                .read(plaintext)
-                .map_err(Error::from);
-        }
-
-        let bufs = self.tcp_stream.recv().await?;
-
-        let conn = &mut *tls_conn.borrow_mut();
-        for mut b in &bufs {
-            conn.read_tls(&mut b)?;
-        }
-
-        conn.process_new_packets()?;
-        conn.reader().read(plaintext).map_err(Error::from)
-    }
 }
 
 pub async fn server_handshake(
@@ -330,8 +222,6 @@ pub async fn server_handshake(
         stream_impl: Rc::new(StreamImpl {
             tls_conn: RefCell::new(config),
             buf: RefCell::new(Vec::new()),
-            send_pending: Cell::new(false),
-            recv_pending: Cell::new(false),
         }),
     };
 
@@ -386,8 +276,6 @@ pub async fn client_handshake(
         stream_impl: Rc::new(StreamImpl {
             tls_conn: RefCell::new(rustls::ClientConnection::new(config, server_name)?),
             buf: RefCell::new(Vec::new()),
-            send_pending: Cell::new(false),
-            recv_pending: Cell::new(false),
         }),
     };
 

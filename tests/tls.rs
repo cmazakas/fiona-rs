@@ -264,6 +264,8 @@ fn tls_handshake() {
 
 #[test]
 fn tls_send_recv() {
+    // Test a simple exchange of fixed-sized messages.
+
     let mut ioc = fiona::IoContext::new();
 
     let ex = ioc.get_executor();
@@ -281,16 +283,20 @@ fn tls_send_recv() {
             .await
             .unwrap();
 
-        tls_stream
-            .send("Hello, world! This is plaintext from the server!".as_bytes())
-            .await
-            .unwrap();
+        let text = "Hello, world! This is plaintext from the server!";
 
-        let mut buf = vec![0_u8; 1024];
-        let n = tls_stream.recv(&mut buf).await.unwrap();
+        let n = tls_stream.write_tls(text.as_bytes()).unwrap();
+        assert_eq!(n, text.len());
 
+        let n = tls_stream.flush_tls(1024).await.unwrap();
+        assert!(n > text.len());
+
+        let mut msg = Vec::new();
+        let n = tls_stream.read_tls(&mut msg).await.unwrap();
+
+        assert_eq!(msg.len(), n);
         assert_eq!(
-            str::from_utf8(&buf[..n]).unwrap(),
+            str::from_utf8(&msg[..]).unwrap(),
             "Hello, world! This is plaintext from the client!"
         );
     })(acceptor));
@@ -311,13 +317,16 @@ fn tls_send_recv() {
         .await
         .unwrap();
 
-        tls_client
-            .send("Hello, world! This is plaintext from the client!".as_bytes())
-            .await
-            .unwrap();
+        let text = "Hello, world! This is plaintext from the client!";
 
-        let mut buf = vec![0_u8; 1024];
-        let n = tls_client.recv(&mut buf).await.unwrap();
+        let n = tls_client.write_tls(text.as_bytes()).unwrap();
+        assert_eq!(n, text.len());
+
+        let n = tls_client.flush_tls(1024).await.unwrap();
+        assert!(n > text.len());
+
+        let mut buf = Vec::new();
+        let n = tls_client.read_tls(&mut buf).await.unwrap();
 
         assert_eq!(
             str::from_utf8(&buf[..n]).unwrap(),
@@ -331,7 +340,7 @@ fn tls_send_recv() {
 #[test]
 fn tls_large_send() {
     // Test that our code doesn't drop any octets when sending something is
-    // sufficiently large that it needs multiple TCP sends
+    // sufficiently large that it needs multiple TCP sends.
 
     const MAX_SEND_SIZE: usize = 16 * 1024;
 
