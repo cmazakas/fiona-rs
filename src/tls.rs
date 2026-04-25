@@ -4,7 +4,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     rc::Rc,
     sync::Arc,
 };
@@ -65,6 +65,85 @@ pub struct TlsStream {
 }
 
 impl TlsStream {
+    pub fn write_tls(&self, plaintext: &[u8]) -> Result<usize, Error> {
+        let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
+        let n = tls_conn.writer().write(plaintext)?;
+        Ok(n)
+    }
+
+    pub async fn flush_tls(&self, max_send_size: usize) -> Result<usize, Error> {
+        let mut buf = std::mem::take(&mut *self.stream_impl.buf.borrow_mut());
+        {
+            let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
+            while tls_conn.wants_write() {
+                tls_conn.write_tls(&mut buf)?;
+            }
+        }
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let (n, mut buf) = self
+            .tcp_stream
+            .send_subspan(..max_send_size.min(buf.len()), buf)
+            .await;
+        let n = n?;
+
+        buf.drain(0..n);
+        *self.stream_impl.buf.borrow_mut() = buf;
+
+        Ok(n)
+    }
+
+    pub async fn read_tls(&self, buf: &mut Vec<u8>) -> Result<usize, Error> {
+        {
+            let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
+
+            let has_pending_plaintext = !tls_conn.wants_read();
+            if has_pending_plaintext {
+                let mut n = 0;
+                let old_len = buf.len();
+                match tls_conn.reader().read_to_end(buf) {
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        n += buf.len() - old_len;
+                    }
+                    Ok(read) => {
+                        n += read;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+                return Ok(n);
+            }
+        }
+
+        let bufs = self.tcp_stream.recv().await?;
+
+        let mut n = 0;
+        let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
+
+        for mut b in &bufs {
+            while !b.is_empty() {
+                tls_conn.read_tls(&mut b)?;
+                tls_conn.process_new_packets()?;
+                if !tls_conn.wants_read() {
+                    let old_len = buf.len();
+                    match tls_conn.reader().read_to_end(buf) {
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            n += buf.len() - old_len;
+                        }
+                        Ok(read) => {
+                            n += read;
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+            }
+        }
+
+        Ok(n)
+    }
+
     pub async fn send(&self, plaintext: &[u8]) -> Result<usize, Error> {
         let _guard = PendingDropGuard::new(&self.stream_impl.send_pending);
 
@@ -119,6 +198,85 @@ pub struct TlsClient {
 }
 
 impl TlsClient {
+    pub fn write_tls(&self, plaintext: &[u8]) -> Result<usize, Error> {
+        let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
+        let n = tls_conn.writer().write(plaintext)?;
+        Ok(n)
+    }
+
+    pub async fn flush_tls(&self, max_send_size: usize) -> Result<usize, Error> {
+        let mut buf = std::mem::take(&mut *self.stream_impl.buf.borrow_mut());
+        {
+            let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
+            while tls_conn.wants_write() {
+                tls_conn.write_tls(&mut buf)?;
+            }
+        }
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let (n, mut buf) = self
+            .tcp_stream
+            .send_subspan(..max_send_size.min(buf.len()), buf)
+            .await;
+        let n = n?;
+
+        buf.drain(0..n);
+        *self.stream_impl.buf.borrow_mut() = buf;
+
+        Ok(n)
+    }
+
+    pub async fn read_tls(&self, buf: &mut Vec<u8>) -> Result<usize, Error> {
+        {
+            let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
+
+            let has_pending_plaintext = !tls_conn.wants_read();
+            if has_pending_plaintext {
+                let mut n = 0;
+                let old_len = buf.len();
+                match tls_conn.reader().read_to_end(buf) {
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        n += buf.len() - old_len;
+                    }
+                    Ok(read) => {
+                        n += read;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+                return Ok(n);
+            }
+        }
+
+        let bufs = self.tcp_stream.recv().await?;
+
+        let mut n = 0;
+        let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
+
+        for mut b in &bufs {
+            while !b.is_empty() {
+                tls_conn.read_tls(&mut b)?;
+                tls_conn.process_new_packets()?;
+                if !tls_conn.wants_read() {
+                    let old_len = buf.len();
+                    match tls_conn.reader().read_to_end(buf) {
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            n += buf.len() - old_len;
+                        }
+                        Ok(read) => {
+                            n += read;
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+            }
+        }
+
+        Ok(n)
+    }
+
     pub async fn send(&self, plaintext: &[u8]) -> Result<usize, Error> {
         let _guard = PendingDropGuard::new(&self.stream_impl.send_pending);
 

@@ -7,9 +7,11 @@
 use std::{
     io::{Read, Write},
     net::Ipv6Addr,
+    rc::Rc,
     sync::Arc,
 };
 
+use rand::SeedableRng;
 use rustls_pki_types::pem::PemObject;
 
 // fn to_hex(x: &[u8]) -> String {
@@ -322,6 +324,113 @@ fn tls_send_recv() {
             "Hello, world! This is plaintext from the server!"
         );
     })(ex.clone(), port));
+
+    assert_eq!(ioc.run(), 2);
+}
+
+#[test]
+fn tls_large_send() {
+    // Test that our code doesn't drop any octets when sending something is
+    // sufficiently large that it needs multiple TCP sends
+
+    const MAX_SEND_SIZE: usize = 16 * 1024;
+
+    let msg_len = 128 * 1024;
+    let mut message = vec![0; msg_len];
+    {
+        let mut rng = rand::rngs::StdRng::from_os_rng();
+        rand::RngCore::fill_bytes(&mut rng, &mut message);
+    }
+
+    let message = Rc::new(message);
+
+    let mut ioc = fiona::IoContext::new();
+
+    let ex = ioc.get_executor();
+    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    ex.register_buf_group(1234, 1024, 1024).unwrap();
+
+    let server_msg = message.clone();
+    ex.spawn(async move {
+        let stream = acceptor.accept().await.unwrap();
+        stream.set_buf_group(1234);
+
+        let tls_stream = fiona::tls::server_handshake(stream, make_server_config())
+            .await
+            .unwrap();
+
+        let mut buf = server_msg.as_slice();
+        let mut total_written = 0;
+        loop {
+            if total_written < server_msg.len() {
+                let n = tls_stream.write_tls(buf).unwrap();
+                assert!(n > 0);
+                assert!(n < server_msg.len());
+                total_written += n;
+                buf = &buf[n..];
+            }
+
+            let sent = tls_stream.flush_tls(MAX_SEND_SIZE).await.unwrap();
+            if total_written == server_msg.len() && sent == 0 {
+                break;
+            }
+        }
+
+        let mut msg = Vec::with_capacity(msg_len);
+        let mut n = 0;
+
+        while n < server_msg.len() {
+            n += tls_stream.read_tls(&mut msg).await.unwrap();
+        }
+
+        assert!(msg == *server_msg);
+    });
+
+    let client_msg = message.clone();
+    ex.clone().spawn(async move {
+        let client = fiona::net::TcpClient::new(&ex)
+            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        client.set_buf_group(1234);
+
+        let tls_stream = fiona::tls::client_handshake(
+            client,
+            make_client_config(),
+            "localhost".try_into().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let mut buf = client_msg.as_slice();
+        let mut total_written = 0;
+        loop {
+            if total_written < client_msg.len() {
+                let n = tls_stream.write_tls(buf).unwrap();
+                assert!(n > 0);
+                assert!(n < client_msg.len());
+                total_written += n;
+                buf = &buf[n..];
+            }
+
+            let sent = tls_stream.flush_tls(MAX_SEND_SIZE).await.unwrap();
+            if total_written == client_msg.len() && sent == 0 {
+                break;
+            }
+        }
+
+        let mut msg = Vec::new();
+        let mut n = 0;
+
+        while n < client_msg.len() {
+            n += tls_stream.read_tls(&mut msg).await.unwrap();
+        }
+
+        assert!(msg == *client_msg);
+    });
 
     assert_eq!(ioc.run(), 2);
 }
