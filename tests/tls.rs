@@ -285,14 +285,14 @@ fn tls_send_recv() {
 
         let text = "Hello, world! This is plaintext from the server!";
 
-        let n = tls_stream.write_tls(text.as_bytes()).unwrap();
+        let n = tls_stream.write(text.as_bytes()).unwrap();
         assert_eq!(n, text.len());
 
-        let n = tls_stream.flush_tls(1024).await.unwrap();
+        let n = tls_stream.flush(1024).await.unwrap();
         assert!(n > text.len());
 
         let mut msg = Vec::new();
-        let n = tls_stream.read_tls(&mut msg).await.unwrap();
+        let n = tls_stream.read(&mut msg).await.unwrap();
 
         assert_eq!(msg.len(), n);
         assert_eq!(
@@ -374,14 +374,18 @@ fn tls_large_send() {
         let mut total_written = 0;
         loop {
             if total_written < server_msg.len() {
-                let n = tls_stream.write_tls(buf).unwrap();
+                let n = tls_stream.write(buf).unwrap();
                 assert!(n > 0);
                 assert!(n < server_msg.len());
                 total_written += n;
                 buf = &buf[n..];
+                if !buf.is_empty() {
+                    let n = tls_stream.write(buf).unwrap();
+                    assert_eq!(n, 0);
+                }
             }
 
-            let sent = tls_stream.flush_tls(MAX_SEND_SIZE).await.unwrap();
+            let sent = tls_stream.flush(MAX_SEND_SIZE).await.unwrap();
             if total_written == server_msg.len() && sent == 0 {
                 break;
             }
@@ -391,7 +395,7 @@ fn tls_large_send() {
         let mut n = 0;
 
         while n < server_msg.len() {
-            n += tls_stream.read_tls(&mut msg).await.unwrap();
+            n += tls_stream.read(&mut msg).await.unwrap();
         }
 
         assert!(msg == *server_msg);
@@ -423,6 +427,10 @@ fn tls_large_send() {
                 assert!(n < client_msg.len());
                 total_written += n;
                 buf = &buf[n..];
+                if !buf.is_empty() {
+                    let n = tls_stream.write_tls(buf).unwrap();
+                    assert_eq!(n, 0);
+                }
             }
 
             let sent = tls_stream.flush_tls(MAX_SEND_SIZE).await.unwrap();
