@@ -163,12 +163,12 @@ pub struct TlsClient {
 }
 
 impl TlsClient {
-    pub fn write_tls(&self, plaintext: &[u8]) -> Result<usize, Error> {
+    pub fn write(&self, plaintext: &[u8]) -> Result<usize, Error> {
         let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
         write_impl(tls_conn, plaintext)
     }
 
-    pub async fn flush_tls(&self, max_send_size: usize) -> Result<usize, Error> {
+    pub async fn flush(&self, max_send_size: usize) -> Result<usize, Error> {
         let buf = std::mem::take(&mut *self.stream_impl.buf.borrow_mut());
         let (n, send_buf) =
             flush_impl(&self.tcp_stream, buf, max_send_size, &self.stream_impl.tls_conn).await;
@@ -176,7 +176,7 @@ impl TlsClient {
         n
     }
 
-    pub async fn read_tls(&self, buf: &mut Vec<u8>) -> Result<usize, Error> {
+    pub async fn read(&self, buf: &mut Vec<u8>) -> Result<usize, Error> {
         read_impl(&self.tcp_stream, buf, &self.stream_impl.tls_conn).await
     }
 }

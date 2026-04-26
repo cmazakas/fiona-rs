@@ -319,14 +319,14 @@ fn tls_send_recv() {
 
         let text = "Hello, world! This is plaintext from the client!";
 
-        let n = tls_client.write_tls(text.as_bytes()).unwrap();
+        let n = tls_client.write(text.as_bytes()).unwrap();
         assert_eq!(n, text.len());
 
-        let n = tls_client.flush_tls(1024).await.unwrap();
+        let n = tls_client.flush(1024).await.unwrap();
         assert!(n > text.len());
 
         let mut buf = Vec::new();
-        let n = tls_client.read_tls(&mut buf).await.unwrap();
+        let n = tls_client.read(&mut buf).await.unwrap();
 
         assert_eq!(
             str::from_utf8(&buf[..n]).unwrap(),
@@ -422,18 +422,18 @@ fn tls_large_send() {
         let mut total_written = 0;
         loop {
             if total_written < client_msg.len() {
-                let n = tls_stream.write_tls(buf).unwrap();
+                let n = tls_stream.write(buf).unwrap();
                 assert!(n > 0);
                 assert!(n < client_msg.len());
                 total_written += n;
                 buf = &buf[n..];
                 if !buf.is_empty() {
-                    let n = tls_stream.write_tls(buf).unwrap();
+                    let n = tls_stream.write(buf).unwrap();
                     assert_eq!(n, 0);
                 }
             }
 
-            let sent = tls_stream.flush_tls(MAX_SEND_SIZE).await.unwrap();
+            let sent = tls_stream.flush(MAX_SEND_SIZE).await.unwrap();
             if total_written == client_msg.len() && sent == 0 {
                 break;
             }
@@ -443,7 +443,7 @@ fn tls_large_send() {
         let mut n = 0;
 
         while n < client_msg.len() {
-            n += tls_stream.read_tls(&mut msg).await.unwrap();
+            n += tls_stream.read(&mut msg).await.unwrap();
         }
 
         assert!(msg == *client_msg);
