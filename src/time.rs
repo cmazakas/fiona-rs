@@ -153,6 +153,7 @@ impl Drop for TimerFuture<'_> {
 impl Future for TimerFuture<'_> {
     type Output = Result<()>;
 
+    #[inline]
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {

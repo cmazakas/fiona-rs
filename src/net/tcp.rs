@@ -307,6 +307,7 @@ pub struct AcceptFuture<'a> {
 impl Future for AcceptFuture<'_> {
     type Output = Result<TcpStream>;
 
+    #[inline]
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
@@ -794,6 +795,7 @@ impl Drop for SendFuture<'_> {
 impl Future for SendFuture<'_> {
     type Output = (Result<usize>, Vec<u8>);
 
+    #[inline]
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> Poll<Self::Output> {
@@ -887,6 +889,7 @@ pub struct CloseFuture<'a> {
 impl Future for CloseFuture<'_> {
     type Output = Result<()>;
 
+    #[inline]
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> Poll<Self::Output> {
@@ -993,6 +996,7 @@ pub struct ShutdownFuture<'a> {
 impl Future for ShutdownFuture<'_> {
     type Output = Result<()>;
 
+    #[inline]
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> Poll<Self::Output> {
@@ -1094,6 +1098,7 @@ pub struct CancelFuture<'a> {
 impl Future for CancelFuture<'_> {
     type Output = Result<()>;
 
+    #[inline]
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> Poll<Self::Output> {
@@ -1197,6 +1202,7 @@ impl Drop for RecvFuture<'_> {
 impl Future for RecvFuture<'_> {
     type Output = Result<BorrowedBufs>;
 
+    #[inline]
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> Poll<Self::Output> {
@@ -1399,6 +1405,7 @@ pub struct ConnectFuture {
 impl Future for ConnectFuture {
     type Output = Result<TcpStream>;
 
+    #[inline]
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> Poll<Self::Output> {

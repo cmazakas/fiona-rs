@@ -1733,6 +1733,8 @@ impl<T: Unpin> Unpin for JoinHandle<T> {}
 
 impl<T> Future for JoinHandle<T> {
     type Output = T;
+
+    #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         assert!(!self.done);
         let this = unsafe { self.get_unchecked_mut() };
