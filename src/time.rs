@@ -37,6 +37,13 @@ pub struct TimerFuture<'a> {
 
 //-----------------------------------------------------------------------------
 
+pub async fn sleep(ex: &Executor, dur: Duration) {
+    let timer = Timer::new(ex);
+    timer.wait(dur).await.unwrap();
+}
+
+//-----------------------------------------------------------------------------
+
 impl Timer {
     #[must_use]
     pub fn new(ex: &Executor) -> Self {
