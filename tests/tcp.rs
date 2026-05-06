@@ -13,7 +13,7 @@ use std::{
     pin::Pin,
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
-    task::Poll,
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -286,6 +286,62 @@ fn tcp_send_hello_world_throwing() {
     });
 
     let _n = ioc.run();
+}
+
+#[test]
+fn tcp_send_hello_world_throwing_reuse_future() {
+    // Test that we can reuse a Future post-panic.
+
+    struct WakerFuture;
+
+    impl Future for WakerFuture {
+        type Output = Waker;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+        ) -> Poll<Self::Output> {
+            Poll::Ready(cx.waker().clone())
+        }
+    }
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let acceptor = fiona::net::TcpListener::bind_ipv4(&ex, Ipv4Addr::LOCALHOST, 0).unwrap();
+    assert!(acceptor.port() != 0);
+
+    let port = acceptor.port();
+
+    let mut cx = Context::from_waker(Waker::noop());
+
+    let mut fut = acceptor.accept();
+    assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+
+    let ex_copy = ex.clone();
+    ex.clone().spawn(async move {
+        let mut connect_future =
+            fiona::net::TcpClient::new(&ex_copy).connect_ipv4(Ipv4Addr::LOCALHOST, port);
+
+        let waker = WakerFuture.await;
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(Pin::new(&mut connect_future).poll(&mut cx).is_pending());
+        panic!();
+    });
+
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let _n = ioc.run();
+    }));
+
+    assert!(r.is_err());
+
+    assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+
+    ex.clone().spawn(async move {
+        fiona::time::sleep(&ex, Duration::from_millis(100)).await;
+    });
+
+    ioc.run();
 }
 
 #[test]
