@@ -3,7 +3,7 @@
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     io::{ErrorKind, Read, Write},
     ops::DerefMut,
     rc::Rc,
@@ -39,11 +39,16 @@ impl From<rustls::Error> for Error {
 struct StreamImpl<TlsConnection> {
     tls_conn: RefCell<TlsConnection>,
     buf: RefCell<Vec<u8>>,
+    wrote_close_notify: Cell<bool>,
 }
 
 fn write_impl<Data>(
     tls_conn: &mut rustls::ConnectionCommon<Data>, plaintext: &[u8],
+    wrote_close_notify: &Cell<bool>,
 ) -> Result<usize, Error> {
+    if wrote_close_notify.get() {
+        return Ok(0);
+    }
     let n = tls_conn.writer().write(plaintext).map_err(Error::from)?;
     Ok(n)
 }
@@ -57,9 +62,13 @@ where
 {
     {
         let tls_conn = &mut *tls_stream.borrow_mut();
-        while tls_conn.wants_write() {
+        loop {
             if let Err(err) = tls_conn.write_tls(&mut buf) {
                 return (Err(err.into()), buf);
+            }
+
+            if !tls_conn.wants_write() {
+                break;
             }
         }
     }
@@ -83,16 +92,17 @@ where
 
 async fn read_impl<Data, TlsConnection>(
     tcp_stream: &TcpStream, buf: &mut Vec<u8>, tls_stream: &RefCell<TlsConnection>,
+    wrote_close_notify: &Cell<bool>,
 ) -> Result<usize, Error>
 where
     TlsConnection: DerefMut<Target = rustls::ConnectionCommon<Data>>,
 {
+    let mut n = 0;
+
     {
         let tls_conn = &mut *tls_stream.borrow_mut();
 
-        let has_pending_plaintext = !tls_conn.wants_read();
-        if has_pending_plaintext {
-            let mut n = 0;
+        if !tls_conn.wants_read() {
             let old_len = buf.len();
             match tls_conn.reader().read_to_end(buf) {
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {
@@ -107,25 +117,33 @@ where
         }
     }
 
-    let bufs = tcp_stream.recv().await?;
+    while n == 0 {
+        let bufs = tcp_stream.recv().await?;
 
-    let mut n = 0;
-    let tls_conn = &mut *tls_stream.borrow_mut();
+        let tls_conn = &mut *tls_stream.borrow_mut();
 
-    for mut b in &bufs {
-        while !b.is_empty() {
-            tls_conn.read_tls(&mut b)?;
-            tls_conn.process_new_packets()?;
-            if !tls_conn.wants_read() {
-                let old_len = buf.len();
-                match tls_conn.reader().read_to_end(buf) {
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        n += buf.len() - old_len;
+        for mut b in &bufs {
+            while !b.is_empty() {
+                tls_conn.read_tls(&mut b)?;
+                let io_state = tls_conn.process_new_packets()?;
+
+                if !tls_conn.wants_read() {
+                    let old_len = buf.len();
+                    match tls_conn.reader().read_to_end(buf) {
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            n += buf.len() - old_len;
+                        }
+                        Ok(read) => {
+                            n += read;
+                        }
+                        Err(err) => return Err(err.into()),
                     }
-                    Ok(read) => {
-                        n += read;
-                    }
-                    Err(err) => return Err(err.into()),
+                }
+
+                if io_state.peer_has_closed() {
+                    tls_conn.send_close_notify();
+                    wrote_close_notify.set(true);
+                    return Ok(0);
                 }
             }
         }
@@ -142,7 +160,13 @@ pub struct TlsStream {
 impl TlsStream {
     pub fn write(&self, plaintext: &[u8]) -> Result<usize, Error> {
         let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
-        write_impl(tls_conn, plaintext)
+        write_impl(tls_conn, plaintext, &self.stream_impl.wrote_close_notify)
+    }
+
+    pub fn write_shutdown(&self) {
+        let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
+        tls_conn.send_close_notify();
+        self.stream_impl.wrote_close_notify.set(true);
     }
 
     pub async fn flush(&self, max_send_size: usize) -> Result<usize, Error> {
@@ -154,7 +178,13 @@ impl TlsStream {
     }
 
     pub async fn read(&self, buf: &mut Vec<u8>) -> Result<usize, Error> {
-        read_impl(&self.tcp_stream, buf, &self.stream_impl.tls_conn).await
+        read_impl(
+            &self.tcp_stream,
+            buf,
+            &self.stream_impl.tls_conn,
+            &self.stream_impl.wrote_close_notify,
+        )
+        .await
     }
 }
 pub struct TlsClient {
@@ -165,7 +195,7 @@ pub struct TlsClient {
 impl TlsClient {
     pub fn write(&self, plaintext: &[u8]) -> Result<usize, Error> {
         let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
-        write_impl(tls_conn, plaintext)
+        write_impl(tls_conn, plaintext, &self.stream_impl.wrote_close_notify)
     }
 
     pub async fn flush(&self, max_send_size: usize) -> Result<usize, Error> {
@@ -177,7 +207,19 @@ impl TlsClient {
     }
 
     pub async fn read(&self, buf: &mut Vec<u8>) -> Result<usize, Error> {
-        read_impl(&self.tcp_stream, buf, &self.stream_impl.tls_conn).await
+        read_impl(
+            &self.tcp_stream,
+            buf,
+            &self.stream_impl.tls_conn,
+            &self.stream_impl.wrote_close_notify,
+        )
+        .await
+    }
+
+    pub fn write_shutdown(&self) {
+        let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
+        tls_conn.send_close_notify();
+        self.stream_impl.wrote_close_notify.set(true);
     }
 }
 
@@ -191,6 +233,7 @@ pub async fn server_handshake(
         stream_impl: Rc::new(StreamImpl {
             tls_conn: RefCell::new(config),
             buf: RefCell::new(Vec::new()),
+            wrote_close_notify: Cell::new(false),
         }),
     };
 
@@ -245,6 +288,7 @@ pub async fn client_handshake(
         stream_impl: Rc::new(StreamImpl {
             tls_conn: RefCell::new(rustls::ClientConnection::new(config, server_name)?),
             buf: RefCell::new(Vec::new()),
+            wrote_close_notify: Cell::new(false),
         }),
     };
 

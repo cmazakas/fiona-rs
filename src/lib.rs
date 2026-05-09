@@ -1782,6 +1782,11 @@ impl Executor {
         *self.p.params.borrow()
     }
 
+    #[must_use]
+    pub fn has_buf_group(&self, bgid: u16) -> bool {
+        self.p.buf_groups.borrow().contains_key(&bgid)
+    }
+
     pub fn register_buf_group(&self, bgid: u16, num_bufs: u32, buf_len: usize) -> Result<()> {
         let mut ret = 0_i32;
 

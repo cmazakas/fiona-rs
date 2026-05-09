@@ -5,10 +5,12 @@
 #![allow(clippy::redundant_closure_call)]
 
 use std::{
+    cell::RefCell,
     io::{Read, Write},
     net::Ipv6Addr,
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 
 use rand::{Rng, SeedableRng};
@@ -48,6 +50,57 @@ fn make_client_config() -> Arc<rustls::ClientConfig> {
             .with_root_certificates(Arc::new(cert_store))
             .with_no_client_auth(),
     )
+}
+
+fn make_tls_socket_pair(
+    ioc: &mut fiona::IoContext, bgid: u16, num_bufs: u32, buf_len: usize,
+) -> (fiona::tls::TlsStream, fiona::tls::TlsClient) {
+    let ex = ioc.get_executor();
+    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    if !ex.has_buf_group(bgid) {
+        ex.register_buf_group(bgid, num_bufs, buf_len).unwrap();
+    }
+
+    let server_conn = Rc::new(RefCell::new(None));
+    let client_conn = Rc::new(RefCell::new(None));
+
+    let server_conn_copy = server_conn.clone();
+    ex.spawn(async move {
+        let stream = acceptor.accept().await.unwrap();
+        stream.set_buf_group(bgid);
+
+        let tls_stream = fiona::tls::server_handshake(stream, make_server_config())
+            .await
+            .unwrap();
+
+        *server_conn_copy.borrow_mut() = Some(tls_stream);
+    });
+
+    let client_conn_copy = client_conn.clone();
+    ex.clone().spawn(async move {
+        let stream = fiona::net::TcpClient::new(&ex)
+            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+
+        stream.set_buf_group(bgid);
+
+        let tls_stream = fiona::tls::client_handshake(
+            stream,
+            make_client_config(),
+            "localhost".try_into().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        *client_conn_copy.borrow_mut() = Some(tls_stream);
+    });
+
+    ioc.run();
+
+    (server_conn.borrow_mut().take().unwrap(), client_conn.borrow_mut().take().unwrap())
 }
 
 #[test]
@@ -354,22 +407,12 @@ fn tls_large_send() {
     let message = Rc::new(message);
 
     let mut ioc = fiona::IoContext::new();
-
     let ex = ioc.get_executor();
-    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
-    let port = acceptor.port();
 
-    ex.register_buf_group(1234, 1024, 1024).unwrap();
+    let (tls_stream, tls_client) = make_tls_socket_pair(&mut ioc, 1234, 1024, 1024);
 
     let server_msg = message.clone();
     ex.spawn(async move {
-        let stream = acceptor.accept().await.unwrap();
-        stream.set_buf_group(1234);
-
-        let tls_stream = fiona::tls::server_handshake(stream, make_server_config())
-            .await
-            .unwrap();
-
         let mut buf = server_msg.as_slice();
         let mut total_written = 0;
         loop {
@@ -403,37 +446,22 @@ fn tls_large_send() {
 
     let client_msg = message.clone();
     ex.clone().spawn(async move {
-        let client = fiona::net::TcpClient::new(&ex)
-            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
-            .await
-            .unwrap();
-
-        client.set_buf_group(1234);
-
-        let tls_stream = fiona::tls::client_handshake(
-            client,
-            make_client_config(),
-            "localhost".try_into().unwrap(),
-        )
-        .await
-        .unwrap();
-
         let mut buf = client_msg.as_slice();
         let mut total_written = 0;
         loop {
             if total_written < client_msg.len() {
-                let n = tls_stream.write(buf).unwrap();
+                let n = tls_client.write(buf).unwrap();
                 assert!(n > 0);
                 assert!(n < client_msg.len());
                 total_written += n;
                 buf = &buf[n..];
                 if !buf.is_empty() {
-                    let n = tls_stream.write(buf).unwrap();
+                    let n = tls_client.write(buf).unwrap();
                     assert_eq!(n, 0);
                 }
             }
 
-            let sent = tls_stream.flush(MAX_SEND_SIZE).await.unwrap();
+            let sent = tls_client.flush(MAX_SEND_SIZE).await.unwrap();
             if total_written == client_msg.len() && sent == 0 {
                 break;
             }
@@ -443,7 +471,7 @@ fn tls_large_send() {
         let mut n = 0;
 
         while n < client_msg.len() {
-            n += tls_stream.read(&mut msg).await.unwrap();
+            n += tls_client.read(&mut msg).await.unwrap();
         }
 
         assert!(msg == *client_msg);
@@ -457,6 +485,7 @@ fn tls_large_send_randomized() {
     // Test that we can handle large sends, under randomized conditions.
 
     const MAX_SEND_SIZE: usize = 16 * 1024;
+    const MAX_WRITE: usize = 64 * 1024;
 
     let msg_len = 1024 * 1024;
 
@@ -475,25 +504,13 @@ fn tls_large_send_randomized() {
     };
 
     let mut ioc = fiona::IoContext::new();
-
     let ex = ioc.get_executor();
-    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
-    let port = acceptor.port();
 
-    ex.register_buf_group(1234, 16 * 1024, 1024).unwrap();
-
-    const MAX_WRITE: usize = 64 * 1024;
+    let (tls_stream, tls_client) = make_tls_socket_pair(&mut ioc, 1234, 16 * 1024, 1024);
 
     let server_msg1 = server_message.clone();
     let client_msg1 = client_message.clone();
     ex.spawn(async move {
-        let stream = acceptor.accept().await.unwrap();
-        stream.set_buf_group(1234);
-
-        let tls_stream = fiona::tls::server_handshake(stream, make_server_config())
-            .await
-            .unwrap();
-
         let mut rng = rand::rng();
 
         let mut buf = server_msg1.as_slice();
@@ -539,21 +556,6 @@ fn tls_large_send_randomized() {
     let server_msg2 = server_message.clone();
     let client_msg2 = client_message.clone();
     ex.clone().spawn(async move {
-        let client = fiona::net::TcpClient::new(&ex)
-            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
-            .await
-            .unwrap();
-
-        client.set_buf_group(1234);
-
-        let tls_stream = fiona::tls::client_handshake(
-            client,
-            make_client_config(),
-            "localhost".try_into().unwrap(),
-        )
-        .await
-        .unwrap();
-
         let mut rng = rand::rng();
 
         let mut buf = client_msg2.as_slice();
@@ -561,7 +563,7 @@ fn tls_large_send_randomized() {
         loop {
             if total_written < client_msg2.len() {
                 loop {
-                    let n = tls_stream
+                    let n = tls_client
                         .write(&buf[..rng.random_range(1..=MAX_WRITE).min(buf.len())])
                         .unwrap();
 
@@ -576,7 +578,7 @@ fn tls_large_send_randomized() {
                 }
             }
 
-            let sent = tls_stream
+            let sent = tls_client
                 .flush(rng.random_range(1..=MAX_SEND_SIZE))
                 .await
                 .unwrap();
@@ -590,11 +592,109 @@ fn tls_large_send_randomized() {
         let mut n = 0;
 
         while n < server_msg2.len() {
-            n += tls_stream.read(&mut msg).await.unwrap();
+            n += tls_client.read(&mut msg).await.unwrap();
         }
 
         assert!(msg == *server_msg2);
     });
 
     assert_eq!(ioc.run(), 2);
+}
+
+#[test]
+fn tls_shutdown() {
+    // Test what happens to our TLS streams when the peer sends a close_notify
+    // in the middle of a normal recv operation.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let (tls_stream, tls_client) = make_tls_socket_pair(&mut ioc, 1234, 1024, 1024);
+
+    ex.spawn(async move {
+        let mut buf = Vec::new();
+
+        let read = tls_stream.read(&mut buf).await.unwrap();
+        assert!(!buf.is_empty());
+        assert_eq!(&buf[..read], b"Hello, world!");
+        buf.clear();
+
+        let read = tls_stream.read(&mut buf).await.unwrap();
+        assert!(buf.is_empty());
+        assert_eq!(read, 0);
+
+        let sent = tls_stream.flush(8 * 1024).await.unwrap();
+        assert!(sent > 0);
+
+        let written = tls_stream.write(b"rawr").unwrap();
+        assert_eq!(written, 0);
+
+        let sent = tls_stream.flush(4 * 1024).await.unwrap();
+        assert_eq!(sent, 0);
+    });
+
+    let ex_copy = ex.clone();
+    ex.clone().spawn(async move {
+        tls_client.write(b"Hello, world!").unwrap();
+        tls_client.flush(1024).await.unwrap();
+
+        tls_client.write_shutdown();
+        tls_client.flush(32 * 1024).await.unwrap();
+
+        let written = tls_client.write(b"rawr").unwrap();
+        assert_eq!(written, 0);
+
+        let sent = tls_client.flush(4 * 1024).await.unwrap();
+        assert_eq!(sent, 0);
+
+        fiona::time::sleep(&ex_copy, Duration::from_millis(250)).await;
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+
+    // Should be the dual of what's above.
+
+    let (tls_stream, tls_client) = make_tls_socket_pair(&mut ioc, 1234, 1024, 1024);
+
+    ex.spawn(async move {
+        let mut buf = Vec::new();
+
+        let read = tls_client.read(&mut buf).await.unwrap();
+        assert!(!buf.is_empty());
+        assert_eq!(&buf[..read], b"Hello, world!");
+        buf.clear();
+
+        let read = tls_client.read(&mut buf).await.unwrap();
+        assert!(buf.is_empty());
+        assert_eq!(read, 0);
+
+        let sent = tls_client.flush(8 * 1024).await.unwrap();
+        assert!(sent > 0);
+
+        let written = tls_client.write(b"rawr").unwrap();
+        assert_eq!(written, 0);
+
+        let sent = tls_client.flush(4 * 1024).await.unwrap();
+        assert_eq!(sent, 0);
+    });
+
+    ex.clone().spawn(async move {
+        tls_stream.write(b"Hello, world!").unwrap();
+        tls_stream.flush(1024).await.unwrap();
+
+        tls_stream.write_shutdown();
+        tls_stream.flush(32 * 1024).await.unwrap();
+
+        let written = tls_stream.write(b"rawr").unwrap();
+        assert_eq!(written, 0);
+
+        let sent = tls_stream.flush(4 * 1024).await.unwrap();
+        assert_eq!(sent, 0);
+
+        fiona::time::sleep(&ex, Duration::from_millis(250)).await;
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
 }
