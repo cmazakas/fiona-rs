@@ -152,6 +152,7 @@ where
     Ok(n)
 }
 
+#[derive(Clone)]
 pub struct TlsStream {
     tcp_stream: TcpStream,
     stream_impl: Rc<StreamImpl<rustls::ServerConnection>>,
@@ -187,6 +188,8 @@ impl TlsStream {
         .await
     }
 }
+
+#[derive(Clone)]
 pub struct TlsClient {
     tcp_stream: TcpStream,
     stream_impl: Rc<StreamImpl<rustls::ClientConnection>>,

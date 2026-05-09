@@ -698,3 +698,40 @@ fn tls_shutdown() {
     let n = ioc.run();
     assert_eq!(n, 2);
 }
+
+#[test]
+fn tls_concurrent_write_flush() {
+    // Test that a concurrent write() and flush() call are sound together.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+    let (tls_stream, tls_client) = make_tls_socket_pair(&mut ioc, 1234, 1024, 1024);
+
+    ex.clone().spawn(async move {
+        let mut buf = Vec::new();
+
+        let read = tls_stream.read(&mut buf).await.unwrap();
+        assert!(!buf.is_empty());
+        assert_eq!(&buf[..read], b"Hello, world!");
+        buf.clear();
+
+        let read = tls_stream.read(&mut buf).await.unwrap();
+        assert!(!buf.is_empty());
+        assert_eq!(&buf[..read], b"Hello world! Again, this time!");
+        buf.clear();
+    });
+
+    let ex_copy = ex.clone();
+    ex.clone().spawn(async move {
+        tls_client.write(b"Hello, world!").unwrap();
+        let tls_client_copy = tls_client.clone();
+        ex_copy.spawn(async move {
+            tls_client_copy
+                .write(b"Hello world! Again, this time!")
+                .unwrap();
+        });
+
+        tls_client.flush(1024).await.unwrap();
+        fiona::time::sleep(&ex_copy, Duration::from_millis(250)).await;
+    });
+}
