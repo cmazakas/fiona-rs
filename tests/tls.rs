@@ -733,5 +733,8 @@ fn tls_concurrent_write_flush() {
 
         tls_client.flush(1024).await.unwrap();
         fiona::time::sleep(&ex_copy, Duration::from_millis(250)).await;
+        tls_client.flush(1024).await.unwrap();
     });
+
+    ioc.run();
 }
