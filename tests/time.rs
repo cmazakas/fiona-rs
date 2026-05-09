@@ -451,7 +451,7 @@ fn time_double_run() {
 
 #[test]
 fn time_double_run_panic_reuse() {
-    // Test that we can call IoContext::run
+    // Test that we can call IoContext::run after handling a panic.
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
