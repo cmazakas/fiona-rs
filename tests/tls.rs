@@ -633,21 +633,23 @@ fn tls_shutdown() {
         assert_eq!(sent, 0);
     });
 
-    let ex_copy = ex.clone();
-    ex.clone().spawn(async move {
-        tls_client.write(b"Hello, world!").unwrap();
-        tls_client.flush(1024).await.unwrap();
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            tls_client.write(b"Hello, world!").unwrap();
+            tls_client.flush(1024).await.unwrap();
 
-        tls_client.write_shutdown();
-        tls_client.flush(32 * 1024).await.unwrap();
+            tls_client.write_shutdown();
+            tls_client.flush(32 * 1024).await.unwrap();
 
-        let written = tls_client.write(b"rawr").unwrap();
-        assert_eq!(written, 0);
+            let written = tls_client.write(b"rawr").unwrap();
+            assert_eq!(written, 0);
 
-        let sent = tls_client.flush(4 * 1024).await.unwrap();
-        assert_eq!(sent, 0);
+            let sent = tls_client.flush(4 * 1024).await.unwrap();
+            assert_eq!(sent, 0);
 
-        fiona::time::sleep(&ex_copy, Duration::from_millis(250)).await;
+            fiona::time::sleep(&ex, Duration::from_millis(250)).await;
+        }
     });
 
     let n = ioc.run();
@@ -679,20 +681,23 @@ fn tls_shutdown() {
         assert_eq!(sent, 0);
     });
 
-    ex.clone().spawn(async move {
-        tls_stream.write(b"Hello, world!").unwrap();
-        tls_stream.flush(1024).await.unwrap();
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            tls_stream.write(b"Hello, world!").unwrap();
+            tls_stream.flush(1024).await.unwrap();
 
-        tls_stream.write_shutdown();
-        tls_stream.flush(32 * 1024).await.unwrap();
+            tls_stream.write_shutdown();
+            tls_stream.flush(32 * 1024).await.unwrap();
 
-        let written = tls_stream.write(b"rawr").unwrap();
-        assert_eq!(written, 0);
+            let written = tls_stream.write(b"rawr").unwrap();
+            assert_eq!(written, 0);
 
-        let sent = tls_stream.flush(4 * 1024).await.unwrap();
-        assert_eq!(sent, 0);
+            let sent = tls_stream.flush(4 * 1024).await.unwrap();
+            assert_eq!(sent, 0);
 
-        fiona::time::sleep(&ex, Duration::from_millis(250)).await;
+            fiona::time::sleep(&ex, Duration::from_millis(250)).await;
+        }
     });
 
     let n = ioc.run();
@@ -707,7 +712,7 @@ fn tls_concurrent_write_flush() {
     let ex = ioc.get_executor();
     let (tls_stream, tls_client) = make_tls_socket_pair(&mut ioc, 1234, 1024, 1024);
 
-    ex.clone().spawn(async move {
+    ex.spawn(async move {
         let mut buf = Vec::new();
 
         let read = tls_stream.read(&mut buf).await.unwrap();
@@ -721,19 +726,21 @@ fn tls_concurrent_write_flush() {
         buf.clear();
     });
 
-    let ex_copy = ex.clone();
-    ex.clone().spawn(async move {
-        tls_client.write(b"Hello, world!").unwrap();
-        let tls_client_copy = tls_client.clone();
-        ex_copy.spawn(async move {
-            tls_client_copy
-                .write(b"Hello world! Again, this time!")
-                .unwrap();
-        });
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            tls_client.write(b"Hello, world!").unwrap();
+            let tls_client_copy = tls_client.clone();
+            ex.spawn(async move {
+                tls_client_copy
+                    .write(b"Hello world! Again, this time!")
+                    .unwrap();
+            });
 
-        tls_client.flush(1024).await.unwrap();
-        fiona::time::sleep(&ex_copy, Duration::from_millis(250)).await;
-        tls_client.flush(1024).await.unwrap();
+            tls_client.flush(1024).await.unwrap();
+            fiona::time::sleep(&ex, Duration::from_millis(250)).await;
+            tls_client.flush(1024).await.unwrap();
+        }
     });
 
     ioc.run();

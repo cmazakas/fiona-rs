@@ -317,16 +317,18 @@ fn tcp_send_hello_world_throwing_reuse_future() {
     let mut fut = acceptor.accept();
     assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
 
-    let ex_copy = ex.clone();
-    ex.clone().spawn(async move {
-        let mut connect_future =
-            fiona::net::TcpClient::new(&ex_copy).connect_ipv4(Ipv4Addr::LOCALHOST, port);
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let mut connect_future =
+                fiona::net::TcpClient::new(&ex).connect_ipv4(Ipv4Addr::LOCALHOST, port);
 
-        let waker = WakerFuture.await;
-        let mut cx = Context::from_waker(&waker);
+            let waker = WakerFuture.await;
+            let mut cx = Context::from_waker(&waker);
 
-        assert!(Pin::new(&mut connect_future).poll(&mut cx).is_pending());
-        panic!();
+            assert!(Pin::new(&mut connect_future).poll(&mut cx).is_pending());
+            panic!();
+        }
     });
 
     let r = catch_unwind(AssertUnwindSafe(|| {
@@ -334,11 +336,13 @@ fn tcp_send_hello_world_throwing_reuse_future() {
     }));
 
     assert!(r.is_err());
-
     assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
 
-    ex.clone().spawn(async move {
-        fiona::time::sleep(&ex, Duration::from_millis(100)).await;
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            fiona::time::sleep(&ex, Duration::from_millis(100)).await;
+        }
     });
 
     ioc.run();
