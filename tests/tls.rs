@@ -705,8 +705,8 @@ fn tls_shutdown() {
 }
 
 #[test]
-fn tls_concurrent_write_flush() {
-    // Test that a concurrent write() and flush() call are sound together.
+fn tls_concurrent_read_write() {
+    // Test that a concurrent read() and write() + flush() call are sound together.
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
@@ -748,13 +748,13 @@ fn tls_concurrent_write_flush() {
 }
 
 #[test]
-fn tls_concurrent_write_flush_large() {
-    // Test that a concurrent write() and flush() call are sound together, but for a
-    // large message.
+fn tls_concurrent_read_write_large() {
+    // Test that a concurrent read() and write() + flush() call are sound together,
+    // but for a large message.
 
     const MAX_SEND: usize = 4 * 1024;
 
-    let msg_len = 128 * 1024;
+    let msg_len = 1024 * 1024;
 
     let mut rng = rand::rngs::StdRng::from_os_rng();
 
@@ -772,7 +772,7 @@ fn tls_concurrent_write_flush_large() {
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
-    let (tls_stream, tls_client) = make_tls_socket_pair(&mut ioc, 1234, 1024, 1024);
+    let (tls_stream, tls_client) = make_tls_socket_pair(&mut ioc, 1234, 1024, 16 * 1024);
 
     ex.spawn({
         let (tls_stream, client_message) = (tls_stream.clone(), client_message.clone());
@@ -830,6 +830,113 @@ fn tls_concurrent_write_flush_large() {
                 if num_written < client_message.len() {
                     let n = tls_client.write(&client_message[num_written..]).unwrap();
                     num_written += n;
+                }
+
+                let n = tls_client.flush(MAX_SEND).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 4);
+}
+
+#[test]
+fn tls_concurrent_read_write_intermittent_shutdown() {
+    // Test TLS shutdown semantics during a concurrent read(), write() loop.
+
+    const MAX_SEND: usize = 64 * 1024;
+
+    let msg_len = 1024 * 1024;
+
+    let mut rng = rand::rngs::StdRng::from_os_rng();
+
+    let client_message = {
+        let mut message = vec![0; msg_len];
+        rand::RngCore::fill_bytes(&mut rng, &mut message);
+        Rc::new(message)
+    };
+
+    let server_message = {
+        let mut message = vec![0; msg_len];
+        rand::RngCore::fill_bytes(&mut rng, &mut message);
+        Rc::new(message)
+    };
+
+    assert_eq!(client_message.len(), msg_len);
+    assert_eq!(server_message.len(), msg_len);
+
+    let write_close_after = rng.random_range(1..msg_len / 2);
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+    let (tls_stream, tls_client) = make_tls_socket_pair(&mut ioc, 1234, 1024, 16 * 1024);
+
+    ex.spawn({
+        let (tls_stream, client_message) = (tls_stream.clone(), client_message.clone());
+        async move {
+            let mut buf = Vec::new();
+
+            while buf.len() < client_message.len() {
+                let n = tls_stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+            }
+
+            assert!(buf.len() < client_message.len());
+        }
+    });
+
+    ex.spawn({
+        let (tls_stream, server_message) = (tls_stream.clone(), server_message.clone());
+        async move {
+            let mut num_written = 0;
+            loop {
+                if num_written < server_message.len() {
+                    let n = tls_stream.write(&server_message[num_written..]).unwrap();
+                    num_written += n;
+                }
+
+                let n = tls_stream.flush(MAX_SEND).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    });
+
+    ex.spawn({
+        let (tls_client, server_message) = (tls_client.clone(), server_message.clone());
+        async move {
+            let mut buf = Vec::new();
+
+            while buf.len() < server_message.len() {
+                let n = tls_client.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+            }
+
+            assert!(buf.len() < server_message.len());
+        }
+    });
+
+    ex.spawn({
+        let (tls_client, client_message) = (tls_client.clone(), client_message.clone());
+        async move {
+            let mut num_written = 0;
+            loop {
+                if num_written < client_message.len() {
+                    let n = tls_client.write(&client_message[num_written..]).unwrap();
+                    num_written += n;
+                }
+
+                if num_written >= write_close_after {
+                    tls_stream.write_shutdown();
                 }
 
                 let n = tls_client.flush(MAX_SEND).await.unwrap();

@@ -49,6 +49,7 @@ fn write_impl<Data>(
     if wrote_close_notify.get() {
         return Ok(0);
     }
+
     let n = tls_conn.writer().write(plaintext).map_err(Error::from)?;
     Ok(n)
 }
@@ -165,6 +166,10 @@ impl TlsStream {
     }
 
     pub fn write_shutdown(&self) {
+        if self.stream_impl.wrote_close_notify.get() {
+            return;
+        }
+
         let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
         tls_conn.send_close_notify();
         self.stream_impl.wrote_close_notify.set(true);
@@ -220,6 +225,10 @@ impl TlsClient {
     }
 
     pub fn write_shutdown(&self) {
+        if self.stream_impl.wrote_close_notify.get() {
+            return;
+        }
+
         let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
         tls_conn.send_close_notify();
         self.stream_impl.wrote_close_notify.set(true);

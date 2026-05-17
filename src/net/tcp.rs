@@ -537,7 +537,10 @@ impl TcpStream {
 
     #[must_use]
     pub fn send_subspan<R: RangeBounds<usize>>(&self, subspan: R, buf: Vec<u8>) -> SendFuture<'_> {
-        assert!(unsafe { !(*self.p.as_ptr()).send_pending });
+        assert!(
+            unsafe { !(*self.p.as_ptr()).send_pending },
+            "Send is already pending for this TCP socket."
+        );
 
         let start = match subspan.start_bound() {
             std::ops::Bound::Included(&s) => s,
