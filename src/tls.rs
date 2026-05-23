@@ -55,39 +55,48 @@ fn write_impl<Data>(
 }
 
 async fn flush_impl<Data, TlsConnection>(
-    tcp_stream: &TcpStream, mut buf: Vec<u8>, max_send_size: usize,
+    tcp_stream: &TcpStream, buf: &RefCell<Vec<u8>>, max_send_size: usize,
     tls_stream: &RefCell<TlsConnection>,
-) -> (Result<usize, Error>, Vec<u8>)
+) -> Result<usize, Error>
 where
     TlsConnection: DerefMut<Target = rustls::ConnectionCommon<Data>>,
 {
-    {
+    let (send_buf, max_send) = {
+        let mut borrow_guard = buf.borrow_mut();
+        let mut buf = &mut *borrow_guard;
         let tls_conn = &mut *tls_stream.borrow_mut();
+
         loop {
             if let Err(err) = tls_conn.write_tls(&mut buf) {
-                return (Err(err.into()), buf);
+                return Err(err.into());
             }
 
             if !tls_conn.wants_write() {
                 break;
             }
         }
-    }
 
-    if buf.is_empty() {
-        return (Ok(0), buf);
-    }
+        if buf.is_empty() {
+            return Ok(0);
+        }
 
-    let (n, mut buf) = tcp_stream
-        .send_subspan(..max_send_size.min(buf.len()), buf)
-        .await;
+        let max_send = max_send_size.min(buf.len());
+        let send_buf = std::mem::take(buf);
+
+        (send_buf, max_send)
+    };
+
+    let (n, send_buf) = tcp_stream.send_subspan(..max_send, send_buf).await;
+
+    let buf = &mut *buf.borrow_mut();
+    *buf = send_buf;
 
     match n {
         Ok(n) => {
             buf.drain(0..n);
-            (Ok(n), buf)
+            Ok(n)
         }
-        Err(err) => (Err(err.into()), buf),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -153,6 +162,19 @@ where
     Ok(n)
 }
 
+fn write_shutdown_impl<Data, TlsConnection>(
+    tls_stream: &RefCell<TlsConnection>, wrote_close_notify: &Cell<bool>,
+) where
+    TlsConnection: DerefMut<Target = rustls::ConnectionCommon<Data>>,
+{
+    if wrote_close_notify.get() {
+        return;
+    }
+
+    tls_stream.borrow_mut().send_close_notify();
+    wrote_close_notify.set(true);
+}
+
 #[derive(Clone)]
 pub struct TlsStream {
     tcp_stream: TcpStream,
@@ -166,21 +188,17 @@ impl TlsStream {
     }
 
     pub fn write_shutdown(&self) {
-        if self.stream_impl.wrote_close_notify.get() {
-            return;
-        }
-
-        let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
-        tls_conn.send_close_notify();
-        self.stream_impl.wrote_close_notify.set(true);
+        write_shutdown_impl(&self.stream_impl.tls_conn, &self.stream_impl.wrote_close_notify);
     }
 
     pub async fn flush(&self, max_send_size: usize) -> Result<usize, Error> {
-        let buf = std::mem::take(&mut *self.stream_impl.buf.borrow_mut());
-        let (n, send_buf) =
-            flush_impl(&self.tcp_stream, buf, max_send_size, &self.stream_impl.tls_conn).await;
-        *self.stream_impl.buf.borrow_mut() = send_buf;
-        n
+        flush_impl(
+            &self.tcp_stream,
+            &self.stream_impl.buf,
+            max_send_size,
+            &self.stream_impl.tls_conn,
+        )
+        .await
     }
 
     pub async fn read(&self, buf: &mut Vec<u8>) -> Result<usize, Error> {
@@ -207,11 +225,13 @@ impl TlsClient {
     }
 
     pub async fn flush(&self, max_send_size: usize) -> Result<usize, Error> {
-        let buf = std::mem::take(&mut *self.stream_impl.buf.borrow_mut());
-        let (n, send_buf) =
-            flush_impl(&self.tcp_stream, buf, max_send_size, &self.stream_impl.tls_conn).await;
-        *self.stream_impl.buf.borrow_mut() = send_buf;
-        n
+        flush_impl(
+            &self.tcp_stream,
+            &self.stream_impl.buf,
+            max_send_size,
+            &self.stream_impl.tls_conn,
+        )
+        .await
     }
 
     pub async fn read(&self, buf: &mut Vec<u8>) -> Result<usize, Error> {
@@ -225,13 +245,7 @@ impl TlsClient {
     }
 
     pub fn write_shutdown(&self) {
-        if self.stream_impl.wrote_close_notify.get() {
-            return;
-        }
-
-        let tls_conn = &mut *self.stream_impl.tls_conn.borrow_mut();
-        tls_conn.send_close_notify();
-        self.stream_impl.wrote_close_notify.set(true);
+        write_shutdown_impl(&self.stream_impl.tls_conn, &self.stream_impl.wrote_close_notify);
     }
 }
 
