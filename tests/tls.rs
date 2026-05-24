@@ -2,8 +2,8 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-#![allow(clippy::redundant_closure_call)]
-
+use rand::{Rng, SeedableRng};
+use rustls_pki_types::pem::PemObject;
 use std::{
     cell::RefCell,
     io::{Read, Write},
@@ -12,13 +12,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-
-use rand::{Rng, SeedableRng};
-use rustls_pki_types::pem::PemObject;
-
-// fn to_hex(x: &[u8]) -> String {
-//     x.iter().map(|b| format!("{:02x}", b)).collect()
-// }
 
 const SERVER_CA: &str = "tests/test_certs/ca.crt";
 const SERVER_CERT: &str = "tests/test_certs/server.crt";
@@ -251,66 +244,72 @@ fn tls_handshake() {
     ex.register_buf_group(1234, 1024, 256).unwrap();
     ex.register_buf_group(4321, 1024, 256).unwrap();
 
-    ex.spawn((async |acceptor: fiona::net::TcpListener| {
-        let stream = acceptor.accept().await.unwrap();
-        stream.set_buf_group(1234);
+    ex.spawn({
+        let acceptor = acceptor.clone();
+        async move {
+            let stream = acceptor.accept().await.unwrap();
+            stream.set_buf_group(1234);
 
-        let _tls_stream = fiona::tls::server_handshake(stream, make_server_config())
+            let _tls_stream = fiona::tls::server_handshake(stream, make_server_config())
+                .await
+                .unwrap();
+
+            let stream2 = acceptor.accept().await.unwrap();
+            stream2.set_buf_group(1234);
+
+            let Err(tls_error) = fiona::tls::server_handshake(stream2, make_server_config()).await
+            else {
+                unreachable!()
+            };
+
+            let fiona::tls::Error::Tls(rustls::Error::HandshakeNotComplete) = tls_error else {
+                eprintln!("{tls_error:?}");
+                unreachable!()
+            };
+        }
+    });
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let client = fiona::net::TcpClient::new(&ex)
+                .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            client.set_buf_group(4321);
+
+            let _tls_client = fiona::tls::client_handshake(
+                client,
+                make_client_config(),
+                "localhost".try_into().unwrap(),
+            )
             .await
             .unwrap();
 
-        let stream2 = acceptor.accept().await.unwrap();
-        stream2.set_buf_group(1234);
+            let client = fiona::net::TcpClient::new(&ex)
+                .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+                .await
+                .unwrap();
 
-        let Err(tls_error) = fiona::tls::server_handshake(stream2, make_server_config()).await
-        else {
-            unreachable!()
-        };
+            client.set_buf_group(4321);
 
-        let fiona::tls::Error::Tls(rustls::Error::HandshakeNotComplete) = tls_error else {
-            eprintln!("{tls_error:?}");
-            unreachable!()
-        };
-    })(acceptor));
-
-    ex.spawn((async |ex: fiona::Executor, port: u16| {
-        let client = fiona::net::TcpClient::new(&ex)
-            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+            let Err(tls_error) = fiona::tls::client_handshake(
+                client,
+                make_client_config(),
+                "www.google.com".try_into().unwrap(),
+            )
             .await
-            .unwrap();
+            else {
+                unreachable!()
+            };
 
-        client.set_buf_group(4321);
-
-        let _tls_client = fiona::tls::client_handshake(
-            client,
-            make_client_config(),
-            "localhost".try_into().unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let client = fiona::net::TcpClient::new(&ex)
-            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
-            .await
-            .unwrap();
-
-        client.set_buf_group(4321);
-
-        let Err(tls_error) = fiona::tls::client_handshake(
-            client,
-            make_client_config(),
-            "www.google.com".try_into().unwrap(),
-        )
-        .await
-        else {
-            unreachable!()
-        };
-
-        let fiona::tls::Error::Tls(rustls::Error::InvalidCertificate(_)) = tls_error else {
-            eprintln!("{:?}", tls_error);
-            unreachable!()
-        };
-    })(ex.clone(), port));
+            let fiona::tls::Error::Tls(rustls::Error::InvalidCertificate(_)) = tls_error else {
+                eprintln!("{:?}", tls_error);
+                unreachable!()
+            };
+        }
+    });
 
     assert_eq!(ioc.run(), 2);
 }
@@ -328,64 +327,69 @@ fn tls_send_recv() {
     ex.register_buf_group(1234, 1024, 256).unwrap();
     ex.register_buf_group(4321, 1024, 256).unwrap();
 
-    ex.spawn((async |acceptor: fiona::net::TcpListener| {
-        let stream = acceptor.accept().await.unwrap();
-        stream.set_buf_group(1234);
+    ex.spawn({
+        async move {
+            let stream = acceptor.accept().await.unwrap();
+            stream.set_buf_group(1234);
 
-        let tls_stream = fiona::tls::server_handshake(stream, make_server_config())
+            let tls_stream = fiona::tls::server_handshake(stream, make_server_config())
+                .await
+                .unwrap();
+
+            let text = "Hello, world! This is plaintext from the server!";
+
+            let n = tls_stream.write(text.as_bytes()).unwrap();
+            assert_eq!(n, text.len());
+
+            let n = tls_stream.flush(1024).await.unwrap();
+            assert!(n > text.len());
+
+            let mut msg = Vec::new();
+            let n = tls_stream.read(&mut msg).await.unwrap();
+
+            assert_eq!(msg.len(), n);
+            assert_eq!(
+                str::from_utf8(&msg[..]).unwrap(),
+                "Hello, world! This is plaintext from the client!"
+            );
+        }
+    });
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let client = fiona::net::TcpClient::new(&ex)
+                .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            client.set_buf_group(4321);
+
+            let tls_client = fiona::tls::client_handshake(
+                client,
+                make_client_config(),
+                "localhost".try_into().unwrap(),
+            )
             .await
             .unwrap();
 
-        let text = "Hello, world! This is plaintext from the server!";
+            let text = "Hello, world! This is plaintext from the client!";
 
-        let n = tls_stream.write(text.as_bytes()).unwrap();
-        assert_eq!(n, text.len());
+            let n = tls_client.write(text.as_bytes()).unwrap();
+            assert_eq!(n, text.len());
 
-        let n = tls_stream.flush(1024).await.unwrap();
-        assert!(n > text.len());
+            let n = tls_client.flush(1024).await.unwrap();
+            assert!(n > text.len());
 
-        let mut msg = Vec::new();
-        let n = tls_stream.read(&mut msg).await.unwrap();
+            let mut buf = Vec::new();
+            let n = tls_client.read(&mut buf).await.unwrap();
 
-        assert_eq!(msg.len(), n);
-        assert_eq!(
-            str::from_utf8(&msg[..]).unwrap(),
-            "Hello, world! This is plaintext from the client!"
-        );
-    })(acceptor));
-
-    ex.spawn((async |ex: fiona::Executor, port: u16| {
-        let client = fiona::net::TcpClient::new(&ex)
-            .connect_ipv6(Ipv6Addr::LOCALHOST, port)
-            .await
-            .unwrap();
-
-        client.set_buf_group(4321);
-
-        let tls_client = fiona::tls::client_handshake(
-            client,
-            make_client_config(),
-            "localhost".try_into().unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let text = "Hello, world! This is plaintext from the client!";
-
-        let n = tls_client.write(text.as_bytes()).unwrap();
-        assert_eq!(n, text.len());
-
-        let n = tls_client.flush(1024).await.unwrap();
-        assert!(n > text.len());
-
-        let mut buf = Vec::new();
-        let n = tls_client.read(&mut buf).await.unwrap();
-
-        assert_eq!(
-            str::from_utf8(&buf[..n]).unwrap(),
-            "Hello, world! This is plaintext from the server!"
-        );
-    })(ex.clone(), port));
+            assert_eq!(
+                str::from_utf8(&buf[..n]).unwrap(),
+                "Hello, world! This is plaintext from the server!"
+            );
+        }
+    });
 
     assert_eq!(ioc.run(), 2);
 }
