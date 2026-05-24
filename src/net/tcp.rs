@@ -436,6 +436,7 @@ impl Drop for StreamImpl {
 
 //-----------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct TcpStream {
     p: NonNull<StreamImpl>,
 }

@@ -12,30 +12,21 @@ use std::{
 
 use crate::net::TcpStream;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Error {
-    Io(std::io::Error),
-    Tls(rustls::Error),
+    UnknownError,
+    BadHandshake,
+    PlaintextWriteFailed,
+    CiphertextWriteFailed,
+    TcpSendFailed,
+    TcpRecvFailed,
+    InternalReadFailed,
+    InvalidCiphertext,
+    InvalidServerConfiguration,
+    InvalidClientConfiguration,
 }
 
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Error::Io(err)
-    }
-}
-
-impl From<nix::Error> for Error {
-    fn from(err: nix::Error) -> Self {
-        Error::Io(err.into())
-    }
-}
-
-impl From<rustls::Error> for Error {
-    fn from(err: rustls::Error) -> Self {
-        Error::Tls(err)
-    }
-}
-
+#[derive(Debug)]
 struct StreamImpl<TlsConnection> {
     tls_conn: RefCell<TlsConnection>,
     buf: RefCell<Vec<u8>>,
@@ -50,7 +41,11 @@ fn write_impl<Data>(
         return Ok(0);
     }
 
-    let n = tls_conn.writer().write(plaintext).map_err(Error::from)?;
+    let n = tls_conn
+        .writer()
+        .write(plaintext)
+        .map_err(|_| Error::PlaintextWriteFailed)?;
+
     Ok(n)
 }
 
@@ -67,8 +62,8 @@ where
         let tls_conn = &mut *tls_stream.borrow_mut();
 
         loop {
-            if let Err(err) = tls_conn.write_tls(&mut buf) {
-                return Err(err.into());
+            if let Err(_err) = tls_conn.write_tls(&mut buf) {
+                return Err(Error::CiphertextWriteFailed);
             }
 
             if !tls_conn.wants_write() {
@@ -96,7 +91,7 @@ where
             buf.drain(0..n);
             Ok(n)
         }
-        Err(err) => Err(err.into()),
+        Err(_err) => Err(Error::TcpSendFailed),
     }
 }
 
@@ -121,21 +116,25 @@ where
                 Ok(read) => {
                     n += read;
                 }
-                Err(err) => return Err(err.into()),
+                Err(_err) => return Err(Error::BadHandshake),
             }
             return Ok(n);
         }
     }
 
     while n == 0 {
-        let bufs = tcp_stream.recv().await?;
+        let bufs = tcp_stream.recv().await.map_err(|_| Error::TcpRecvFailed)?;
 
         let tls_conn = &mut *tls_stream.borrow_mut();
-
         for mut b in &bufs {
             while !b.is_empty() {
-                tls_conn.read_tls(&mut b)?;
-                let io_state = tls_conn.process_new_packets()?;
+                tls_conn
+                    .read_tls(&mut b)
+                    .map_err(|_| Error::InternalReadFailed)?;
+
+                let io_state = tls_conn
+                    .process_new_packets()
+                    .map_err(|_| Error::InvalidCiphertext)?;
 
                 if !tls_conn.wants_read() {
                     let old_len = buf.len();
@@ -146,7 +145,7 @@ where
                         Ok(read) => {
                             n += read;
                         }
-                        Err(err) => return Err(err.into()),
+                        Err(_err) => return Err(Error::InternalReadFailed),
                     }
                 }
 
@@ -175,7 +174,7 @@ fn write_shutdown_impl<Data, TlsConnection>(
     wrote_close_notify.set(true);
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TlsStream {
     tcp_stream: TcpStream,
     stream_impl: Rc<StreamImpl<rustls::ServerConnection>>,
@@ -252,7 +251,8 @@ impl TlsClient {
 pub async fn server_handshake(
     stream: TcpStream, config: Arc<rustls::ServerConfig>,
 ) -> Result<TlsStream, Error> {
-    let config = rustls::ServerConnection::new(config)?;
+    let config =
+        rustls::ServerConnection::new(config).map_err(|_| Error::InvalidServerConfiguration)?;
 
     let tls_stream = TlsStream {
         tcp_stream: stream,
@@ -274,25 +274,42 @@ pub async fn server_handshake(
         );
 
         if wants_write {
-            tls_conn.borrow_mut().write_tls(&mut buf)?;
+            tls_conn
+                .borrow_mut()
+                .write_tls(&mut buf)
+                .map_err(|_| Error::CiphertextWriteFailed)?;
+
             let (n, send_buf) = tls_stream.tcp_stream.send(buf).await;
-            if let Err(err) = n {
-                return Err(err.into());
+            if n.is_err() {
+                return Err(Error::TcpSendFailed);
             }
+
             buf = send_buf;
             buf.clear();
         }
 
         if is_handshaking && wants_read {
-            let bufs = tls_stream.tcp_stream.recv().await?;
+            let bufs = tls_stream
+                .tcp_stream
+                .recv()
+                .await
+                .map_err(|_| Error::TcpRecvFailed)?;
+
             if bufs.is_empty() {
-                return Err(Error::Tls(rustls::Error::HandshakeNotComplete));
+                return Err(Error::BadHandshake);
             }
 
+            let mut tls_conn = tls_conn.borrow_mut();
+
             for mut b in &bufs {
-                tls_conn.borrow_mut().read_tls(&mut b)?;
+                tls_conn
+                    .read_tls(&mut b)
+                    .map_err(|_| Error::InternalReadFailed)?;
             }
-            tls_conn.borrow_mut().process_new_packets()?;
+
+            tls_conn
+                .process_new_packets()
+                .map_err(|_| Error::BadHandshake)?;
         }
 
         if !is_handshaking {
@@ -312,7 +329,10 @@ pub async fn client_handshake(
     let tls_client = TlsClient {
         tcp_stream: stream,
         stream_impl: Rc::new(StreamImpl {
-            tls_conn: RefCell::new(rustls::ClientConnection::new(config, server_name)?),
+            tls_conn: RefCell::new(
+                rustls::ClientConnection::new(config, server_name)
+                    .map_err(|_| Error::InvalidClientConfiguration)?,
+            ),
             buf: RefCell::new(Vec::new()),
             wrote_close_notify: Cell::new(false),
         }),
@@ -328,25 +348,41 @@ pub async fn client_handshake(
         );
 
         if wants_write {
-            tls_conn.borrow_mut().write_tls(&mut buf)?;
+            tls_conn
+                .borrow_mut()
+                .write_tls(&mut buf)
+                .map_err(|_| Error::CiphertextWriteFailed)?;
+
             let (n, send_buf) = tls_client.tcp_stream.send(buf).await;
-            if let Err(err) = n {
-                return Err(err.into());
+            if n.is_err() {
+                return Err(Error::TcpSendFailed);
             }
             buf = send_buf;
             buf.clear();
         }
 
         if is_handshaking && wants_read {
-            let bufs = tls_client.tcp_stream.recv().await?;
+            let bufs = tls_client
+                .tcp_stream
+                .recv()
+                .await
+                .map_err(|_| Error::TcpRecvFailed)?;
+
             if bufs.is_empty() {
-                return Err(Error::Tls(rustls::Error::HandshakeNotComplete));
+                return Err(Error::BadHandshake);
             }
 
+            let mut tls_conn = tls_conn.borrow_mut();
+
             for mut b in &bufs {
-                tls_conn.borrow_mut().read_tls(&mut b)?;
+                tls_conn
+                    .read_tls(&mut b)
+                    .map_err(|_| Error::InternalReadFailed)?;
             }
-            tls_conn.borrow_mut().process_new_packets()?;
+
+            tls_conn
+                .process_new_packets()
+                .map_err(|_| Error::BadHandshake)?;
         }
 
         if !is_handshaking {
@@ -356,11 +392,16 @@ pub async fn client_handshake(
 
     let wants_write = { tls_conn.borrow().wants_write() };
     if wants_write {
-        tls_conn.borrow_mut().write_tls(&mut buf)?;
+        tls_conn
+            .borrow_mut()
+            .write_tls(&mut buf)
+            .map_err(|_| Error::CiphertextWriteFailed)?;
+
         let (n, send_buf) = tls_client.tcp_stream.send(buf).await;
-        if let Err(err) = n {
-            return Err(err.into());
+        if n.is_err() {
+            return Err(Error::TcpSendFailed);
         }
+
         buf = send_buf;
         buf.clear();
     }
