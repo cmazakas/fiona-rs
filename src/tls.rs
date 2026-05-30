@@ -211,7 +211,7 @@ impl TlsStream {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TlsClient {
     tcp_stream: TcpStream,
     stream_impl: Rc<StreamImpl<rustls::ClientConnection>>,

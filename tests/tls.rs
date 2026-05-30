@@ -965,13 +965,16 @@ fn handshake_errors() {
     let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
     let port = acceptor.port();
 
-    ex.spawn(async move {
-        let stream = acceptor.accept().await.unwrap();
-        stream.set_buf_group(5);
+    ex.spawn({
+        let acceptor = acceptor.clone();
+        async move {
+            let stream = acceptor.accept().await.unwrap();
+            stream.set_buf_group(5);
 
-        let tls_stream = fiona::tls::server_handshake(stream, make_server_config()).await;
-        assert!(tls_stream.is_err());
-        assert_eq!(tls_stream.unwrap_err(), fiona::tls::Error::BadHandshake);
+            let tls_stream = fiona::tls::server_handshake(stream, make_server_config()).await;
+            assert!(tls_stream.is_err());
+            assert_eq!(tls_stream.unwrap_err(), fiona::tls::Error::BadHandshake);
+        }
     });
 
     ex.spawn({
@@ -992,5 +995,44 @@ fn handshake_errors() {
         }
     });
 
-    ioc.run();
+    let n = ioc.run();
+    assert_eq!(n, 2);
+
+    ex.spawn({
+        let acceptor = acceptor.clone();
+        async move {
+            let stream = acceptor.accept().await.unwrap();
+            stream.set_buf_group(5);
+
+            let (n, _buf) = stream
+                .send(String::from("Hello, world!").into_bytes())
+                .await;
+
+            assert!(n.is_ok());
+        }
+    });
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let stream = fiona::net::TcpClient::new(&ex)
+                .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            stream.set_buf_group(5);
+
+            let tls_stream = fiona::tls::client_handshake(
+                stream,
+                make_client_config(),
+                "localhost".try_into().unwrap(),
+            )
+            .await;
+            assert!(tls_stream.is_err());
+            assert_eq!(tls_stream.unwrap_err(), fiona::tls::Error::BadHandshake);
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
 }
