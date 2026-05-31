@@ -54,10 +54,11 @@ use liburing_rs::{
     io_uring_get_events, io_uring_get_sqe, io_uring_params, io_uring_peek_cqe,
     io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_connect,
     io_uring_prep_link_timeout, io_uring_prep_msg_ring, io_uring_prep_timeout, io_uring_queue_exit,
-    io_uring_queue_init_params, io_uring_register_files_sparse, io_uring_register_ring_fd,
-    io_uring_register_sync_msg, io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe,
-    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
-    io_uring_submit_and_get_events, io_uring_submit_and_wait, io_uring_unregister_buf_ring,
+    io_uring_queue_init_params, io_uring_register_buffers, io_uring_register_files_sparse,
+    io_uring_register_ring_fd, io_uring_register_sync_msg, io_uring_setup_buf_ring,
+    io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data, io_uring_sqe_set_data64,
+    io_uring_sqe_set_flags, io_uring_submit_and_get_events, io_uring_submit_and_wait,
+    io_uring_unregister_buf_ring, io_uring_unregister_buffers, iovec,
 };
 
 pub mod net;
@@ -580,6 +581,14 @@ impl<'a> Iterator for BorrowedBufsIterator<'a> {
 
 //-----------------------------------------------------------------------------
 
+#[derive(Default, Debug)]
+struct FixedBufs {
+    buf: Vec<u8>,
+    iovecs: Vec<iovec>,
+}
+
+//-----------------------------------------------------------------------------
+
 mod io_ops {
     use slotmap::{DefaultKey, SlotMap};
 
@@ -629,6 +638,7 @@ struct IoContextFrame {
     receiver: RefCell<Receiver<Weak>>,
     sender: RefCell<Sender<Weak>>,
     buf_groups: RefCell<HashMap<u16, Box<UnsafeCell<BufGroup>>>>,
+    fixed_bufs: RefCell<FixedBufs>,
     local_task_queue: RefCell<VecDeque<Weak>>,
     io_ops: RefCell<IoOpsMap>,
     needs_wake: Arc<AlignedAtomicBool>,
@@ -638,13 +648,19 @@ struct IoContextFrame {
 
 impl Drop for IoContextFrame {
     fn drop(&mut self) {
+        let ring = &raw mut *self.ioring.borrow_mut();
+
         let buf_groups = &mut *self.buf_groups.borrow_mut();
-        for (_, buf_group) in buf_groups.iter() {
+        for buf_group in buf_groups.values() {
             unsafe { (*buf_group.get()).release() };
         }
         buf_groups.clear();
 
-        unsafe { io_uring_queue_exit(&raw mut *self.ioring.borrow_mut()) };
+        if !self.fixed_bufs.borrow().buf.is_empty() {
+            unsafe { io_uring_unregister_buffers(ring) };
+        }
+
+        unsafe { io_uring_queue_exit(ring) };
 
         let n = self.io_ops.borrow().len();
         if n > 0 {
@@ -979,6 +995,7 @@ impl IoContextBuilder {
             sender: RefCell::new(tx),
             ioring: RefCell::new(ioring),
             buf_groups: RefCell::new(HashMap::new()),
+            fixed_bufs: RefCell::new(FixedBufs::default()),
             local_task_queue: RefCell::new(VecDeque::new()),
             io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
             needs_wake: Arc::new(AlignedAtomicBool(AtomicBool::new(true))),
@@ -1846,6 +1863,40 @@ impl Executor {
             .buf_groups
             .borrow_mut()
             .insert(bgid, Box::new(UnsafeCell::new(bg)));
+
+        Ok(())
+    }
+
+    pub fn register_fixed_buffers(&self, num_bufs: u32, buf_len: usize) -> Result<()> {
+        assert!(
+            self.p.fixed_bufs.borrow().buf.is_empty(),
+            "A fixed buffer sequence is already registered."
+        );
+
+        let ring = self.ring();
+        let nr_iovecs = num_bufs;
+
+        let mut buf = vec![0_u8; num_bufs as usize * buf_len];
+
+        let mut iovecs = Vec::with_capacity(num_bufs as _);
+        for i in 0..num_bufs {
+            iovecs.push(iovec {
+                iov_base: unsafe { buf.as_mut_ptr().add(i as usize * buf_len).cast() },
+                iov_len: buf_len,
+            });
+        }
+
+        let mut registered_bufs = FixedBufs { buf, iovecs };
+
+        let ret = unsafe {
+            io_uring_register_buffers(ring, registered_bufs.iovecs.as_mut_ptr(), nr_iovecs)
+        };
+
+        if ret != 0 {
+            return Err(Errno::from_raw(ret));
+        }
+
+        *self.p.fixed_bufs.borrow_mut() = registered_bufs;
 
         Ok(())
     }
