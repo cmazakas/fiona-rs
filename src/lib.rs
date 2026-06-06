@@ -25,7 +25,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     mem::{ManuallyDrop, forget},
-    ops::{Deref, Range},
+    ops::{Deref, DerefMut, Range},
     pin::Pin,
     ptr::{self, DynMetadata, NonNull, metadata},
     rc::Rc,
@@ -585,6 +585,66 @@ impl<'a> Iterator for BorrowedBufsIterator<'a> {
 struct FixedBufs {
     buf: Vec<u8>,
     iovecs: Vec<iovec>,
+    free_bufs: VecDeque<usize>,
+}
+
+impl FixedBufs {
+    fn get_next_buf(&mut self, ex: &Executor) -> Option<FixedBuf> {
+        let buf_idx = self.free_bufs.pop_front();
+        let buf_idx = buf_idx?;
+
+        let iov = self.iovecs[buf_idx];
+
+        Some(FixedBuf {
+            ex: ex.clone(),
+            p: iov.iov_base.cast(),
+            len: iov.iov_len,
+            buf_idx,
+        })
+    }
+}
+
+pub struct FixedBuf {
+    ex: Executor,
+    p: *mut u8,
+    len: usize,
+    buf_idx: usize,
+}
+
+impl FixedBuf {
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.p, self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.p, self.len) }
+    }
+}
+
+impl Drop for FixedBuf {
+    fn drop(&mut self) {
+        self.ex
+            .p
+            .fixed_bufs
+            .borrow_mut()
+            .free_bufs
+            .push_back(self.buf_idx);
+    }
+}
+
+impl Deref for FixedBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl DerefMut for FixedBuf {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -1886,7 +1946,16 @@ impl Executor {
             });
         }
 
-        let mut registered_bufs = FixedBufs { buf, iovecs };
+        let mut free_bufs = VecDeque::new();
+        for i in 0..num_bufs {
+            free_bufs.push_back(i as usize);
+        }
+
+        let mut registered_bufs = FixedBufs {
+            buf,
+            iovecs,
+            free_bufs,
+        };
 
         let ret = unsafe {
             io_uring_register_buffers(ring, registered_bufs.iovecs.as_mut_ptr(), nr_iovecs)
@@ -1899,6 +1968,11 @@ impl Executor {
         *self.p.fixed_bufs.borrow_mut() = registered_bufs;
 
         Ok(())
+    }
+
+    #[must_use]
+    pub fn get_fixed_buf(&self) -> Option<FixedBuf> {
+        self.p.fixed_bufs.borrow_mut().get_next_buf(self)
     }
 
     fn spawn_impl_helper<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> Task {
