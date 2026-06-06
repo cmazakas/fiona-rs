@@ -2,8 +2,6 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-extern crate liburing_rs;
-
 use crate::{
     BorrowedBufs, Executor, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
     make_io_uring_op, release_impl, release_obj,
@@ -171,8 +169,7 @@ impl TcpListener {
         unreachable!();
     }
 
-    #[must_use]
-    pub fn accept(&self) -> AcceptFuture<'_> {
+    pub fn accept(&self) -> impl Future<Output = Result<TcpStream>> {
         let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!acceptor_impl.accept_pending);
         acceptor_impl.accept_pending = true;
@@ -189,8 +186,7 @@ impl TcpListener {
         acceptor_impl.fd_impl.ex.clone()
     }
 
-    #[must_use]
-    pub fn cancel(&self) -> CancelFuture<'_> {
+    pub fn cancel(&self) -> impl Future<Output = Result<()>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
         let acceptor = unsafe { &mut *self.p.as_ptr() };
@@ -213,8 +209,7 @@ impl TcpListener {
         }
     }
 
-    #[must_use]
-    pub fn close(&self) -> CloseFuture<'_> {
+    pub fn close(&self) -> impl Future<Output = Result<()>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
 
         let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
@@ -299,7 +294,7 @@ impl Drop for ListenerImpl {
 
 //-----------------------------------------------------------------------------
 
-pub struct AcceptFuture<'a> {
+struct AcceptFuture<'a> {
     acceptor: &'a TcpListener,
     completed: bool,
 }
@@ -531,13 +526,13 @@ impl TcpStream {
         // gets called or at least figure out the correct behavior.
     }
 
-    #[must_use]
-    pub fn send(&self, buf: Vec<u8>) -> SendFuture<'_> {
+    pub fn send(&self, buf: Vec<u8>) -> impl Future<Output = (Result<usize>, Vec<u8>)> {
         self.send_subspan(0..buf.len(), buf)
     }
 
-    #[must_use]
-    pub fn send_subspan<R: RangeBounds<usize>>(&self, subspan: R, buf: Vec<u8>) -> SendFuture<'_> {
+    pub fn send_subspan<R: RangeBounds<usize>>(
+        &self, subspan: R, buf: Vec<u8>,
+    ) -> impl Future<Output = (Result<usize>, Vec<u8>)> {
         assert!(
             unsafe { !(*self.p.as_ptr()).send_pending },
             "Send is already pending for this TCP socket."
@@ -585,8 +580,7 @@ impl TcpStream {
         }
     }
 
-    #[must_use]
-    pub fn recv(&self) -> RecvFuture<'_> {
+    pub fn recv(&self) -> impl Future<Output = Result<BorrowedBufs>> {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!stream_impl.recv_pending);
         stream_impl.recv_pending = true;
@@ -597,8 +591,7 @@ impl TcpStream {
         }
     }
 
-    #[must_use]
-    pub fn shutdown(&self, how: i32) -> ShutdownFuture<'_> {
+    pub fn shutdown(&self, how: i32) -> impl Future<Output = Result<()>> {
         assert!(unsafe { !(*self.p.as_ptr()).shutdown_pending });
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
@@ -621,8 +614,7 @@ impl TcpStream {
         }
     }
 
-    #[must_use]
-    pub fn close(&self) -> CloseFuture<'_> {
+    pub fn close(&self) -> impl Future<Output = Result<()>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
@@ -645,8 +637,7 @@ impl TcpStream {
         }
     }
 
-    #[must_use]
-    pub fn cancel(&self) -> CancelFuture<'_> {
+    pub fn cancel(&self) -> impl Future<Output = Result<()>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
@@ -759,7 +750,7 @@ impl Clone for TcpStream {
 
 //-----------------------------------------------------------------------------
 
-pub struct SendFuture<'a> {
+struct SendFuture<'a> {
     stream: &'a TcpStream,
     completed: bool,
     op: Option<u64>,
@@ -883,7 +874,7 @@ impl Future for SendFuture<'_> {
 
 //-----------------------------------------------------------------------------
 
-pub struct CloseFuture<'a> {
+struct CloseFuture<'a> {
     fd_impl: *mut FdImpl,
     completed: bool,
     op: Option<u64>,
@@ -990,7 +981,7 @@ impl Drop for CloseFuture<'_> {
 
 //-----------------------------------------------------------------------------
 
-pub struct ShutdownFuture<'a> {
+struct ShutdownFuture<'a> {
     stream: &'a TcpStream,
     completed: bool,
     op: Option<u64>,
@@ -1092,7 +1083,7 @@ impl Drop for ShutdownFuture<'_> {
 
 //-----------------------------------------------------------------------------
 
-pub struct CancelFuture<'a> {
+struct CancelFuture<'a> {
     fd_impl: *mut FdImpl,
     completed: bool,
     op: Option<u64>,
@@ -1191,7 +1182,7 @@ impl Drop for CancelFuture<'_> {
 
 //-----------------------------------------------------------------------------
 
-pub struct RecvFuture<'a> {
+struct RecvFuture<'a> {
     stream: &'a TcpStream,
     completed: bool,
 }
@@ -1349,8 +1340,9 @@ impl TcpClient {
         self
     }
 
-    #[must_use]
-    pub fn connect_ipv4(self, addr: Ipv4Addr, port: u16) -> ConnectFuture {
+    pub fn connect_ipv4(
+        self, addr: Ipv4Addr, port: u16,
+    ) -> impl Future<Output = Result<TcpStream>> {
         let addr = SocketAddrV4::new(addr, port);
 
         let op = make_io_uring_op(
@@ -1374,8 +1366,9 @@ impl TcpClient {
         }
     }
 
-    #[must_use]
-    pub fn connect_ipv6(self, addr: Ipv6Addr, port: u16) -> ConnectFuture {
+    pub fn connect_ipv6(
+        self, addr: Ipv6Addr, port: u16,
+    ) -> impl Future<Output = Result<TcpStream>> {
         let addr = SocketAddrV6::new(addr, port, 0, 0);
 
         let op = make_io_uring_op(
@@ -1400,7 +1393,7 @@ impl TcpClient {
     }
 }
 
-pub struct ConnectFuture {
+struct ConnectFuture {
     completed: bool,
     ex: Executor,
     op: Option<u64>,
