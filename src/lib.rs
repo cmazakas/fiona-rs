@@ -800,6 +800,13 @@ enum OpType {
         buf: Vec<u8>,
         last_send: *mut Instant,
     },
+    TcpSendFixed {
+        num_sent: usize,
+        subspan: Range<usize>,
+        buf: Option<FixedBuf>,
+        last_send: *mut Instant,
+    },
+
     MultishotTcpRecv {
         bufs: BorrowedBufs,
         buf_group: *mut BufGroup,
@@ -1274,7 +1281,7 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler {
         OpType::MultishotTimeout { .. } => on_timeout_multishot,
         OpType::MultishotTcpAccept { .. } => on_tcp_accept_multishot,
         OpType::TcpConnect { .. } => on_tcp_connect,
-        OpType::TcpSend { .. } => on_tcp_send,
+        OpType::TcpSend { .. } | OpType::TcpSendFixed { .. } => on_tcp_send,
         OpType::MultishotTcpRecv { .. } => on_tcp_recv_multishot,
         OpType::TcpShutdown | OpType::TcpClose | OpType::TcpCancel => on_tcp_close,
         OpType::DropCancel => on_drop_cancel,
@@ -1523,11 +1530,16 @@ fn on_tcp_send(ex: &Executor, cqe: &mut io_uring_cqe) {
         return;
     }
 
-    let OpType::TcpSend {
+    let (OpType::TcpSend {
         ref mut num_sent,
         last_send,
         ..
-    } = op.op_type
+    }
+    | OpType::TcpSendFixed {
+        ref mut num_sent,
+        last_send,
+        ..
+    }) = op.op_type
     else {
         unreachable!()
     };

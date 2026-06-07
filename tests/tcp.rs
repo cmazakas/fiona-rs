@@ -31,6 +31,13 @@ fn make_bytes(num_bytes: usize) -> Vec<u8> {
     bytes
 }
 
+fn make_random_bytes(num_bytes: usize) -> Vec<u8> {
+    let mut rng = rand::rngs::StdRng::from_os_rng();
+    let mut bytes = vec![0_u8; num_bytes];
+    rand::RngCore::fill_bytes(&mut rng, &mut bytes);
+    bytes
+}
+
 struct WakerFuture;
 
 impl Future for WakerFuture {
@@ -39,6 +46,47 @@ impl Future for WakerFuture {
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         Poll::Ready(cx.waker().clone())
     }
+}
+
+fn make_socket_pair(ioc: &mut fiona::IoContext) -> (fiona::net::TcpStream, fiona::net::TcpStream) {
+    let ex = ioc.get_executor();
+
+    ex.register_buf_group(1234, 1024, 1024).unwrap();
+
+    let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
+    let port = acceptor.port();
+
+    let server = Rc::new(RefCell::new(None));
+    let client = Rc::new(RefCell::new(None));
+
+    ex.clone().spawn({
+        let server = server.clone();
+        async move {
+            let stream = acceptor.accept().await.unwrap();
+            stream.set_buf_group(1234);
+
+            *server.borrow_mut() = Some(stream.clone());
+        }
+    });
+
+    ex.clone().spawn({
+        let client = client.clone();
+        async move {
+            let stream = fiona::net::TcpClient::new(&ex)
+                .connect_ipv6(Ipv6Addr::LOCALHOST, port)
+                .await
+                .unwrap();
+
+            stream.set_buf_group(1234);
+
+            *client.borrow_mut() = Some(stream.clone());
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+
+    (server.borrow_mut().take().unwrap(), client.borrow_mut().take().unwrap())
 }
 
 #[test]
@@ -2261,45 +2309,6 @@ fn test_tcp_double_run() {
 
     let mut ioc = fiona::IoContext::new();
 
-    fn make_socket_pair(
-        ioc: &mut fiona::IoContext,
-    ) -> (fiona::net::TcpStream, fiona::net::TcpStream) {
-        let ex = ioc.get_executor();
-
-        ex.register_buf_group(1234, 1024, 1024).unwrap();
-
-        let acceptor = fiona::net::TcpListener::bind_ipv6(&ex, Ipv6Addr::LOCALHOST, 0).unwrap();
-        let port = acceptor.port();
-
-        let server = Rc::new(RefCell::new(None));
-        let client = Rc::new(RefCell::new(None));
-
-        let server_cpy = server.clone();
-        ex.clone().spawn(async move {
-            let stream = acceptor.accept().await.unwrap();
-            stream.set_buf_group(1234);
-
-            *server_cpy.borrow_mut() = Some(stream.clone());
-        });
-
-        let client_cpy = client.clone();
-        ex.clone().spawn(async move {
-            let stream = fiona::net::TcpClient::new(&ex)
-                .connect_ipv6(Ipv6Addr::LOCALHOST, port)
-                .await
-                .unwrap();
-
-            stream.set_buf_group(1234);
-
-            *client_cpy.borrow_mut() = Some(stream.clone());
-        });
-
-        let n = ioc.run();
-        assert_eq!(n, 2);
-
-        (server.borrow_mut().take().unwrap(), client.borrow_mut().take().unwrap())
-    }
-
     let (server, client) = make_socket_pair(&mut ioc);
 
     let ex = ioc.get_executor();
@@ -2318,6 +2327,111 @@ fn test_tcp_double_run() {
 
         let bufs = client.recv().await.unwrap();
         assert!(!bufs.is_empty());
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn tcp_fixed_send_hello_world() {
+    let mut ioc = fiona::IoContext::new();
+    let (server, client) = make_socket_pair(&mut ioc);
+
+    let ex = ioc.get_executor();
+    ex.register_fixed_buffers(1024, 1024).unwrap();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let mut buf = ex.get_fixed_buf().unwrap();
+
+            let src = "hello, world!".as_bytes();
+            buf[..src.len()].copy_from_slice(src);
+
+            let (n, _buf) = server.send_subspan_fixed(..src.len(), buf).await;
+            assert_eq!(n.unwrap(), src.len());
+
+            let bufs = server.recv().await.unwrap();
+            let msg = bufs
+                .iter()
+                .map(|buf| str::from_utf8(buf).unwrap())
+                .collect::<String>();
+            assert_eq!(msg, "hello, world!");
+        }
+    });
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let mut buf = ex.get_fixed_buf().unwrap();
+
+            let src = "hello, world!".as_bytes();
+            buf[..src.len()].copy_from_slice(src);
+
+            let (n, _buf) = client.send_subspan_fixed(..src.len(), buf).await;
+            assert_eq!(n.unwrap(), src.len());
+
+            let bufs = client.recv().await.unwrap();
+            let msg = bufs
+                .iter()
+                .map(|buf| str::from_utf8(buf).unwrap())
+                .collect::<String>();
+            assert_eq!(msg, "hello, world!");
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn tcp_fixed_send_random_bytes() {
+    let mut ioc = fiona::IoContext::new();
+    let (server, client) = make_socket_pair(&mut ioc);
+
+    let ex = ioc.get_executor();
+    ex.register_fixed_buffers(1024, 1024).unwrap();
+
+    let server_bytes = Rc::new(make_random_bytes(1024));
+    let client_bytes = Rc::new(make_random_bytes(1024));
+
+    ex.spawn({
+        let ex = ex.clone();
+        let server_bytes = server_bytes.clone();
+        let client_bytes = client_bytes.clone();
+        async move {
+            let mut buf = ex.get_fixed_buf().unwrap();
+
+            let src = server_bytes.as_slice();
+            buf[..src.len()].copy_from_slice(src);
+
+            let (n, _buf) = server.send_subspan_fixed(..src.len(), buf).await;
+            assert_eq!(n.unwrap(), src.len());
+
+            let bufs = server.recv().await.unwrap();
+            let msg = bufs.iter().flatten().copied().collect::<Vec<u8>>();
+            assert_eq!(msg, *client_bytes);
+        }
+    });
+
+    ex.spawn({
+        let ex = ex.clone();
+        let server_bytes = server_bytes.clone();
+        let client_bytes = client_bytes.clone();
+        async move {
+            let mut buf = ex.get_fixed_buf().unwrap();
+
+            let src = client_bytes.as_slice();
+            buf[..src.len()].copy_from_slice(src);
+
+            let (n, _buf) = client.send_subspan_fixed(..src.len(), buf).await;
+            assert_eq!(n.unwrap(), src.len());
+
+            let bufs = client.recv().await.unwrap();
+            let msg = bufs.iter().flatten().copied().collect::<Vec<u8>>();
+            assert_eq!(msg, *server_bytes);
+        }
     });
 
     let n = ioc.run();

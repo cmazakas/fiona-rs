@@ -65,13 +65,14 @@ fn fixed_bufs_outlives_ioc() {
     let num_bufs = 1024;
     let buf_len = 128;
 
-    let ioc = fiona::IoContext::new();
-    let ex = ioc.get_executor();
-    ex.register_fixed_buffers(num_bufs, buf_len).unwrap();
+    let mut fixed_buf;
+    {
+        let ioc = fiona::IoContext::new();
+        let ex = ioc.get_executor();
+        ex.register_fixed_buffers(num_bufs, buf_len).unwrap();
 
-    let mut fixed_buf = ex.get_fixed_buf().unwrap();
-
-    drop(ioc);
+        fixed_buf = ex.get_fixed_buf().unwrap();
+    }
 
     fixed_buf.iter_mut().for_each(|x| {
         *x = 123;

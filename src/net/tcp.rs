@@ -3,7 +3,7 @@
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 use crate::{
-    BorrowedBufs, Executor, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
+    BorrowedBufs, Executor, FixedBuf, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
     make_io_uring_op, release_impl, release_obj,
 };
 use core::panic;
@@ -12,10 +12,10 @@ use liburing_rs::{
     IORING_RECVSEND_BUNDLE, IORING_TIMEOUT_MULTISHOT, IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS,
     IOSQE_FIXED_FILE, io_uring_prep_cancel_fd, io_uring_prep_cancel64, io_uring_prep_close,
     io_uring_prep_close_direct, io_uring_prep_multishot_accept_direct,
-    io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_shutdown,
-    io_uring_prep_socket_direct_alloc, io_uring_prep_timeout, io_uring_prep_timeout_remove,
-    io_uring_prep_timeout_update, io_uring_sqe_set_buf_group, io_uring_sqe_set_data64,
-    io_uring_sqe_set_flags,
+    io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_send_zc_fixed,
+    io_uring_prep_shutdown, io_uring_prep_socket_direct_alloc, io_uring_prep_timeout,
+    io_uring_prep_timeout_remove, io_uring_prep_timeout_update, io_uring_sqe_set_buf_group,
+    io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
 use nix::{
     errno::Errno,
@@ -36,6 +36,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     ops::{Range, RangeBounds},
     os::fd::{AsRawFd, IntoRawFd},
+    pin::Pin,
     ptr::{self, NonNull},
     task::Poll,
     time::{Duration, Instant},
@@ -531,20 +532,23 @@ impl TcpStream {
     }
 
     pub fn send_subspan<R: RangeBounds<usize>>(
-        &self, subspan: R, buf: Vec<u8>,
+        &self, range: R, buf: Vec<u8>,
     ) -> impl Future<Output = (Result<usize>, Vec<u8>)> {
         assert!(
             unsafe { !(*self.p.as_ptr()).send_pending },
             "Send is already pending for this TCP socket."
         );
 
-        let start = match subspan.start_bound() {
+        let stream_impl = unsafe { &mut *self.p.as_ptr() };
+        let last_send = &raw mut stream_impl.last_send;
+
+        let start = match range.start_bound() {
             std::ops::Bound::Included(&s) => s,
             std::ops::Bound::Excluded(&s) => s + 1,
             std::ops::Bound::Unbounded => 0,
         };
 
-        let end = match subspan.end_bound() {
+        let end = match range.end_bound() {
             std::ops::Bound::Included(&e) => e + 1,
             std::ops::Bound::Excluded(&e) => e,
             std::ops::Bound::Unbounded => buf.len(),
@@ -553,31 +557,88 @@ impl TcpStream {
         let subspan = Range { start, end };
         assert!(subspan.end <= buf.len());
 
-        let stream_impl = unsafe { &mut *self.p.as_ptr() };
+        let op = OpType::TcpSend {
+            buf,
+            last_send,
+            num_sent: 0,
+            subspan,
+        };
+
         stream_impl.send_pending = true;
         stream_impl.last_send = Instant::now();
 
-        let last_send = &raw mut stream_impl.last_send;
         let ref_count = &raw mut stream_impl.fd_impl.ref_count;
 
-        let key = stream_impl.fd_impl.ex.p.io_ops.borrow_mut().insert(
-            make_io_uring_op(
-                ref_count,
-                OpType::TcpSend {
-                    buf,
-                    last_send,
-                    num_sent: 0,
-                    subspan,
-                },
-            ),
-            &stream_impl.fd_impl.ex,
-        );
+        let key = stream_impl
+            .fd_impl
+            .ex
+            .p
+            .io_ops
+            .borrow_mut()
+            .insert(make_io_uring_op(ref_count, op), &stream_impl.fd_impl.ex);
 
-        SendFuture {
+        SendFuture(SendFutureImpl {
             stream: self,
             completed: false,
             op: Some(key.data().as_ffi()),
-        }
+        })
+    }
+
+    pub fn send_fixed(&self, buf: FixedBuf) -> impl Future<Output = (Result<usize>, FixedBuf)> {
+        self.send_subspan_fixed(0..buf.len(), buf)
+    }
+
+    pub fn send_subspan_fixed<R: RangeBounds<usize>>(
+        &self, range: R, buf: FixedBuf,
+    ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
+        assert!(
+            unsafe { !(*self.p.as_ptr()).send_pending },
+            "Send is already pending for this TCP socket."
+        );
+
+        let stream_impl = unsafe { &mut *self.p.as_ptr() };
+        let last_send = &raw mut stream_impl.last_send;
+
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(&s) => s,
+            std::ops::Bound::Excluded(&s) => s + 1,
+            std::ops::Bound::Unbounded => 0,
+        };
+
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(&e) => e + 1,
+            std::ops::Bound::Excluded(&e) => e,
+            std::ops::Bound::Unbounded => buf.len(),
+        };
+
+        let subspan = Range { start, end };
+        assert!(subspan.end <= buf.len());
+
+        let op = OpType::TcpSendFixed {
+            buf: Some(buf),
+            last_send,
+            num_sent: 0,
+            subspan,
+        };
+
+        stream_impl.send_pending = true;
+        stream_impl.last_send = Instant::now();
+
+        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
+
+        let key = stream_impl
+            .fd_impl
+            .ex
+            .p
+            .io_ops
+            .borrow_mut()
+            .insert(make_io_uring_op(ref_count, op), &stream_impl.fd_impl.ex);
+
+        SendFixedFuture(SendFutureImpl {
+            stream: self,
+            completed: false,
+            op: Some(key.data().as_ffi()),
+        })
     }
 
     pub fn recv(&self) -> impl Future<Output = Result<BorrowedBufs>> {
@@ -750,13 +811,13 @@ impl Clone for TcpStream {
 
 //-----------------------------------------------------------------------------
 
-struct SendFuture<'a> {
+struct SendFutureImpl<'a> {
     stream: &'a TcpStream,
     completed: bool,
     op: Option<u64>,
 }
 
-impl Drop for SendFuture<'_> {
+impl Drop for SendFutureImpl<'_> {
     fn drop(&mut self) {
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
         stream_impl.send_pending = false;
@@ -787,13 +848,16 @@ impl Drop for SendFuture<'_> {
     }
 }
 
-impl Future for SendFuture<'_> {
-    type Output = (Result<usize>, Vec<u8>);
+enum ErasedBuf {
+    Vec(Vec<u8>),
+    FixedBuf(FixedBuf),
+}
 
+impl SendFutureImpl<'_> {
     #[inline]
-    fn poll(
+    fn poll_impl_optype(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
-    ) -> Poll<Self::Output> {
+    ) -> Poll<(Result<usize>, ErasedBuf)> {
         assert!(!self.completed);
 
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
@@ -812,31 +876,56 @@ impl Future for SendFuture<'_> {
                 Poll::Pending
             }
             (false, false) => {
-                let OpType::TcpSend {
-                    ref mut buf,
-                    ref subspan,
-                    ..
-                } = op.op_type
+                let (OpType::TcpSend { ref subspan, .. }
+                | OpType::TcpSendFixed { ref subspan, .. }) = op.op_type
                 else {
                     unreachable!()
                 };
 
                 if stream_impl.fd_impl.fd == -1 {
                     self.completed = true;
-                    return Poll::Ready((Err(Errno::EBADF), mem::take(buf)));
+                    if let OpType::TcpSend { ref mut buf, .. } = op.op_type {
+                        return Poll::Ready((Err(Errno::EBADF), ErasedBuf::Vec(mem::take(buf))));
+                    }
+
+                    if let OpType::TcpSendFixed { ref mut buf, .. } = op.op_type {
+                        return Poll::Ready((
+                            Err(Errno::EBADF),
+                            ErasedBuf::FixedBuf(buf.take().unwrap()),
+                        ));
+                    }
+
+                    unreachable!()
                 }
 
                 {
                     let sqe = get_sqe(&stream_impl.fd_impl.ex);
-                    unsafe {
-                        io_uring_prep_send_zc(
-                            sqe,
-                            stream_impl.fd_impl.fd,
-                            buf.as_ptr().add(subspan.start).cast(),
-                            subspan.end - subspan.start,
-                            0,
-                            0,
-                        );
+                    if let OpType::TcpSend { ref mut buf, .. } = op.op_type {
+                        unsafe {
+                            io_uring_prep_send_zc(
+                                sqe,
+                                stream_impl.fd_impl.fd,
+                                buf.as_ptr().add(subspan.start).cast(),
+                                subspan.end - subspan.start,
+                                0,
+                                0,
+                            );
+                        }
+                    } else if let OpType::TcpSendFixed { ref mut buf, .. } = op.op_type {
+                        let buf = buf.as_mut().unwrap();
+                        unsafe {
+                            io_uring_prep_send_zc_fixed(
+                                sqe,
+                                stream_impl.fd_impl.fd,
+                                buf.as_ptr().add(subspan.start).cast(),
+                                subspan.end - subspan.start,
+                                0,
+                                0,
+                                buf.buf_idx as u32,
+                            );
+                        }
+                    } else {
+                        unreachable!()
                     }
 
                     unsafe { io_uring_sqe_set_data64(sqe, user_data) };
@@ -852,21 +941,82 @@ impl Future for SendFuture<'_> {
             (true, true) => {
                 self.completed = true;
 
-                let OpType::TcpSend {
+                let res = op.res;
+                if let OpType::TcpSend {
                     ref mut buf,
                     num_sent,
                     ..
                 } = op.op_type
-                else {
+                {
+                    return if res < 0 {
+                        Poll::Ready((
+                            Err(Errno::from_raw(-res)),
+                            ErasedBuf::Vec(std::mem::take(buf)),
+                        ))
+                    } else {
+                        Poll::Ready((Ok(num_sent), ErasedBuf::Vec(std::mem::take(buf))))
+                    };
+                }
+
+                if let OpType::TcpSendFixed {
+                    ref mut buf,
+                    num_sent,
+                    ..
+                } = op.op_type
+                {
+                    return if res < 0 {
+                        Poll::Ready((
+                            Err(Errno::from_raw(-res)),
+                            ErasedBuf::FixedBuf(buf.take().unwrap()),
+                        ))
+                    } else {
+                        Poll::Ready((Ok(num_sent), ErasedBuf::FixedBuf(buf.take().unwrap())))
+                    };
+                }
+
+                unreachable!()
+            }
+        }
+    }
+}
+
+struct SendFuture<'a>(SendFutureImpl<'a>);
+
+impl Future for SendFuture<'_> {
+    type Output = (Result<usize>, Vec<u8>);
+
+    #[inline]
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        match Pin::new(&mut self.0).poll_impl_optype(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready((n, erased_buf)) => {
+                let ErasedBuf::Vec(buf) = erased_buf else {
                     unreachable!()
                 };
+                Poll::Ready((n, buf))
+            }
+        }
+    }
+}
 
-                let res = op.res;
-                if res < 0 {
-                    Poll::Ready((Err(Errno::from_raw(-res)), std::mem::take(buf)))
-                } else {
-                    Poll::Ready((Ok(num_sent), std::mem::take(buf)))
-                }
+struct SendFixedFuture<'a>(SendFutureImpl<'a>);
+
+impl Future for SendFixedFuture<'_> {
+    type Output = (Result<usize>, FixedBuf);
+
+    #[inline]
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        match Pin::new(&mut self.0).poll_impl_optype(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready((n, erased_buf)) => {
+                let ErasedBuf::FixedBuf(buf) = erased_buf else {
+                    unreachable!()
+                };
+                Poll::Ready((n, buf))
             }
         }
     }
