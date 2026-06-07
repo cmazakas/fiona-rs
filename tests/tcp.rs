@@ -2404,9 +2404,9 @@ fn tcp_fixed_send_random_bytes() {
             let mut buf = ex.get_fixed_buf().unwrap();
 
             let src = server_bytes.as_slice();
-            buf[..src.len()].copy_from_slice(src);
+            buf.copy_from_slice(src);
 
-            let (n, _buf) = server.send_subspan_fixed(..src.len(), buf).await;
+            let (n, _buf) = server.send_fixed(buf).await;
             assert_eq!(n.unwrap(), src.len());
 
             let bufs = server.recv().await.unwrap();
@@ -2423,9 +2423,9 @@ fn tcp_fixed_send_random_bytes() {
             let mut buf = ex.get_fixed_buf().unwrap();
 
             let src = client_bytes.as_slice();
-            buf[..src.len()].copy_from_slice(src);
+            buf.copy_from_slice(src);
 
-            let (n, _buf) = client.send_subspan_fixed(..src.len(), buf).await;
+            let (n, _buf) = client.send_fixed(buf).await;
             assert_eq!(n.unwrap(), src.len());
 
             let bufs = client.recv().await.unwrap();
