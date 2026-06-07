@@ -403,21 +403,22 @@ fn compio_echo_server(
 
 async fn fiona_send(stream: fiona::net::TcpStream, bytes: Arc<Vec<u8>>) {
     let mut total_sent = 0;
-    let mut send_buf = vec![0_u8; SEND_BUF_SIZE];
+
+    let mut fixed_buf = stream.get_executor().get_fixed_buf().unwrap();
 
     while total_sent < BUF_SIZE {
-        send_buf.copy_from_slice(&bytes[total_sent..total_sent + SEND_BUF_SIZE]);
+        fixed_buf.copy_from_slice(&bytes[total_sent..total_sent + SEND_BUF_SIZE]);
 
         let mut n = 0;
         while n < SEND_BUF_SIZE {
-            let (num_sent, buf) = stream.send_subspan(n.., send_buf).await;
+            let (num_sent, buf) = stream.send_subspan_fixed(n.., fixed_buf).await;
             let num_sent = num_sent.unwrap();
             assert!(num_sent > 0);
 
             n += num_sent;
             total_sent += num_sent;
 
-            send_buf = buf;
+            fixed_buf = buf;
         }
     }
 }
@@ -453,11 +454,16 @@ async fn fiona_close(stream: fiona::net::TcpStream) {
 }
 
 fn make_io_context(nr_files: u32) -> fiona::IoContext {
-    fiona::IoContext::builder()
+    let ioc = fiona::IoContext::builder()
         .sq_entries(256)
         .cq_entries(CQ_ENTRIES)
         .num_files(2 * nr_files)
-        .build()
+        .build();
+
+    let ex = ioc.get_executor();
+    ex.register_fixed_buffers(nr_files, SEND_BUF_SIZE).unwrap();
+
+    ioc
 }
 
 fn fiona_echo_client(
@@ -548,14 +554,14 @@ fn fiona_echo_server(
 
     unsafe { DURATION = Duration::new(0, 0) };
 
-    ex //
-        .clone()
-        .spawn(async move {
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
             for _ in 0..nr_files {
                 let stream = acceptor.accept().await.unwrap();
                 let bytes = bytes.clone();
 
-                ex.clone().spawn(async move {
+                ex.spawn(async move {
                     let start = Instant::now();
 
                     let mut h = blake2::Blake2b512::new();
@@ -575,7 +581,8 @@ fn fiona_echo_server(
                     unsafe { DURATION += start.elapsed() };
                 });
             }
-        });
+        }
+    });
 
     let _n = ioc.run();
 
