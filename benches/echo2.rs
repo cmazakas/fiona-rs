@@ -180,7 +180,7 @@ fn tokio_echo_server(
         let start = Instant::now();
 
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.reuseaddr().unwrap();
+        socket.set_reuseaddr(true).unwrap();
         socket
             .bind(SocketAddr::new(IpAddr::V4(ipv4_addr), port))
             .unwrap();
