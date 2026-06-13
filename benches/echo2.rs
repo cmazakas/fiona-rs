@@ -20,7 +20,7 @@ use std::{
 
 use blake2::Digest;
 use clap::Parser;
-use compio::io::{AsyncRead, AsyncWrite};
+// use compio::io::{AsyncRead, AsyncWrite};
 use nix::{
     errno::Errno,
     libc::{ENOBUFS, SHUT_WR},
@@ -219,187 +219,190 @@ fn tokio_echo_server(
     Ok(())
 }
 
-async fn compio_send(stream: &mut compio::net::TcpStream, bytes: Arc<Vec<u8>>) {
-    let mut total_sent = 0;
-    let mut send_buf = vec![0_u8; SEND_BUF_SIZE];
+// async fn compio_send(stream: &mut compio::net::TcpStream, bytes:
+// Arc<Vec<u8>>) {     let mut total_sent = 0;
+//     let mut send_buf = vec![0_u8; SEND_BUF_SIZE];
 
-    while total_sent < BUF_SIZE {
-        send_buf.copy_from_slice(&bytes[total_sent..total_sent + SEND_BUF_SIZE]);
+//     while total_sent < BUF_SIZE {
+//         send_buf.copy_from_slice(&bytes[total_sent..total_sent +
+// SEND_BUF_SIZE]);
 
-        let mut n = 0;
-        while n < SEND_BUF_SIZE {
-            let (sent, mut buf) =
-                compio::time::timeout(Duration::from_secs(120), stream.write(send_buf))
-                    .await
-                    .unwrap()
-                    .unwrap();
+//         let mut n = 0;
+//         while n < SEND_BUF_SIZE {
+//             let (sent, mut buf) =
+//                 compio::time::timeout(Duration::from_secs(120),
+// stream.write(send_buf))                     .await
+//                     .unwrap()
+//                     .unwrap();
 
-            assert!(sent > 0);
-            n += sent;
-            total_sent += sent;
+//             assert!(sent > 0);
+//             n += sent;
+//             total_sent += sent;
 
-            buf.drain(0..sent);
-            send_buf = buf;
-        }
+//             buf.drain(0..sent);
+//             send_buf = buf;
+//         }
 
-        send_buf.resize(SEND_BUF_SIZE, 0);
-    }
-}
+//         send_buf.resize(SEND_BUF_SIZE, 0);
+//     }
+// }
 
-async fn compio_recv(h: &mut blake2::Blake2b512, stream: &mut compio::net::TcpStream) {
-    let mut recv_buf = vec![0; RECV_BUF_SIZE];
+// async fn compio_recv(h: &mut blake2::Blake2b512, stream: &mut
+// compio::net::TcpStream) {     let mut recv_buf = vec![0; RECV_BUF_SIZE];
 
-    let mut total_received = 0;
-    while total_received < BUF_SIZE {
-        let (n, buf) = compio::time::timeout(Duration::from_secs(120), stream.read(recv_buf))
-            .await
-            .unwrap()
-            .unwrap();
+//     let mut total_received = 0;
+//     while total_received < BUF_SIZE {
+//         let (n, buf) = compio::time::timeout(Duration::from_secs(120),
+// stream.read(recv_buf))             .await
+//             .unwrap()
+//             .unwrap();
 
-        h.update(&buf[0..n]);
-        total_received += n;
+//         h.update(&buf[0..n]);
+//         total_received += n;
 
-        recv_buf = buf;
-    }
-}
+//         recv_buf = buf;
+//     }
+// }
 
-async fn compio_close(stream: &mut compio::net::TcpStream) {
-    stream.shutdown().await.unwrap();
-    // stream.clone().close().await.unwrap();
-}
+// async fn compio_close(stream: &mut compio::net::TcpStream) {
+//     stream.shutdown().await.unwrap();
+//     // stream.clone().close().await.unwrap();
+// }
 
-fn compio_echo_client(
-    ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, bytes: Vec<u8>,
-) -> Result<(), String> {
-    static mut TIMINGS: Vec<Duration> = Vec::new();
+// fn compio_echo_client(
+//     ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, bytes: Vec<u8>,
+// ) -> Result<(), String> {
+//     static mut TIMINGS: Vec<Duration> = Vec::new();
 
-    let bytes = Arc::new(bytes);
+//     let bytes = Arc::new(bytes);
 
-    let mut proactor = compio::driver::ProactorBuilder::new();
-    proactor.capacity(2 * nr_files);
+//     let mut proactor = compio::driver::ProactorBuilder::new();
+//     proactor.capacity(2 * nr_files);
 
-    let rt = compio::runtime::RuntimeBuilder::new()
-        .with_proactor(proactor)
-        .build()
-        .unwrap();
+//     let rt = compio::runtime::RuntimeBuilder::new()
+//         .with_proactor(proactor)
+//         .build()
+//         .unwrap();
 
-    rt.block_on(async move {
-        unsafe { DURATION = Duration::new(0, 0) };
+//     rt.block_on(async move {
+//         unsafe { DURATION = Duration::new(0, 0) };
 
-        let start = Instant::now();
+//         let start = Instant::now();
 
-        let mut join_set = Vec::<compio::runtime::JoinHandle<_>>::new();
+//         let mut join_set = Vec::<compio::runtime::JoinHandle<_>>::new();
 
-        for _ in 0..nr_files {
-            let bytes = bytes.clone();
-            join_set.push(compio::runtime::spawn(async move {
-                let start = Instant::now();
+//         for _ in 0..nr_files {
+//             let bytes = bytes.clone();
+//             join_set.push(compio::runtime::spawn(async move {
+//                 let start = Instant::now();
 
-                let mut h = blake2::Blake2b512::new();
+//                 let mut h = blake2::Blake2b512::new();
 
-                let mut client =
-                    compio::net::TcpStream::connect(SocketAddrV4::new(ipv4_addr, port))
-                        .await
-                        .unwrap();
+//                 let mut client =
+//
+// compio::net::TcpStream::connect(SocketAddrV4::new(ipv4_addr, port))
+//                         .await
+//                         .unwrap();
 
-                compio_send(&mut client, bytes).await;
-                compio_recv(&mut h, &mut client).await;
+//                 compio_send(&mut client, bytes).await;
+//                 compio_recv(&mut h, &mut client).await;
 
-                let digest = h.finalize();
-                assert_eq!(digest.as_slice(), EXPECTED_HASH);
+//                 let digest = h.finalize();
+//                 assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
-                compio_close(&mut client).await;
-                drop(client);
+//                 compio_close(&mut client).await;
+//                 drop(client);
 
-                unsafe { DURATION += start.elapsed() };
-                unsafe {
-                    TIMINGS.push(start.elapsed());
-                }
-            }));
-        }
+//                 unsafe { DURATION += start.elapsed() };
+//                 unsafe {
+//                     TIMINGS.push(start.elapsed());
+//                 }
+//             }));
+//         }
 
-        for h in join_set {
-            h.await.unwrap();
-        }
+//         for h in join_set {
+//             h.await.unwrap();
+//         }
 
-        let avg_dur = unsafe { DURATION / nr_files };
-        println!("compio average client duration: {avg_dur:?}");
-        println!("compio client loop took: {:?} for {nr_files} connections", start.elapsed());
+//         let avg_dur = unsafe { DURATION / nr_files };
+//         println!("compio average client duration: {avg_dur:?}");
+//         println!("compio client loop took: {:?} for {nr_files} connections",
+// start.elapsed());
 
-        let mut outliers = 0;
-        unsafe {
-            for timing in &TIMINGS {
-                if *timing >= 2 * avg_dur {
-                    outliers += 1;
-                }
-            }
-        }
-        println!("total outliers: {outliers}");
-    });
+//         let mut outliers = 0;
+//         unsafe {
+//             for timing in &TIMINGS {
+//                 if *timing >= 2 * avg_dur {
+//                     outliers += 1;
+//                 }
+//             }
+//         }
+//         println!("total outliers: {outliers}");
+//     });
 
-    Ok(())
-}
+//     Ok(())
+// }
 
-fn compio_echo_server(
-    ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, bytes: Vec<u8>,
-) -> Result<(), String> {
-    let bytes = Arc::new(bytes);
+// fn compio_echo_server(
+//     ipv4_addr: Ipv4Addr, port: u16, nr_files: u32, bytes: Vec<u8>,
+// ) -> Result<(), String> {
+//     let bytes = Arc::new(bytes);
 
-    let mut proactor = compio::driver::ProactorBuilder::new();
-    proactor.capacity(2 * nr_files);
+//     let mut proactor = compio::driver::ProactorBuilder::new();
+//     proactor.capacity(2 * nr_files);
 
-    let rt = compio::runtime::RuntimeBuilder::new()
-        .with_proactor(proactor)
-        .build()
-        .unwrap();
+//     let rt = compio::runtime::RuntimeBuilder::new()
+//         .with_proactor(proactor)
+//         .build()
+//         .unwrap();
 
-    rt.block_on(async move {
-        unsafe { DURATION = Duration::new(0, 0) };
-        let start = Instant::now();
+//     rt.block_on(async move {
+//         unsafe { DURATION = Duration::new(0, 0) };
+//         let start = Instant::now();
 
-        let socket_opts = compio::net::SocketOpts::new().reuse_address(true);
+//         let socket_opts = compio::net::SocketOpts::new().reuse_address(true);
 
-        let listener = compio::net::TcpListener::bind_with_options(
-            SocketAddrV4::new(ipv4_addr, port),
-            &socket_opts,
-        )
-        .await
-        .unwrap();
+//         let listener = compio::net::TcpListener::bind_with_options(
+//             SocketAddrV4::new(ipv4_addr, port),
+//             &socket_opts,
+//         )
+//         .await
+//         .unwrap();
 
-        let mut join_set = Vec::<compio::runtime::JoinHandle<_>>::new();
+//         let mut join_set = Vec::<compio::runtime::JoinHandle<_>>::new();
 
-        for _ in 0..nr_files {
-            let mut stream = listener.accept().await.unwrap().0;
-            let bytes = bytes.clone();
-            join_set.push(compio::runtime::spawn(async move {
-                let start = Instant::now();
+//         for _ in 0..nr_files {
+//             let mut stream = listener.accept().await.unwrap().0;
+//             let bytes = bytes.clone();
+//             join_set.push(compio::runtime::spawn(async move {
+//                 let start = Instant::now();
 
-                let mut h = blake2::Blake2b512::new();
+//                 let mut h = blake2::Blake2b512::new();
 
-                compio_recv(&mut h, &mut stream).await;
-                let digest = h.finalize();
-                assert_eq!(digest.as_slice(), EXPECTED_HASH);
+//                 compio_recv(&mut h, &mut stream).await;
+//                 let digest = h.finalize();
+//                 assert_eq!(digest.as_slice(), EXPECTED_HASH);
 
-                compio_send(&mut stream, bytes).await;
+//                 compio_send(&mut stream, bytes).await;
 
-                compio_close(&mut stream).await;
-                drop(stream);
+//                 compio_close(&mut stream).await;
+//                 drop(stream);
 
-                unsafe { DURATION += start.elapsed() };
-            }));
-        }
+//                 unsafe { DURATION += start.elapsed() };
+//             }));
+//         }
 
-        for h in join_set {
-            h.await.unwrap();
-        }
+//         for h in join_set {
+//             h.await.unwrap();
+//         }
 
-        let avg_dur = unsafe { DURATION / nr_files };
-        println!("average server duration: {avg_dur:?}");
-        println!("compio accept loop took: {:?} for {nr_files} connections", start.elapsed());
-    });
+//         let avg_dur = unsafe { DURATION / nr_files };
+//         println!("average server duration: {avg_dur:?}");
+//         println!("compio accept loop took: {:?} for {nr_files} connections",
+// start.elapsed());     });
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 async fn fiona_send(stream: fiona::net::TcpStream, bytes: Arc<Vec<u8>>) {
     let mut total_sent = 0;
@@ -666,17 +669,18 @@ fn main() {
             .unwrap();
         }
     } else if args.compio {
-        if args.server {
-            utils::run_once("compio echo2 server", move || {
-                black_box(compio_echo_server(args.ipv4_addr, args.port, args.nr_files, bytes))
-            })
-            .unwrap();
-        } else {
-            assert!(args.client);
-            utils::run_once("compio echo2 client", || {
-                black_box(compio_echo_client(args.ipv4_addr, args.port, args.nr_files, bytes))
-            })
-            .unwrap();
-        }
+        unreachable!("compio on nightly is currently broken for version 0.19.0")
+        // if args.server {
+        //     utils::run_once("compio echo2 server", move || {
+        //         black_box(compio_echo_server(args.ipv4_addr, args.port,
+        // args.nr_files, bytes))     })
+        //     .unwrap();
+        // } else {
+        //     assert!(args.client);
+        //     utils::run_once("compio echo2 client", || {
+        //         black_box(compio_echo_client(args.ipv4_addr, args.port,
+        // args.nr_files, bytes))     })
+        //     .unwrap();
+        // }
     }
 }
