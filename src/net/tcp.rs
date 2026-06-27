@@ -3,8 +3,8 @@
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 use crate::{
-    BorrowedBufs, Executor, FixedBuf, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe,
-    make_io_uring_op, release_impl, release_obj,
+    BorrowedBufs, Executor, FdImpl, FixedBuf, OpType, RefCount, Result, add_obj_ref, add_op_ref,
+    get_sqe, make_io_uring_op, release_impl, release_obj,
 };
 use core::panic;
 use liburing_rs::{
@@ -57,18 +57,6 @@ impl Default for TcpListenerOpts {
             reuse_port: false,
         }
     }
-}
-
-//-----------------------------------------------------------------------------
-
-pub(crate) struct FdImpl {
-    ref_count: RefCount,
-    ex: Executor,
-    pub(crate) fd: i32,
-    pub(crate) close_pending: bool,
-    pub(crate) cancel_pending: bool,
-    was_closed: bool,
-    is_fixed: bool,
 }
 
 //-----------------------------------------------------------------------------

@@ -21,6 +21,7 @@ use std::{
     alloc::Layout,
     cell::{RefCell, SyncUnsafeCell, UnsafeCell},
     collections::{HashMap, VecDeque},
+    ffi::CString,
     fmt::Debug,
     future::Future,
     marker::PhantomData,
@@ -61,6 +62,7 @@ use liburing_rs::{
     io_uring_unregister_buf_ring, io_uring_unregister_buffers, iovec,
 };
 
+pub mod file;
 pub mod net;
 pub mod time;
 pub mod tls;
@@ -816,6 +818,9 @@ enum OpType {
     TcpClose,
     TcpCancel,
     DropCancel,
+    FileOpen {
+        path: CString,
+    },
 }
 
 type CqeHandler = fn(ex: &Executor, cqe: &mut io_uring_cqe);
@@ -1285,6 +1290,7 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler {
         OpType::MultishotTcpRecv { .. } => on_tcp_recv_multishot,
         OpType::TcpShutdown | OpType::TcpClose | OpType::TcpCancel => on_tcp_close,
         OpType::DropCancel => on_drop_cancel,
+        OpType::FileOpen { .. } => on_file_open,
     }
 }
 
@@ -1720,6 +1726,28 @@ fn on_timeout_multishot(ex: &Executor, cqe: &mut io_uring_cqe) {
     }
 }
 
+fn on_file_open(ex: &Executor, cqe: &mut io_uring_cqe) {
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.get_mut(key).unwrap();
+
+    op.done = true;
+    op.res = cqe.res;
+
+    if op.eager_dropped {
+        let _op = io_ops.remove(key).unwrap();
+        todo!("if the file was opened successfully, close it here");
+    }
+
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
+    }
+}
+
 fn on_drop_cancel(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
@@ -2068,6 +2096,18 @@ impl Executor {
             _marker: PhantomData,
         }
     }
+}
+
+//-----------------------------------------------------------------------------
+
+pub(crate) struct FdImpl {
+    ref_count: RefCount,
+    ex: Executor,
+    pub(crate) fd: i32,
+    pub(crate) close_pending: bool,
+    pub(crate) cancel_pending: bool,
+    was_closed: bool,
+    is_fixed: bool,
 }
 
 //-----------------------------------------------------------------------------
