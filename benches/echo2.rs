@@ -13,7 +13,7 @@ mod utils;
 
 use std::{
     hint::black_box,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
