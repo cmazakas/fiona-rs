@@ -6,8 +6,9 @@ use crate::{
     Executor, FdImpl, OpType, RefCount, get_sqe, make_io_uring_op, release_impl, release_obj,
 };
 use liburing_rs::{
-    IORING_FILE_INDEX_ALLOC, IOSQE_CQE_SKIP_SUCCESS, io_uring_prep_close_direct,
-    io_uring_prep_open_direct, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    IORING_FILE_INDEX_ALLOC, IOSQE_CQE_SKIP_SUCCESS, io_uring_prep_cancel64,
+    io_uring_prep_close_direct, io_uring_prep_open_direct, io_uring_sqe_set_data64,
+    io_uring_sqe_set_flags,
 };
 use nix::libc::{O_CREAT, O_DIRECT, O_RDWR, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP, S_IWUSR};
 use slotmap::{DefaultKey, Key, KeyData};
@@ -55,7 +56,7 @@ pub struct File {
 impl File {
     pub fn open(
         ex: &Executor, path: impl AsRef<Path>,
-    ) -> impl Future<Output = Result<File, Error>> {
+    ) -> impl Future<Output = Result<File, Error>> + 'static {
         let ex = ex.clone();
 
         let path = CString::new(path.as_ref().as_os_str().as_bytes()).unwrap();
@@ -193,7 +194,20 @@ impl Drop for OpenFuture {
         let op = io_ops.get_mut(key).unwrap();
 
         if op.initiated && !op.done {
-            todo!("attempt to cancel the I/O request here")
+            op.eager_dropped = true;
+
+            let sqe = get_sqe(&self.ex);
+            unsafe { io_uring_prep_cancel64(sqe, op_key, 0) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+
+            return;
+        }
+
+        if op.initiated && op.done && !self.completed && op.res >= 0 {
+            let sqe = get_sqe(&self.ex);
+            let fd = op.res as _;
+            unsafe { io_uring_prep_close_direct(sqe, fd) };
         }
 
         io_ops.remove(key).unwrap();

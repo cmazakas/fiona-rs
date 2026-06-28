@@ -1739,8 +1739,17 @@ fn on_file_open(ex: &Executor, cqe: &mut io_uring_cqe) {
     op.res = cqe.res;
 
     if op.eager_dropped {
-        let _op = io_ops.remove(key).unwrap();
-        todo!("if the file was opened successfully, close it here");
+        let op = io_ops.remove(key).unwrap();
+        drop(borrow_guard);
+
+        if op.res >= 0 {
+            let sqe = get_sqe(ex);
+            unsafe { io_uring_prep_close_direct(sqe, op.res as _) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
+        }
+
+        return;
     }
 
     if let Some(local_waker) = op.local_waker.take() {
