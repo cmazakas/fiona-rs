@@ -1,5 +1,11 @@
 # fiona-rs
 
+An io_uring runtime that aims to leverage all of its unique features to experiment and see what kinds of new APIs are possible.
+
+## Build Requirements
+
+Requires Linux kernel version 7.0 and up.
+
 Building this crate successfully may require the following in your `.cargo/config.toml`:
 
 ```toml
@@ -8,11 +14,42 @@ CLANG_PATH = "/usr/bin/clang-20"
 LIBCLANG_PATH = "/usr/lib/llvm-20/lib"
 ```
 
-Requires Linux kernel version 6.8 and up.
+## Preliminary Benchmarks
 
-A Rust port of some C++ I had written which was a port of some Rust code I originally worked on.
+Benchmarks were build against commit [ff37219f55b8c32bf9541dbfd476db4d1824e4f3](https://github.com/cmazakas/fiona-rs/tree/ff37219f55b8c32bf9541dbfd476db4d1824e4f3).
 
-Aims to be a competitively fast I/O runtime using io_uring and all of its features.
+Benchmarks were run using two physical machines, a gaming desktop with a 2.5 Gb NIC and a Dell XPS 17 laptop. A 2.5 Gb ethernet cable was used to connect the two machines. The Dell XPS functioned as the server, the gaming desktop functioned as the client.
+
+The server machine uses:
+```
+cargo bench --bench echo2 -- --ipv4-addr 192.168.10.12 --port 8015 --tokio --server --nr-files 5000
+```
+
+The client machine uses:
+```
+cargo bench --bench echo2 -- --ipv4-addr 192.168.10.12 --port 8015 --tokio --client --nr-files 5000
+```
+
+`--tokio` can be substituted for `--fiona`. All benchmarks were run back-to-back as fast as human input allows. Tokio was relegated to port 8015, fiona-rs used port 8016.
+
+Current benchmark data applies to [echo2](benches/echo2.rs).
+
+| Number of Connections | fiona-rs (Total client loop time) | Tokio (Total client loop time) | fiona-rs (Average client duration) | Tokio (Average client duration) |
+| --------------------- | --------------------------------- | ------------------------------ | ---------------------------------- | ------------------------------- |
+| 1000                  | 5.78s                             | 6.45s                          | 4.79s                              | 5.55s                           |
+| 2000                  | 11.95s                            | 13.59s                         | 9.99s                              | 10.41s                          |
+| 3000                  | 18.79s                            | 21.82s                         | 15.72s                             | 16.40s                          |
+| 4000                  | 27.69s                            | 36.73s                         | 23.35s                             | 22.64s                          |
+| 5000                  | 37.40s                            | 47.45s                         | 31.64s                             | 31.23s                          |
+| 6000                  | 48.48s                            | 58.10s                         | 39.17s                             | 39.24s                          |
+| 7000                  | 68.62s                            | 75.54s                         | 46.93s                             | 46.84s                          |
+| 8000                  | 67.96s                            | 102.84s                        | 54.28s                             | 54.45s                          |
+| 9000                  | 76.64s                            | 108.29s                        | 61.22s                             | 61.04s                          |
+| 10000                 | 112.34s                           | Timed out                      | 68.07s                             | Timed out                       |
+
+The benchmarks also track strong statistical outliers. No outliers meeting the current critertia were detected for either runtime during the benchmark runs.
+
+Note: results are preliminary and are subject to noise and are not absolutely conclusive of overall performance.
 
 ## Working Around RLIMIT_MEMLOCK Limits
 
