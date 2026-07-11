@@ -34,10 +34,11 @@ use std::{
     marker::PhantomData,
     mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
-    ops::{Range, RangeBounds},
+    ops::RangeBounds,
     os::fd::{AsRawFd, IntoRawFd},
     pin::Pin,
     ptr::{self, NonNull},
+    range::Range,
     task::Poll,
     time::{Duration, Instant},
 };
