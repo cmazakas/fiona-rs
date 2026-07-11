@@ -26,9 +26,10 @@ use std::{
     future::Future,
     marker::PhantomData,
     mem::{ManuallyDrop, forget},
-    ops::{Deref, DerefMut, Range},
+    ops::{Deref, DerefMut},
     pin::Pin,
     ptr::{self, DynMetadata, NonNull, metadata},
+    range::Range,
     rc::Rc,
     slice,
     sync::{
@@ -615,12 +616,19 @@ pub struct FixedBuf {
 
 impl FixedBuf {
     #[must_use]
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.p, self.len) }
     }
 
+    #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.p, self.len) }
+    }
+
+    #[inline]
+    pub fn buf_idx(&self) -> usize {
+        self.buf_idx
     }
 }
 
@@ -820,6 +828,11 @@ enum OpType {
     DropCancel,
     FileOpen {
         path: CString,
+    },
+    FileWrite {
+        buf: Option<FixedBuf>,
+        subspan: Range<usize>,
+        offset: u64,
     },
 }
 
@@ -1291,6 +1304,7 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler {
         OpType::TcpShutdown | OpType::TcpClose | OpType::TcpCancel => on_tcp_close,
         OpType::DropCancel => on_drop_cancel,
         OpType::FileOpen { .. } => on_file_open,
+        OpType::FileWrite { .. } => on_file_write,
     }
 }
 
@@ -1752,6 +1766,28 @@ fn on_file_open(ex: &Executor, cqe: &mut io_uring_cqe) {
         return;
     }
 
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
+    }
+}
+
+fn on_file_write(ex: &Executor, cqe: &mut io_uring_cqe) {
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.get_mut(key).unwrap();
+
+    op.done = true;
+    op.res = cqe.res;
+
+    if op.eager_dropped {
+        todo!("handle eager-dropped file write")
+    }
+
+    unsafe { release_op(op.ref_count) };
     if let Some(local_waker) = op.local_waker.take() {
         local_waker.wake();
     }

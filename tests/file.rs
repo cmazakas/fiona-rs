@@ -5,6 +5,7 @@
 use std::{path::Path, time::Duration};
 
 use futures::poll;
+use rand::SeedableRng;
 
 #[test]
 fn file_open() {
@@ -155,6 +156,107 @@ fn file_open_eager_drop_cancel() {
 
                 files.push(file);
             }
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn file_write() {
+    // Test that we can successfully write continuously to a file.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let pathname = "/tmp/fiona_test_file_write.txt";
+
+            let file = fiona::file::File::open(&ex, pathname).await.unwrap();
+
+            ex.register_fixed_buffers(8, 1024).unwrap();
+
+            let mut message = vec![0; 8 * 1024];
+            {
+                let mut rng = rand::rngs::StdRng::from_os_rng();
+                rand::RngCore::fill_bytes(&mut rng, &mut message);
+            }
+
+            // For this test, we exercise a code path where we grab multiple registered
+            // buffers up front and then incrementally consume each one.
+            let mut fixed_bufs = Vec::new();
+            {
+                let mut msg = &message[..];
+                for i in 0..8 {
+                    let mut buf = ex.get_fixed_buf().unwrap();
+                    assert_eq!(buf.buf_idx(), i as _);
+
+                    let (to_write, remaining) = msg.split_at(1024);
+                    msg = remaining;
+
+                    buf.as_mut_slice().copy_from_slice(to_write);
+                    fixed_bufs.push(buf);
+                }
+            }
+
+            for buf in fixed_bufs {
+                let (written, b) = file.write_at(buf, -1 as _).await;
+                assert_eq!(written.unwrap(), b.len());
+            }
+
+            let content = std::fs::read(pathname).unwrap();
+            assert_eq!(message, content);
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn file_subspan_write() {
+    // Test that we can successfully write continuously to a file using subspans.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let pathname = "/tmp/fiona_test_file_subspan_write";
+
+            let file = fiona::file::File::open(&ex, pathname).await.unwrap();
+
+            ex.register_fixed_buffers(8, 8 * 1024).unwrap();
+
+            let mut message = vec![0; 8 * 1024];
+            {
+                let mut rng = rand::rngs::StdRng::from_os_rng();
+                rand::RngCore::fill_bytes(&mut rng, &mut message);
+            }
+
+            // For this test, we exercise the codepath where we have one large fixed buffer
+            // that we incrementally write from using subspans.
+            let mut buf = ex.get_fixed_buf().unwrap();
+            buf.copy_from_slice(&message[..]);
+
+            let mut written = 0;
+            while written < message.len() {
+                let (n, b) = file
+                    .write_subspan_at(written..written + 1024, buf, -1 as _)
+                    .await;
+                buf = b;
+
+                let n = n.unwrap();
+                assert_eq!(n, 1024);
+                written += n;
+            }
+
+            let content = std::fs::read(pathname).unwrap();
+            assert_eq!(message, content);
         }
     });
 
