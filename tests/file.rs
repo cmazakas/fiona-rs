@@ -2,7 +2,12 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    pin::Pin,
+    task::{Context, Waker},
+    time::Duration,
+};
 
 use futures::poll;
 use rand::SeedableRng;
@@ -257,6 +262,98 @@ fn file_subspan_write() {
 
             let content = std::fs::read(pathname).unwrap();
             assert_eq!(message, content);
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn file_offset_out_of_bounds() {
+    // Test that our code can handle sparse writes.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.register_fixed_buffers(8, 8 * 1024).unwrap();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let pathname = "/tmp/fiona_test_file_offset_out_of_bounds";
+
+            let file = fiona::file::File::open(&ex, pathname).await.unwrap();
+
+            let mut buf = ex.get_fixed_buf().unwrap();
+            let msg = "hello, world!";
+            let n = msg.len();
+            buf[..n].copy_from_slice(msg.as_bytes());
+
+            let (written, _buf) = file.write_subspan_at(..n, buf, -1 as _).await;
+            buf = _buf;
+            assert_eq!(written.unwrap(), msg.len());
+
+            let (n, _buf) = file.write_subspan_at(..n, buf, 1234).await;
+            assert_eq!(n.unwrap(), msg.len());
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn file_eager_drop_write() {
+    // Test that our code can handle eager dropped writes.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.register_fixed_buffers(16, 8 * 1024).unwrap();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let mut files = Vec::new();
+
+            for i in 0..16 {
+                let file = fiona::file::File::open(
+                    &ex,
+                    format!("/tmp/fiona_test_file_eager_drop_write_{}", i),
+                )
+                .await
+                .unwrap();
+
+                files.push(file);
+            }
+
+            let msg = vec![127_u8; 4 * 1024];
+            let n = msg.len();
+
+            let mut cx = Context::from_waker(Waker::noop());
+
+            let mut bufs = Vec::new();
+            for _ in 0..16 {
+                let mut buf = ex.get_fixed_buf().unwrap();
+                buf[..n].copy_from_slice(&msg);
+                bufs.push(buf);
+            }
+
+            let mut tasks = Vec::new();
+
+            for (i, buf) in bufs.into_iter().enumerate() {
+                let task = files[i].write_subspan_at(..n, buf, -1 as _);
+                tasks.push(task);
+            }
+
+            for mut task in &mut tasks {
+                assert!(Pin::new(&mut task).poll(&mut cx).is_pending());
+            }
+
+            drop(tasks);
+
+            fiona::time::sleep(&ex, Duration::from_millis(250)).await;
         }
     });
 

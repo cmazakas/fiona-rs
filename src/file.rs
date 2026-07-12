@@ -26,7 +26,7 @@ use std::{
 
 //-----------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Error {
     OpenError,
     WriteError,
@@ -361,20 +361,18 @@ impl Drop for WriteFuture<'_> {
         let op = io_ops.get_mut(key).unwrap();
 
         if op.initiated && !op.done {
-            todo!("handle WriteFuture eager drop");
-            // op.eager_dropped = true;
-            // op.local_waker = None;
+            op.eager_dropped = true;
+            op.local_waker = None;
 
-            // let ref_count = &raw mut file_impl.fd_impl.ref_count;
-            // let key = io_ops
-            //     .insert(make_io_uring_op(ref_count, OpType::DropCancel),
-            // &file_impl.fd_impl.ex);
-            // unsafe { add_op_ref(ref_count) };
+            let ref_count = &raw mut file_impl.fd_impl.ref_count;
+            let key = io_ops
+                .insert(make_io_uring_op(ref_count, OpType::DropCancel), &file_impl.fd_impl.ex);
+            unsafe { add_op_ref(ref_count) };
 
-            // let sqe = get_sqe(&file_impl.fd_impl.ex);
-            // let user_data = key.data().as_ffi();
-            // unsafe { io_uring_prep_cancel64(sqe, key_data, 0) };
-            // unsafe { io_uring_sqe_set_data64(sqe, user_data) };
+            let sqe = get_sqe(&file_impl.fd_impl.ex);
+            let user_data = key.data().as_ffi();
+            unsafe { io_uring_prep_cancel64(sqe, key_data, 0) };
+            unsafe { io_uring_sqe_set_data64(sqe, user_data) };
         } else {
             io_ops.remove(key).unwrap();
         }

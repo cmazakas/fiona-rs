@@ -1784,7 +1784,12 @@ fn on_file_write(ex: &Executor, cqe: &mut io_uring_cqe) {
     op.res = cqe.res;
 
     if op.eager_dropped {
-        todo!("handle eager-dropped file write")
+        let op = io_ops.remove(key).unwrap();
+        drop(borrow_guard);
+
+        let rc = op.ref_count;
+        unsafe { release_op(rc) };
+        return;
     }
 
     unsafe { release_op(op.ref_count) };
