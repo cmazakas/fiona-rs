@@ -63,7 +63,7 @@ use liburing_rs::{
     io_uring_unregister_buf_ring, io_uring_unregister_buffers, iovec,
 };
 
-pub mod file;
+pub mod fs;
 pub mod net;
 pub mod time;
 pub mod tls;
@@ -626,6 +626,7 @@ impl FixedBuf {
         unsafe { std::slice::from_raw_parts_mut(self.p, self.len) }
     }
 
+    #[must_use]
     #[inline]
     pub fn buf_idx(&self) -> usize {
         self.buf_idx

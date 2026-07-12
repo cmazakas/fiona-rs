@@ -21,7 +21,7 @@ fn file_open() {
         let ex = ex.clone();
         async move {
             let path = Path::new("/tmp/rawr.txt");
-            let _file = fiona::file::File::open(&ex, path).await.unwrap();
+            let _file = fiona::fs::File::open(&ex, path).await.unwrap();
         }
     });
 
@@ -43,7 +43,7 @@ fn file_close_on_drop() {
         async move {
             let mut files = Vec::new();
             for i in 0..NUM_FILES {
-                let file = fiona::file::File::open(&ex, &format!("/tmp/file_close_on_drop_{i}"))
+                let file = fiona::fs::File::open(&ex, &format!("/tmp/file_close_on_drop_{i}"))
                     .await
                     .unwrap();
 
@@ -51,7 +51,7 @@ fn file_close_on_drop() {
             }
 
             let file =
-                fiona::file::File::open(&ex, &format!("/tmp/file_close_on_drop_{}", NUM_FILES + 1))
+                fiona::fs::File::open(&ex, &format!("/tmp/file_close_on_drop_{}", NUM_FILES + 1))
                     .await;
 
             assert!(file.is_err());
@@ -61,7 +61,7 @@ fn file_close_on_drop() {
             fiona::time::sleep(&ex, Duration::from_millis(100)).await;
 
             for i in 0..NUM_FILES {
-                let file = fiona::file::File::open(&ex, &format!("/tmp/file_close_on_drop_{i}"))
+                let file = fiona::fs::File::open(&ex, &format!("/tmp/file_close_on_drop_{i}"))
                     .await
                     .unwrap();
 
@@ -92,7 +92,7 @@ fn file_close_on_future_drop() {
 
             for i in 0..NUM_FILES {
                 let mut task =
-                    fiona::file::File::open(&ex, &format!("/tmp/file_close_on_future_drop_{i}"));
+                    fiona::fs::File::open(&ex, &format!("/tmp/file_close_on_future_drop_{i}"));
                 let r = poll!(&mut task);
                 assert!(r.is_pending());
 
@@ -101,7 +101,7 @@ fn file_close_on_future_drop() {
 
             fiona::time::sleep(&ex, Duration::from_millis(100)).await;
 
-            let file = fiona::file::File::open(
+            let file = fiona::fs::File::open(
                 &ex,
                 &format!("/tmp/file_close_on_future_drop_{}", NUM_FILES + 1),
             )
@@ -113,7 +113,7 @@ fn file_close_on_future_drop() {
 
             for i in 0..NUM_FILES {
                 let file =
-                    fiona::file::File::open(&ex, &format!("/tmp/file_close_on_future_drop_{i}"))
+                    fiona::fs::File::open(&ex, &format!("/tmp/file_close_on_future_drop_{i}"))
                         .await
                         .unwrap();
 
@@ -143,7 +143,7 @@ fn file_open_eager_drop_cancel() {
 
             for i in 0..NUM_FILES {
                 let mut task =
-                    fiona::file::File::open(&ex, &format!("/tmp/file_open_eager_drop_cancel_{i}"));
+                    fiona::fs::File::open(&ex, &format!("/tmp/file_open_eager_drop_cancel_{i}"));
                 let r = poll!(&mut task);
                 assert!(r.is_pending());
 
@@ -155,7 +155,7 @@ fn file_open_eager_drop_cancel() {
 
             for i in 0..NUM_FILES {
                 let file =
-                    fiona::file::File::open(&ex, &format!("/tmp/file_open_eager_drop_cancel_{i}"))
+                    fiona::fs::File::open(&ex, &format!("/tmp/file_open_eager_drop_cancel_{i}"))
                         .await
                         .unwrap();
 
@@ -180,7 +180,7 @@ fn file_write() {
         async move {
             let pathname = "/tmp/fiona_test_file_write.txt";
 
-            let file = fiona::file::File::open(&ex, pathname).await.unwrap();
+            let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
 
             ex.register_fixed_buffers(8, 1024).unwrap();
 
@@ -233,7 +233,7 @@ fn file_subspan_write() {
         async move {
             let pathname = "/tmp/fiona_test_file_subspan_write";
 
-            let file = fiona::file::File::open(&ex, pathname).await.unwrap();
+            let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
 
             ex.register_fixed_buffers(8, 8 * 1024).unwrap();
 
@@ -283,7 +283,7 @@ fn file_offset_out_of_bounds() {
         async move {
             let pathname = "/tmp/fiona_test_file_offset_out_of_bounds";
 
-            let file = fiona::file::File::open(&ex, pathname).await.unwrap();
+            let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
 
             let mut buf = ex.get_fixed_buf().unwrap();
             let msg = "hello, world!";
@@ -318,7 +318,7 @@ fn file_eager_drop_write() {
             let mut files = Vec::new();
 
             for i in 0..16 {
-                let file = fiona::file::File::open(
+                let file = fiona::fs::File::open(
                     &ex,
                     format!("/tmp/fiona_test_file_eager_drop_write_{}", i),
                 )
