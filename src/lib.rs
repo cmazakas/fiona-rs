@@ -66,6 +66,7 @@ use liburing_rs::{
 pub mod fs;
 pub mod net;
 pub mod time;
+pub mod timer_wheel;
 pub mod tls;
 
 use net::tcp::StreamImpl;
