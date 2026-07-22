@@ -1943,7 +1943,7 @@ pub struct Executor {
 
 impl Executor {
     fn ring(&self) -> *mut io_uring {
-        &raw mut *self.p.ioring.borrow_mut()
+        &raw mut *self.p.ioring.as_ptr()
     }
 
     #[must_use]
