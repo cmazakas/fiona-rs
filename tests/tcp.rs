@@ -1100,8 +1100,9 @@ fn tcp_concurrent_send_recv() {
     let port = acceptor.port();
 
     let mut messages = Vec::new();
+    let rng_bytes = make_bytes(MESSAGE_LEN);
     for _ in 0..NUM_CLIENTS {
-        messages.push(make_bytes(MESSAGE_LEN));
+        messages.push(rng_bytes.clone());
     }
 
     let messages = Rc::new(messages);

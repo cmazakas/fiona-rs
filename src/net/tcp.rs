@@ -32,7 +32,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     marker::PhantomData,
-    mem,
+    mem::{self, offset_of},
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     ops::RangeBounds,
     os::fd::{AsRawFd, IntoRawFd},
@@ -179,20 +179,35 @@ impl TcpListener {
     pub fn cancel(&self) -> impl Future<Output = Result<()>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
-        let acceptor = unsafe { &mut *self.p.as_ptr() };
-        acceptor.fd_impl.cancel_pending = true;
+        let listener = unsafe { &mut *self.p.as_ptr() };
+        listener.fd_impl.cancel_pending = true;
 
-        let ref_count = &raw mut acceptor.fd_impl.ref_count;
-        let key = acceptor
+        let fd_impl = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(ListenerImpl, fd_impl.ref_count))
+                .cast()
+        };
+
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(ListenerImpl, fd_impl.ref_count))
+                .cast()
+        };
+
+        let key = listener
             .fd_impl
             .ex
             .p
             .io_ops
             .borrow_mut()
-            .insert(make_io_uring_op(ref_count, OpType::TcpCancel), &acceptor.fd_impl.ex);
+            .insert(make_io_uring_op(ref_count, OpType::TcpCancel), &listener.fd_impl.ex);
 
         CancelFuture {
-            fd_impl: &raw mut acceptor.fd_impl,
+            fd_impl,
             completed: false,
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
@@ -205,7 +220,22 @@ impl TcpListener {
         let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
         acceptor_impl.fd_impl.close_pending = true;
 
-        let ref_count = &raw mut acceptor_impl.fd_impl.ref_count;
+        let fd_impl = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(ListenerImpl, fd_impl.ref_count))
+                .cast()
+        };
+
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(ListenerImpl, fd_impl.ref_count))
+                .cast()
+        };
+
         let key = acceptor_impl
             .fd_impl
             .ex
@@ -215,7 +245,7 @@ impl TcpListener {
             .insert(make_io_uring_op(ref_count, OpType::TcpClose), &acceptor_impl.fd_impl.ex);
 
         CloseFuture {
-            fd_impl: &raw mut acceptor_impl.fd_impl,
+            fd_impl,
             completed: false,
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
@@ -308,7 +338,14 @@ impl Future for AcceptFuture<'_> {
                     return Poll::Ready(Err(Errno::EBADF));
                 }
 
-                let ref_count = &raw mut acceptor_impl.fd_impl.ref_count;
+                let ref_count = unsafe {
+                    self.acceptor
+                        .p
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset_of!(ListenerImpl, fd_impl.ref_count))
+                        .cast()
+                };
 
                 let io_ops = &mut *ex.p.io_ops.borrow_mut();
                 let key = io_ops.insert(
@@ -469,7 +506,12 @@ impl TcpStream {
         }
 
         let stream_impl = unsafe { &mut *p.as_ptr() };
-        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
+        let ref_count = unsafe {
+            p.as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .cast()
+        };
 
         let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
         let key = io_ops.insert(
@@ -528,8 +570,14 @@ impl TcpStream {
             "Send is already pending for this TCP socket."
         );
 
-        let stream_impl = unsafe { &mut *self.p.as_ptr() };
-        let last_send = &raw mut stream_impl.last_send;
+        let p = self.p.as_ptr();
+        let last_send = unsafe { p.cast::<u8>().add(offset_of!(StreamImpl, last_send)).cast() };
+        let ref_count = unsafe {
+            p.cast::<u8>()
+                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .cast()
+        };
+        let stream_impl = unsafe { &mut *p };
 
         let start = match range.start_bound() {
             std::ops::Bound::Included(&s) => s,
@@ -555,8 +603,6 @@ impl TcpStream {
 
         stream_impl.send_pending = true;
         stream_impl.last_send = Instant::now();
-
-        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
 
         let key = stream_impl
             .fd_impl
@@ -647,7 +693,14 @@ impl TcpStream {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.shutdown_pending = true;
 
-        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .cast()
+        };
+
         let key = stream_impl
             .fd_impl
             .ex
@@ -670,7 +723,22 @@ impl TcpStream {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.fd_impl.close_pending = true;
 
-        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
+        let fd_impl = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .cast()
+        };
+
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .cast()
+        };
+
         let key = stream_impl
             .fd_impl
             .ex
@@ -680,7 +748,7 @@ impl TcpStream {
             .insert(make_io_uring_op(ref_count, OpType::TcpClose), &stream_impl.fd_impl.ex);
 
         CloseFuture {
-            fd_impl: &raw mut stream_impl.fd_impl,
+            fd_impl,
             completed: false,
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
@@ -693,7 +761,22 @@ impl TcpStream {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.fd_impl.cancel_pending = true;
 
-        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
+        let fd_impl = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .cast()
+        };
+
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .cast()
+        };
+
         let key = stream_impl
             .fd_impl
             .ex
@@ -705,7 +788,7 @@ impl TcpStream {
         CancelFuture {
             completed: false,
             op: Some(key.data().as_ffi()),
-            fd_impl: &raw mut stream_impl.fd_impl,
+            fd_impl,
             _m: PhantomData,
         }
     }
@@ -1103,7 +1186,13 @@ impl Drop for CloseFuture<'_> {
             op.eager_dropped = true;
             op.local_waker = None;
 
-            let ref_count = &raw mut fd_impl.ref_count;
+            let ref_count = unsafe {
+                self.fd_impl
+                    .cast::<u8>()
+                    .add(offset_of!(FdImpl, ref_count))
+                    .cast()
+            };
+
             let key = io_ops.insert(make_io_uring_op(ref_count, OpType::DropCancel), &fd_impl.ex);
 
             unsafe { add_op_ref(ref_count) };
@@ -1353,9 +1442,14 @@ impl Future for RecvFuture<'_> {
                 }
 
                 let ioprio = u16::try_from(IORING_RECVSEND_BUNDLE).unwrap();
-
-                let ref_count = &raw mut stream_impl.fd_impl.ref_count;
-
+                let ref_count = unsafe {
+                    self.stream
+                        .p
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                        .cast()
+                };
                 let bgid = stream_impl.buf_group;
 
                 let buf_group = match ex.p.buf_groups.borrow().get(&bgid) {
@@ -1367,7 +1461,14 @@ impl Future for RecvFuture<'_> {
                 };
 
                 stream_impl.last_recv = Instant::now();
-                let last_recv: *mut Instant = &raw mut stream_impl.last_recv;
+                let last_recv: *mut Instant = unsafe {
+                    self.stream
+                        .p
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset_of!(StreamImpl, last_recv))
+                        .cast()
+                };
 
                 let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
                 let key = io_ops.insert(

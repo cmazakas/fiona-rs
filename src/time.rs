@@ -4,7 +4,7 @@
 
 extern crate liburing_rs;
 
-use std::{future::Future, ptr::NonNull, task::Poll, time::Duration};
+use std::{future::Future, mem::offset_of, ptr::NonNull, task::Poll, time::Duration};
 
 use nix::{errno::Errno, libc::ETIME};
 
@@ -87,7 +87,13 @@ impl Timer {
 
         timer_impl.timeout_pending = true;
 
-        let ref_count = &raw mut timer_impl.ref_count;
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(TimerImpl, ref_count))
+                .cast()
+        };
 
         let mut guard = timer_impl.ex.p.io_ops.borrow_mut();
         let io_ops = &mut *guard;
