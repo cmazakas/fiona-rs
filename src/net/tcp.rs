@@ -632,7 +632,21 @@ impl TcpStream {
         );
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
-        let last_send = &raw mut stream_impl.last_send;
+        let last_send = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(StreamImpl, last_send))
+                .cast()
+        };
+
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .cast()
+        };
 
         let start = match range.start_bound() {
             std::ops::Bound::Included(&s) => s,
@@ -658,8 +672,6 @@ impl TcpStream {
 
         stream_impl.send_pending = true;
         stream_impl.last_send = Instant::now();
-
-        let ref_count = &raw mut stream_impl.fd_impl.ref_count;
 
         let key = stream_impl
             .fd_impl
@@ -894,6 +906,15 @@ impl Drop for SendFutureImpl<'_> {
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
         stream_impl.send_pending = false;
 
+        let ref_count = unsafe {
+            self.stream
+                .p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .cast()
+        };
+
         let op_cancel_key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(op_cancel_key_data));
         let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
@@ -903,7 +924,6 @@ impl Drop for SendFutureImpl<'_> {
             op.eager_dropped = true;
             op.local_waker = None;
 
-            let ref_count = &raw mut stream_impl.fd_impl.ref_count;
             let key = io_ops
                 .insert(make_io_uring_op(ref_count, OpType::DropCancel), &stream_impl.fd_impl.ex);
 
@@ -1285,6 +1305,15 @@ impl Drop for ShutdownFuture<'_> {
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
         stream_impl.shutdown_pending = false;
 
+        let ref_count = unsafe {
+            self.stream
+                .p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .cast()
+        };
+
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
         let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
@@ -1294,7 +1323,6 @@ impl Drop for ShutdownFuture<'_> {
             op.eager_dropped = true;
             op.local_waker = None;
 
-            let ref_count = &raw mut stream_impl.fd_impl.ref_count;
             let key = io_ops
                 .insert(make_io_uring_op(ref_count, OpType::DropCancel), &stream_impl.fd_impl.ex);
             unsafe { add_op_ref(ref_count) };

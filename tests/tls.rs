@@ -956,7 +956,7 @@ fn tls_concurrent_read_write_intermittent_shutdown() {
 }
 
 #[test]
-fn handshake_errors() {
+fn tls_handshake_errors() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 

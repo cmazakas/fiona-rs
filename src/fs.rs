@@ -16,6 +16,7 @@ use slotmap::{DefaultKey, Key, KeyData};
 use std::{
     alloc::Layout,
     ffi::CString,
+    mem::offset_of,
     ops::RangeBounds,
     os::unix::ffi::OsStrExt,
     path::Path,
@@ -97,7 +98,13 @@ impl File {
         let subspan = Range { start, end };
         assert!(subspan.end <= buf.len());
 
-        let ref_count = &raw mut file_impl.fd_impl.ref_count;
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .add(offset_of!(FileImpl, fd_impl.ref_count))
+                .cast()
+        };
+
         let key = file_impl.fd_impl.ex.p.io_ops.borrow_mut().insert(
             make_io_uring_op(
                 ref_count,
@@ -355,6 +362,14 @@ impl Drop for WriteFuture<'_> {
         let file_impl = unsafe { &mut *self.file.p.as_ptr() };
         file_impl.write_pending = false;
 
+        let ref_count = unsafe {
+            self.file
+                .p
+                .as_ptr()
+                .add(offset_of!(FileImpl, fd_impl.ref_count))
+                .cast()
+        };
+
         let key_data = self.op.unwrap();
         let key = DefaultKey::from(KeyData::from_ffi(key_data));
         let io_ops = &mut *file_impl.fd_impl.ex.p.io_ops.borrow_mut();
@@ -364,7 +379,6 @@ impl Drop for WriteFuture<'_> {
             op.eager_dropped = true;
             op.local_waker = None;
 
-            let ref_count = &raw mut file_impl.fd_impl.ref_count;
             let key = io_ops
                 .insert(make_io_uring_op(ref_count, OpType::DropCancel), &file_impl.fd_impl.ex);
             unsafe { add_op_ref(ref_count) };

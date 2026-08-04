@@ -1,8 +1,14 @@
-# fiona-rs
-
 An io_uring runtime that aims to leverage all of its unique features to experiment and see what kinds of new APIs are possible.
 
-## Build Requirements
+- [Build Requirements](#build-requirements)
+- [Preliminary Benchmarks](#preliminary-benchmarks)
+- [Working Around RLIMIT\_MEMLOCK Limits](#working-around-rlimit_memlock-limits)
+- [Running Benchmarks](#running-benchmarks)
+- [Dev Scripts](#dev-scripts)
+- [Borrow Sanitizer](#borrow-sanitizer)
+
+
+# Build Requirements
 
 Requires Linux kernel version 7.0 and up.
 
@@ -14,7 +20,7 @@ CLANG_PATH = "/usr/bin/clang-20"
 LIBCLANG_PATH = "/usr/lib/llvm-20/lib"
 ```
 
-## Preliminary Benchmarks
+# Preliminary Benchmarks
 
 Benchmarks were build against commit [ff37219f55b8c32bf9541dbfd476db4d1824e4f3](https://github.com/cmazakas/fiona-rs/tree/ff37219f55b8c32bf9541dbfd476db4d1824e4f3).
 
@@ -51,7 +57,7 @@ The benchmarks also track strong statistical outliers. No outliers meeting the c
 
 Note: results are preliminary and are subject to noise and are not absolutely conclusive of overall performance.
 
-## Working Around RLIMIT_MEMLOCK Limits
+# Working Around RLIMIT_MEMLOCK Limits
 
 By default, Fiona uses io_uring's zero-copy TCP send. In order to do this, the kernel has to lock pages of memory in order to perform the direct memory access.
 
@@ -77,7 +83,7 @@ Fiona is actively developed primarily on Ubuntu machines. The following steps se
 
 Note, the above commands permit the user to potentially `mlock` _all_ available memory which can be undesireable. `unlimited` which can instead be replaced with a numeric value which is KB.
 
-## Running Benchmarks
+# Running Benchmarks
 
 Right now Fiona has one main benchmark: `echo2`. This benchmark simply spawns a number of concurrent clients and sends 1 MiB both directions, hashing the entirety of the message and comparing it against a known sentinel value. To run benchmarks with Fiona it's recommended to use two physical machines connected by a high-quality ethernet cable.
 
@@ -93,7 +99,7 @@ cargo bench --bench echo2 -- --ipv4-addr 192.168.10.12 --port 8016 --fiona --cli
 
 `--fiona` can be replaced with `--tokio` or `--compio` to use those runtimes instead.
 
-## Dev Scripts
+# Dev Scripts
 
 For local dev testing, a script like this is useful:
 
@@ -136,4 +142,56 @@ cargo test "${CARGO_FLAGS[@]}" --profile=release-with-debug -- --test-threads=1
 RUSTFLAGS='-Zsanitizer=address -C embed-bitcode -C lto' cargo test "${CARGO_FLAGS[@]}" --release -- --test-threads=1
 RUSTFLAGS='-Zsanitizer=thread -C embed-bitcode -C lto' cargo test "${CARGO_FLAGS[@]}" --release -- --test-threads=1
 RUSTFLAGS='-C embed-bitcode -C lto' cargo test "${CARGO_FLAGS[@]}" --release -- --test-threads=1
+```
+
+# Borrow Sanitizer
+
+Fiona has been partially tested under [Borrow Sanitizer](https://borrowsanitizer.com/).
+
+To run Fiona's test suite, follow the setup instructions here: https://github.com/BorrowSanitizer/bsan#usage.
+
+Because docker disables io_uring by default, you'll need to run something like this:
+```
+docker run -it --security-opt seccomp=unconfined ghcr.io/borrowsanitizer/bsan:latest
+```
+or use a custom security profile depending on your level of comfort and expertise with docker.
+
+Not all of Fiona's tests can feasibly be run under bsan, so a script like the following is useful:
+
+```
+#!/bin/bash
+
+set -ex
+
+clear
+
+export BSAN_OPTIONS=stacktrace_max_len=32
+
+rm /tmp/fiona* || echo 0
+
+cargo +bsan \
+    bsan test \
+    -Z build-std \
+    --target x86_64-unknown-linux-gnu \
+    -- \
+    --test-threads=1 \
+    --nocapture \
+    --skip await_double_wake \
+    --skip await_rayon_stress_test \
+    --skip await_rayon_tasks \
+    --skip await_stress_test \
+    --skip file_offset_out_of_bounds \
+    --skip fixed_bufs_get_bufs \
+    --skip tcp_concurrent_send_recv \
+    --skip tcp_connection_stress_test_cq_overflow \
+    --skip tcp_connection_stress_test_no_cq_overflow \
+    --skip tcp_ephemeral_port_exhaustion_panic \
+    --skip tcp_multiple_accepts \
+    --skip tcp_socket_reuse \
+    --skip tcp_fixed_send_random_bytes \
+    --skip tcp_stress_panicking \
+    --skip slotmap_stable_submit \
+    --skip time \
+    --skip tls \
+    "$@"
 ```

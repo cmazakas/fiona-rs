@@ -111,8 +111,8 @@ unsafe impl Send for DanglingTask {}
 unsafe impl Sync for DanglingTask {}
 
 impl DanglingTask {
-    fn new(task_header: &TaskHeader) -> Self {
-        Self(SyncUnsafeCell::new(ptr::from_ref(task_header).cast_mut()))
+    fn new(task_header: *mut TaskHeader) -> Self {
+        Self(SyncUnsafeCell::new(task_header))
     }
 
     unsafe fn unsafe_clone(&self) -> DanglingTask {
@@ -182,6 +182,10 @@ trait Erased {}
 impl<T> Erased for T {}
 
 impl Task {
+    fn task_header_as_ptr(&self) -> *mut TaskHeader {
+        self.p.as_ptr().cast()
+    }
+
     fn task_header(&self) -> &TaskHeader {
         unsafe { &*self.p.as_ptr().cast::<TaskHeader>() }
     }
@@ -2132,8 +2136,18 @@ impl Executor {
         unsafe { header.next.set_inner(&self.p.head.get_next()) };
         unsafe { header.prev.set_inner(&self.p.head.unsafe_clone()) };
 
-        unsafe { self.p.head.get_next().set_prev(&DanglingTask::new(header)) };
-        unsafe { self.p.head.set_next(&DanglingTask::new(header)) };
+        unsafe {
+            self.p
+                .head
+                .get_next()
+                .set_prev(&DanglingTask::new(task.task_header_as_ptr()));
+        }
+
+        unsafe {
+            self.p
+                .head
+                .set_next(&DanglingTask::new(task.task_header_as_ptr()));
+        }
 
         forget(task.clone());
 
