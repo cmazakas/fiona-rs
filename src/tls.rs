@@ -58,11 +58,11 @@ where
 {
     let (send_buf, max_send) = {
         let mut borrow_guard = buf.borrow_mut();
-        let mut buf = &mut *borrow_guard;
+        let buf = &mut *borrow_guard;
         let tls_conn = &mut *tls_stream.borrow_mut();
 
         loop {
-            if let Err(_err) = tls_conn.write_tls(&mut buf) {
+            if let Err(_err) = tls_conn.write_tls(buf) {
                 return Err(Error::CiphertextWriteFailed);
             }
 
