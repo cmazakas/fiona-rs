@@ -78,40 +78,42 @@ struct Level {
 }
 
 impl Level {
-    // Find the next occupied slot directly after `when`'s slot for a given level.
-    fn next_occupied_slot(&self, when: u64) -> Option<usize> {
+    unsafe fn add_entry(&mut self, timer: *mut TimerState) {
+        let timer = unsafe { &mut *timer };
+        let slot = slot_for(timer.deadline, self.level);
+
+        if !self.slots[slot].is_null() {
+            unsafe { (*self.slots[slot]).prev = timer };
+        }
+
+        timer.next = self.slots[slot];
+        self.slots[slot] = timer;
+        self.occupied |= 1 << slot;
+    }
+
+    fn next_occupied_slot(&self, now: u64) -> Option<usize> {
         if self.occupied == 0 {
             return None;
         }
 
-        // Grab when's slot in the ring buffer.
-        let when_slot = (when / slot_range(self.level)) as usize;
-
-        // We want to only probe slots _after_ ours, shifted such that bit 0 is our
-        // origin.
-        let occupied = self.occupied.rotate_right(when_slot as u32);
-
-        // Find the first occupied slot's offset from bit 0.
-        let zeroes = occupied.trailing_zeros() as usize;
-
-        // Re-adjust and add modulo for when we wind up using a wrapped-around bit.
-        let slot = (zeroes + when_slot) % LEVEL_MULT;
+        let now_slot = (now / slot_range(self.level)) as usize;
+        let occupied = self.occupied.rotate_right(now_slot as u32);
+        let zeros = occupied.trailing_zeros() as usize;
+        let slot = (zeros + now_slot) % LEVEL_MULT;
 
         Some(slot)
     }
 
-    fn next_expiration(&self, when: u64) -> Option<Expiration> {
-        let slot = self.next_occupied_slot(when)?;
+    fn next_expiration(&self, now: u64) -> Option<Expiration> {
+        let slot = self.next_occupied_slot(now)?;
 
         let level_range = level_range(self.level);
         let slot_range = slot_range(self.level);
 
-        // Mask out this level's bits for `when` so that we can re-express it exactly in
-        // terms of level + slot durations.
-        let start = when & !(level_range - 1);
-        let mut deadline = start + slot as u64 * slot_range;
+        let level_start = now & !(level_range - 1);
+        let mut deadline = level_start + slot as u64 * slot_range;
 
-        if deadline <= when {
+        if deadline <= now {
             assert_eq!(self.level, NUM_LEVELS - 1);
             deadline += level_range;
         }
@@ -157,15 +159,15 @@ impl TimerWheel {
         self.levels[level].occupied |= 1 << slot;
     }
 
-    fn poll(&mut self, when: u64) {
+    fn poll(&mut self, now: u64) {
         loop {
             match self.next_expiration() {
-                Some(ref expiration) if expiration.deadline <= when => {
+                Some(ref expiration) if expiration.deadline <= now => {
                     self.process_expiration(expiration);
-                    self.elapsed = expiration.deadline;
+                    self.set_elapsed(expiration.deadline);
                 }
                 _ => {
-                    self.elapsed = when;
+                    self.set_elapsed(now);
                     break;
                 }
             }
@@ -174,8 +176,8 @@ impl TimerWheel {
 
     fn next_expiration(&self) -> Option<Expiration> {
         for level in &self.levels {
-            if let Some(slot) = level.next_expiration(self.elapsed) {
-                return Some(slot);
+            if let Some(expiration) = level.next_expiration(self.elapsed) {
+                return Some(expiration);
             }
         }
 
@@ -189,22 +191,28 @@ impl TimerWheel {
 
         while !timer_list.is_null() {
             let timer = unsafe { &mut *timer_list };
+            timer_list = timer.next;
+            timer.next = null_mut();
+            timer.prev = null_mut();
+
             if timer.deadline <= expiration.deadline {
                 timer.waker.as_ref().unwrap().wake_by_ref();
             } else {
                 let level = level_for(expiration.deadline, timer.deadline);
-                let slot = slot_for(timer.deadline, level);
-                let curr = self.levels[level].slots[slot];
-                if !curr.is_null() {
-                    unsafe { (*curr).prev = timer };
-                }
-
-                timer.next = curr;
-                self.levels[level].slots[slot] = timer;
-                self.levels[level].occupied |= 1 << slot;
+                unsafe { self.levels[level].add_entry(timer) };
             }
+        }
+    }
 
-            timer_list = timer.next;
+    fn elapsed(&self) -> u64 {
+        self.elapsed
+    }
+
+    fn set_elapsed(&mut self, when: u64) {
+        assert!(self.elapsed <= when);
+
+        if when > self.elapsed {
+            self.elapsed = when;
         }
     }
 }
@@ -218,6 +226,8 @@ mod test {
         task::{Context, LocalWake, Waker},
         time::Instant,
     };
+
+    use rand::{Rng, SeedableRng, TryRngCore, rngs::OsRng};
 
     use super::*;
 
@@ -335,13 +345,28 @@ mod test {
     }
 
     struct TestWaker {
-        queue: Rc<RefCell<VecDeque<i32>>>,
+        queue: Rc<RefCell<Vec<i32>>>,
         x: i32,
     }
 
     impl LocalWake for TestWaker {
         fn wake(self: Rc<Self>) {
-            self.queue.borrow_mut().push_back(self.x);
+            self.queue.borrow_mut().push(self.x);
+        }
+    }
+
+    fn make_timer(deadline: u64, x: i32, queue: Rc<RefCell<Vec<i32>>>) -> TimerState {
+        let local_waker = Rc::new(TestWaker { queue, x }).into();
+
+        let mut cx = std::task::ContextBuilder::from_waker(std::task::Waker::noop())
+            .local_waker(&local_waker)
+            .build();
+
+        TimerState {
+            prev: ptr::null_mut(),
+            next: ptr::null_mut(),
+            waker: Some(cx.local_waker().clone()),
+            deadline,
         }
     }
 
@@ -349,32 +374,108 @@ mod test {
     fn timer_wheel_poll() {
         let mut timer_wheel = TimerWheel::new();
 
-        let queue = Rc::new(RefCell::new(VecDeque::new()));
+        let queue = Rc::new(RefCell::new(Vec::new()));
 
-        let local_waker1 = Rc::new(TestWaker {
-            queue: queue.clone(),
-            x: 1,
-        })
-        .into();
+        {
+            let mut timer1 = make_timer(13, 1, queue.clone());
 
-        let mut cx1 = std::task::ContextBuilder::from_waker(std::task::Waker::noop())
-            .local_waker(&local_waker1)
-            .build();
+            unsafe { timer_wheel.add_timer(&raw mut timer1) };
 
-        let mut timer1 = TimerState {
-            prev: ptr::null_mut(),
-            next: ptr::null_mut(),
-            waker: Some(cx1.local_waker().clone()),
-            deadline: 13,
+            timer_wheel.poll(4);
+            assert!(queue.borrow().is_empty());
+
+            timer_wheel.poll(14);
+            assert_eq!(&queue.borrow()[..], [1]);
+        }
+
+        queue.borrow_mut().clear();
+        assert_eq!(timer_wheel.elapsed(), 14);
+
+        {
+            let mut timer1 = make_timer(14 + 13, 1, queue.clone());
+            unsafe { timer_wheel.add_timer(&raw mut timer1) };
+
+            let mut timer1 = make_timer(14 + 64, 2, queue.clone());
+            unsafe { timer_wheel.add_timer(&raw mut timer1) };
+
+            let mut timer1 = make_timer(14 + 1234, 3, queue.clone());
+            unsafe { timer_wheel.add_timer(&raw mut timer1) };
+
+            let mut timer1 = make_timer(14 + 1264, 4, queue.clone());
+            unsafe { timer_wheel.add_timer(&raw mut timer1) };
+
+            timer_wheel.poll(14 + 3);
+            assert!(queue.borrow().is_empty());
+
+            timer_wheel.poll(14 + 11);
+            assert!(queue.borrow().is_empty());
+
+            timer_wheel.poll(14 + 14);
+            assert_eq!(&queue.borrow()[..], [1]);
+
+            timer_wheel.poll(14 + 63);
+            assert_eq!(&queue.borrow()[..], [1]);
+
+            timer_wheel.poll(14 + 64);
+            assert_eq!(&queue.borrow()[..], [1, 2]);
+
+            timer_wheel.poll(14 + 1270);
+            assert_eq!(&queue.borrow()[..], [1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn timer_wheel_poll_fuzzy() {
+        let mut timer_wheel = TimerWheel::new();
+
+        let queue = Rc::new(RefCell::new(Vec::<i32>::new()));
+
+        let mut timers = Vec::new();
+
+        let mut max_deadline = 0;
+
+        let mut i = 0;
+        for level in 0..NUM_LEVELS {
+            for slot in 0..NUM_SLOTS {
+                for j in 0..3 {
+                    let deadline =
+                        LEVEL_MULT.pow(level as u32) + LEVEL_MULT.pow(level as u32) * slot + j;
+
+                    let deadline = deadline.min(MAX_DURATION as usize);
+                    timers.push(Box::new(make_timer(deadline as u64, i, queue.clone())));
+                    unsafe { timer_wheel.add_timer(Box::as_mut_ptr(timers.last_mut().unwrap())) };
+
+                    i += 1;
+
+                    max_deadline = deadline;
+                }
+            }
+        }
+
+        let mut rng = rand::rngs::StdRng::from_os_rng();
+
+        let mut deadline = 0;
+        while deadline < max_deadline {
+            let remaining = max_deadline - deadline;
+            let elapsed = rng.random_range(1_u64..remaining as u64 + 1);
+            let now = deadline as u64 + elapsed;
+
+            timer_wheel.poll(now);
+            deadline += elapsed as usize;
+        }
+        timer_wheel.poll(max_deadline as u64 + 1);
+
+        assert!(timer_wheel.elapsed() > max_deadline as u64);
+
+        let expected = {
+            let mut expected = Vec::new();
+            for x in 0..i {
+                expected.push(x);
+            }
+            expected
         };
 
-        unsafe { timer_wheel.add_timer(&raw mut timer1) };
-
-        timer_wheel.poll(4);
-
-        assert!(queue.borrow().is_empty());
-
-        timer_wheel.poll(14);
-        assert_eq!(queue.borrow().len(), 1);
+        queue.borrow_mut().sort_unstable();
+        assert_eq!(*queue.borrow(), expected);
     }
 }
