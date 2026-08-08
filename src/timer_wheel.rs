@@ -467,6 +467,8 @@ mod test {
 
         let mut max_deadline = 0;
 
+        let mut expected = Vec::<(i32, usize)>::new();
+
         let mut i = 0;
         for level in 0..NUM_LEVELS {
             for slot in 0..NUM_SLOTS {
@@ -477,6 +479,8 @@ mod test {
                     let deadline = deadline.min(MAX_DURATION as usize);
                     timers.push(Box::new(make_timer(deadline as u64, i, queue.clone())));
                     unsafe { timer_wheel.add_timer(Box::as_mut_ptr(timers.last_mut().unwrap())) };
+
+                    expected.push((i, deadline));
 
                     i += 1;
 
@@ -500,15 +504,22 @@ mod test {
 
         assert!(timer_wheel.elapsed() > max_deadline as u64);
 
-        let expected = {
-            let mut expected = Vec::new();
-            for x in 0..i {
-                expected.push(x);
+        // Sort our indices by the deadlines we've ascribed them and if required, sort
+        // them by the indices themselves. Testing against this property ensures we
+        // follow a proper FIFO structure, which requires pop_front() and pop_back().
+        expected.sort_by(|lhs, rhs| {
+            if lhs.1 == rhs.1 {
+                return lhs.0.cmp(&rhs.0);
             }
-            expected
-        };
 
-        queue.borrow_mut().sort_unstable();
+            lhs.1.cmp(&rhs.1)
+        });
+
+        let expected = expected
+            .iter()
+            .map(|(idx, deadline)| *idx)
+            .collect::<Vec<_>>();
+
         assert_eq!(*queue.borrow(), expected);
     }
 }
