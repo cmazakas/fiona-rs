@@ -11,7 +11,7 @@
 
 use std::{
     array::from_fn,
-    ptr::{self, null_mut},
+    ptr::{self, NonNull, null, null_mut},
     task::LocalWaker,
 };
 
@@ -64,6 +64,57 @@ struct TimerState {
     deadline: u64,
 }
 
+struct LinkedList {
+    head: *mut TimerState,
+    tail: *mut TimerState,
+}
+
+impl LinkedList {
+    fn new() -> LinkedList {
+        LinkedList {
+            head: null_mut(),
+            tail: null_mut(),
+        }
+    }
+
+    unsafe fn push_front(&mut self, node: *mut TimerState) {
+        unsafe { (*node).prev = null_mut() };
+
+        if self.head.is_null() {
+            unsafe { (*node).next = null_mut() };
+            self.head = node;
+            self.tail = node;
+            return;
+        }
+
+        let old_head = self.head;
+        self.head = node;
+
+        unsafe { (*self.head).next = old_head };
+        unsafe { (*old_head).prev = self.head };
+    }
+
+    unsafe fn pop_back(&mut self) -> *mut TimerState {
+        let node = self.tail;
+        if node.is_null() {
+            return null_mut();
+        }
+
+        let prev_node = unsafe { (*node).prev };
+        self.tail = prev_node;
+        if self.tail.is_null() {
+            self.head = null_mut();
+        } else {
+            unsafe { (*prev_node).next = null_mut() };
+        }
+
+        unsafe { (*node).next = null_mut() };
+        unsafe { (*node).prev = null_mut() };
+
+        node
+    }
+}
+
 #[derive(Debug)]
 struct Expiration {
     level: usize,
@@ -74,20 +125,14 @@ struct Expiration {
 struct Level {
     level: usize,
     occupied: u64,
-    slots: [*mut TimerState; NUM_SLOTS],
+    slots: [LinkedList; NUM_SLOTS],
 }
 
 impl Level {
     unsafe fn add_entry(&mut self, timer: *mut TimerState) {
-        let timer = unsafe { &mut *timer };
-        let slot = slot_for(timer.deadline, self.level);
-
-        if !self.slots[slot].is_null() {
-            unsafe { (*self.slots[slot]).prev = timer };
-        }
-
-        timer.next = self.slots[slot];
-        self.slots[slot] = timer;
+        let t = unsafe { &mut *timer };
+        let slot = slot_for(t.deadline, self.level);
+        unsafe { self.slots[slot].push_front(timer) };
         self.occupied |= 1 << slot;
     }
 
@@ -136,7 +181,7 @@ impl TimerWheel {
         let levels = from_fn(|i| Level {
             level: i,
             occupied: 0,
-            slots: [ptr::null_mut(); NUM_SLOTS],
+            slots: std::array::from_fn(|_| LinkedList::new()),
         });
 
         TimerWheel { elapsed: 0, levels }
@@ -147,16 +192,7 @@ impl TimerWheel {
         assert!(timer.deadline > self.elapsed);
 
         let level = level_for(self.elapsed, timer.deadline);
-        let slot = slot_for(timer.deadline, level);
-
-        let curr = self.levels[level].slots[slot];
-        if !curr.is_null() {
-            unsafe { (*curr).prev = timer };
-        }
-
-        timer.next = curr;
-        self.levels[level].slots[slot] = timer;
-        self.levels[level].occupied |= 1 << slot;
+        unsafe { self.levels[level].add_entry(timer) };
     }
 
     fn poll(&mut self, now: u64) {
@@ -185,16 +221,16 @@ impl TimerWheel {
     }
 
     fn process_expiration(&mut self, expiration: &Expiration) {
-        let mut timer_list = self.levels[expiration.level].slots[expiration.slot];
-        self.levels[expiration.level].slots[expiration.slot] = null_mut();
+        let mut timer_list = std::mem::replace(
+            &mut self.levels[expiration.level].slots[expiration.slot],
+            LinkedList::new(),
+        );
         self.levels[expiration.level].occupied &= !(1 << expiration.slot);
 
-        while !timer_list.is_null() {
-            let timer = unsafe { &mut *timer_list };
-            timer_list = timer.next;
-            timer.next = null_mut();
-            timer.prev = null_mut();
-
+        while let timer = unsafe { timer_list.pop_back() }
+            && !timer.is_null()
+        {
+            let timer = unsafe { &mut *timer };
             if timer.deadline <= expiration.deadline {
                 timer.waker.as_ref().unwrap().wake_by_ref();
             } else {
@@ -210,10 +246,7 @@ impl TimerWheel {
 
     fn set_elapsed(&mut self, when: u64) {
         assert!(self.elapsed <= when);
-
-        if when > self.elapsed {
-            self.elapsed = when;
-        }
+        self.elapsed = when;
     }
 }
 
