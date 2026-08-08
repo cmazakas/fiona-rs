@@ -101,6 +101,7 @@ impl File {
         let ref_count = unsafe {
             self.p
                 .as_ptr()
+                .cast::<u8>()
                 .add(offset_of!(FileImpl, fd_impl.ref_count))
                 .cast()
         };
@@ -366,6 +367,7 @@ impl Drop for WriteFuture<'_> {
             self.file
                 .p
                 .as_ptr()
+                .cast::<u8>()
                 .add(offset_of!(FileImpl, fd_impl.ref_count))
                 .cast()
         };
@@ -381,12 +383,12 @@ impl Drop for WriteFuture<'_> {
 
             let key = io_ops
                 .insert(make_io_uring_op(ref_count, OpType::DropCancel), &file_impl.fd_impl.ex);
-            unsafe { add_op_ref(ref_count) };
 
             let sqe = get_sqe(&file_impl.fd_impl.ex);
             let user_data = key.data().as_ffi();
             unsafe { io_uring_prep_cancel64(sqe, key_data, 0) };
             unsafe { io_uring_sqe_set_data64(sqe, user_data) };
+            unsafe { add_op_ref(ref_count) };
         } else {
             io_ops.remove(key).unwrap();
         }

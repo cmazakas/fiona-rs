@@ -186,7 +186,7 @@ impl TcpListener {
             self.p
                 .as_ptr()
                 .cast::<u8>()
-                .add(offset_of!(ListenerImpl, fd_impl.ref_count))
+                .add(offset_of!(ListenerImpl, fd_impl))
                 .cast()
         };
 
@@ -224,7 +224,7 @@ impl TcpListener {
             self.p
                 .as_ptr()
                 .cast::<u8>()
-                .add(offset_of!(ListenerImpl, fd_impl.ref_count))
+                .add(offset_of!(ListenerImpl, fd_impl))
                 .cast()
         };
 
@@ -739,7 +739,7 @@ impl TcpStream {
             self.p
                 .as_ptr()
                 .cast::<u8>()
-                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .add(offset_of!(StreamImpl, fd_impl))
                 .cast()
         };
 
@@ -777,7 +777,7 @@ impl TcpStream {
             self.p
                 .as_ptr()
                 .cast::<u8>()
-                .add(offset_of!(StreamImpl, fd_impl.ref_count))
+                .add(offset_of!(StreamImpl, fd_impl))
                 .cast()
         };
 

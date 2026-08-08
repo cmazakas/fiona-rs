@@ -15,18 +15,20 @@ CARGO_FLAGS=(--target x86_64-unknown-linux-gnu -Zbuild-std --tests)
 
 echo $ASAN_OPTIONS
 
-RUSTFLAGS='-Zsanitizer=address' \
+RUSTFLAGS='-Zsanitizer=address -Zrandomize-layout' \
 cargo test "${CARGO_FLAGS[@]}" --profile=release-with-debug --features=sanitizers -- --test-threads=1 --nocapture
 
-RUSTFLAGS='-Zsanitizer=thread' \
+RUSTFLAGS='-Zsanitizer=thread -Zrandomize-layout' \
 cargo test "${CARGO_FLAGS[@]}" --profile=release-with-debug -- --test-threads=1 --nocapture
 
+RUSTFLAGS='-Zrandomize-layout' \
 cargo test "${CARGO_FLAGS[@]}" --profile=release-with-debug -- --test-threads=1 --nocapture
 
-RUSTFLAGS='-Zsanitizer=address' \
+RUSTFLAGS='-Zsanitizer=address -Zrandomize-layout' \
 cargo test "${CARGO_FLAGS[@]}" --profile=lto --features=sanitizers -- --test-threads=1 --nocapture
 
-RUSTFLAGS='-Zsanitizer=thread' \
+RUSTFLAGS='-Zsanitizer=thread -Zrandomize-layout' \
 cargo test "${CARGO_FLAGS[@]}" --profile=lto -- --test-threads=1 --nocapture
 
+RUSTFLAGS='-Zrandomize-layout' \
 cargo test "${CARGO_FLAGS[@]}" --profile=lto -- --test-threads=1 --nocapture
