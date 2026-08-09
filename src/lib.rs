@@ -72,7 +72,7 @@ pub mod tls;
 use net::tcp::StreamImpl;
 use slotmap::{DefaultKey, KeyData};
 
-use crate::{io_ops::IoOpsMap, net::TcpStream};
+use crate::{io_ops::IoOpsMap, net::TcpStream, timer_wheel::TimerWheel};
 
 pub type Result<T> = std::result::Result<T, nix::Error>;
 
@@ -715,6 +715,8 @@ struct IoContextFrame {
     sender: RefCell<Sender<Weak>>,
     buf_groups: RefCell<HashMap<u16, Box<UnsafeCell<BufGroup>>>>,
     fixed_bufs: RefCell<FixedBufs>,
+    timer_wheel: RefCell<TimerWheel>,
+    wheel_start_time: Instant,
     local_task_queue: RefCell<VecDeque<Weak>>,
     io_ops: RefCell<IoOpsMap>,
     needs_wake: Arc<AlignedAtomicBool>,
@@ -1087,6 +1089,8 @@ impl IoContextBuilder {
             ioring: RefCell::new(ioring),
             buf_groups: RefCell::new(HashMap::new()),
             fixed_bufs: RefCell::new(FixedBufs::default()),
+            timer_wheel: RefCell::new(TimerWheel::new()),
+            wheel_start_time: Instant::now(),
             local_task_queue: RefCell::new(VecDeque::new()),
             io_ops: RefCell::new(IoOpsMap::with_capacity(1024)),
             needs_wake: Arc::new(AlignedAtomicBool(AtomicBool::new(true))),

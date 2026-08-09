@@ -12,8 +12,11 @@
 use std::{
     array::from_fn,
     ptr::{self, NonNull, null, null_mut},
-    task::LocalWaker,
+    task::{LocalWaker, Poll},
+    time::{Duration, Instant},
 };
+
+use crate::Executor;
 
 const NUM_LEVELS: usize = 6;
 const NUM_SLOTS: usize = 64;
@@ -62,6 +65,7 @@ struct TimerState {
     next: *mut TimerState,
     waker: Option<LocalWaker>,
     deadline: u64,
+    done: bool,
 }
 
 struct LinkedList {
@@ -171,13 +175,13 @@ impl Level {
     }
 }
 
-struct TimerWheel {
+pub(crate) struct TimerWheel {
     elapsed: u64,
     levels: [Level; NUM_LEVELS],
 }
 
 impl TimerWheel {
-    fn new() -> TimerWheel {
+    pub(crate) fn new() -> TimerWheel {
         let levels = from_fn(|i| Level {
             level: i,
             occupied: 0,
@@ -233,6 +237,7 @@ impl TimerWheel {
             let timer = unsafe { &mut *timer };
             if timer.deadline <= expiration.deadline {
                 timer.waker.as_ref().unwrap().wake_by_ref();
+                timer.done = true;
             } else {
                 let level = level_for(expiration.deadline, timer.deadline);
                 unsafe { self.levels[level].add_entry(timer) };
@@ -247,6 +252,44 @@ impl TimerWheel {
     fn set_elapsed(&mut self, when: u64) {
         assert!(self.elapsed <= when);
         self.elapsed = when;
+    }
+}
+
+struct TimerFuture {
+    state: TimerState,
+    ex: Executor,
+    duration: Duration,
+    initiated: bool,
+    completed: bool,
+}
+
+impl Future for TimerFuture {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        assert!(!self.completed);
+        match (self.initiated, self.state.done) {
+            (true, false) => Poll::Pending,
+            (false, true) => unreachable!(),
+            (true, true) => {
+                self.completed = true;
+                Poll::Ready(())
+            }
+            (false, false) => {
+                let deadline = Instant::now() + self.duration;
+                let dur_since = deadline.duration_since(self.ex.p.wheel_start_time);
+
+                let deadline: u64 = dur_since.as_millis().try_into().unwrap();
+                self.state.deadline = deadline;
+
+                let state = &raw mut self.state;
+                unsafe { self.ex.p.timer_wheel.borrow_mut().add_timer(state) };
+                self.initiated = true;
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -331,12 +374,14 @@ mod test {
             next: ptr::null_mut(),
             waker: Some(cx.local_waker().clone()),
             deadline: 13,
+            done: false,
         };
 
         let mut timer2 = TimerState {
             prev: ptr::null_mut(),
             next: ptr::null_mut(),
             waker: Some(cx.local_waker().clone()),
+            done: false,
             deadline: 27,
         };
 
@@ -344,6 +389,7 @@ mod test {
             prev: ptr::null_mut(),
             next: ptr::null_mut(),
             waker: Some(cx.local_waker().clone()),
+            done: false,
             deadline: 63,
         };
 
@@ -356,6 +402,7 @@ mod test {
             next: ptr::null_mut(),
             waker: Some(cx.local_waker().clone()),
             deadline: 13,
+            done: false,
         };
 
         let mut timer2_copy = TimerState {
@@ -363,6 +410,7 @@ mod test {
             next: ptr::null_mut(),
             waker: Some(cx.local_waker().clone()),
             deadline: 27,
+            done: false,
         };
 
         let mut timer3_copy = TimerState {
@@ -370,6 +418,7 @@ mod test {
             next: ptr::null_mut(),
             waker: Some(cx.local_waker().clone()),
             deadline: 63,
+            done: false,
         };
 
         unsafe { timer_wheel.add_timer(&raw mut timer1_copy) };
@@ -400,6 +449,7 @@ mod test {
             next: ptr::null_mut(),
             waker: Some(cx.local_waker().clone()),
             deadline,
+            done: false,
         }
     }
 
