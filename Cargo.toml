@@ -6,6 +6,7 @@
 name = "fiona"
 version = "0.1.0"
 edition = "2024"
+documentation = "https://cmazakas.github.io/fiona-rs/"
 
 [dependencies]
 axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "7d982c1ada5ac747c7e5f4f4d8bff8f2be6415a4" }
