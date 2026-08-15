@@ -24,6 +24,8 @@ const LEVEL_MULT: usize = 64;
 
 const MAX_DURATION: u64 = (1 << (6 * NUM_LEVELS)) - 1;
 
+//-----------------------------------------------------------------------------
+
 fn level_for(elapsed: u64, when: u64) -> usize {
     // Obtain the most significant bit where `when` and `elapsed` diverge. This
     // difference is what determines which level/slot we place this timer into.
@@ -60,6 +62,8 @@ fn level_range(level: usize) -> u64 {
     LEVEL_MULT as u64 * slot_range(level)
 }
 
+//-----------------------------------------------------------------------------
+
 struct TimerState {
     prev: *mut TimerState,
     next: *mut TimerState,
@@ -67,6 +71,8 @@ struct TimerState {
     deadline: u64,
     done: bool,
 }
+
+//-----------------------------------------------------------------------------
 
 struct LinkedList {
     head: *mut TimerState,
@@ -119,12 +125,16 @@ impl LinkedList {
     }
 }
 
+//-----------------------------------------------------------------------------
+
 #[derive(Debug)]
 struct Expiration {
     level: usize,
     slot: usize,
     deadline: u64,
 }
+
+//-----------------------------------------------------------------------------
 
 struct Level {
     level: usize,
@@ -175,6 +185,8 @@ impl Level {
     }
 }
 
+//-----------------------------------------------------------------------------
+
 pub(crate) struct TimerWheel {
     elapsed: u64,
     levels: [Level; NUM_LEVELS],
@@ -199,7 +211,7 @@ impl TimerWheel {
         unsafe { self.levels[level].add_entry(timer) };
     }
 
-    fn poll(&mut self, now: u64) {
+    pub(crate) fn poll(&mut self, now: u64) {
         loop {
             match self.next_expiration() {
                 Some(ref expiration) if expiration.deadline <= now => {
@@ -222,6 +234,10 @@ impl TimerWheel {
         }
 
         None
+    }
+
+    pub(crate) fn next_expiration_time(&self) -> Option<u64> {
+        self.next_expiration().map(|ex| ex.deadline)
     }
 
     fn process_expiration(&mut self, expiration: &Expiration) {
@@ -255,6 +271,8 @@ impl TimerWheel {
     }
 }
 
+//-----------------------------------------------------------------------------
+
 struct TimerFuture {
     state: TimerState,
     ex: Executor,
@@ -271,7 +289,10 @@ impl Future for TimerFuture {
     ) -> std::task::Poll<Self::Output> {
         assert!(!self.completed);
         match (self.initiated, self.state.done) {
-            (true, false) => Poll::Pending,
+            (true, false) => {
+                self.state.waker = Some(cx.local_waker().clone());
+                Poll::Pending
+            }
             (false, true) => unreachable!(),
             (true, true) => {
                 self.completed = true;
@@ -287,11 +308,32 @@ impl Future for TimerFuture {
                 let state = &raw mut self.state;
                 unsafe { self.ex.p.timer_wheel.borrow_mut().add_timer(state) };
                 self.initiated = true;
+                self.state.waker = Some(cx.local_waker().clone());
                 Poll::Pending
             }
         }
     }
 }
+
+//-----------------------------------------------------------------------------
+
+pub fn sleep_for(ex: &Executor, duration: Duration) -> impl Future<Output = ()> {
+    TimerFuture {
+        state: TimerState {
+            prev: null_mut(),
+            next: null_mut(),
+            waker: None,
+            deadline: 0,
+            done: false,
+        },
+        ex: ex.clone(),
+        duration,
+        initiated: false,
+        completed: false,
+    }
+}
+
+//-----------------------------------------------------------------------------v
 
 #[cfg(test)]
 mod test {
