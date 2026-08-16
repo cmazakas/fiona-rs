@@ -28,7 +28,7 @@ use std::{
     mem::{ManuallyDrop, forget},
     ops::{Deref, DerefMut},
     pin::Pin,
-    ptr::{self, DynMetadata, NonNull, metadata, null_mut},
+    ptr::{self, DynMetadata, NonNull, metadata},
     range::Range,
     rc::Rc,
     slice,
@@ -60,8 +60,7 @@ use liburing_rs::{
     io_uring_register_ring_fd, io_uring_register_sync_msg, io_uring_setup_buf_ring,
     io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data, io_uring_sqe_set_data64,
     io_uring_sqe_set_flags, io_uring_submit_and_get_events, io_uring_submit_and_wait,
-    io_uring_submit_and_wait_timeout, io_uring_unregister_buf_ring, io_uring_unregister_buffers,
-    iovec,
+    io_uring_unregister_buf_ring, io_uring_unregister_buffers, iovec,
 };
 
 pub mod fs;
@@ -73,7 +72,11 @@ pub mod tls;
 use net::tcp::StreamImpl;
 use slotmap::{DefaultKey, KeyData};
 
-use crate::{io_ops::IoOpsMap, net::TcpStream, timer_wheel::TimerWheel};
+use crate::{
+    io_ops::IoOpsMap,
+    net::TcpStream,
+    timer_wheel::{TimerWheel, round_up_ms},
+};
 
 pub type Result<T> = std::result::Result<T, nix::Error>;
 
@@ -966,13 +969,7 @@ impl IoContext {
         let wheel_start_time = ex.p.wheel_start_time;
         loop {
             {
-                let now = Instant::now();
-                let now = now
-                    .duration_since(wheel_start_time)
-                    .as_millis()
-                    .try_into()
-                    .unwrap();
-
+                let now = wheel_start_time.elapsed().as_millis().try_into().unwrap();
                 ex.p.timer_wheel.borrow_mut().poll(now);
             }
 
@@ -987,30 +984,23 @@ impl IoContext {
             }
 
             if let Some(next) = ex.p.timer_wheel.borrow().next_expiration_time() {
+                let now = Instant::now();
                 let next_timeout = wheel_start_time + Duration::from_millis(next);
-                let mut sleep_time = next_timeout.saturating_duration_since(Instant::now());
-
                 // io_uring isn't epoll and supports sub-millisecond timeouts _too_ well, so we
                 // have to manually round up to the nearest whole ms otherwise we fire timers a
                 // tad too early.
-                sleep_time += Duration::from_millis(1);
+                let sleep_time = round_up_ms(next_timeout.saturating_duration_since(now));
 
-                let mut ts: __kernel_timespec = sleep_time.into();
-                // TODO: figure out the CQE storage situation to solve soundness issues.
-                let mut cqe = null_mut();
-                unsafe {
-                    io_uring_submit_and_wait_timeout(
-                        ring,
-                        &raw mut cqe,
-                        1,
-                        &raw mut ts,
-                        null_mut(),
-                    );
-                }
+                let sqe = get_sqe(&ex);
+                let ts: __kernel_timespec = sleep_time.into();
+                unsafe { io_uring_sqe_set_data64(sqe, 0) };
+                unsafe { io_uring_prep_timeout(sqe, &raw const ts, 0, 0) };
+
+                // Must submit here as otherwise we have a stack UAF.
+                unsafe { io_uring_submit_and_wait(ring, 1) };
             } else {
                 unsafe { io_uring_submit_and_wait(ring, 1) };
             }
-
             process_cqes(&ex);
         }
 

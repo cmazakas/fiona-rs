@@ -23,7 +23,8 @@ impl Drop for DurationGuard {
         let now = Instant::now();
         let d = now - self.timepoint;
         assert!(d >= self.dur, "{d:?} vs {:?}", self.dur);
-        assert!(d <= Duration::from_secs_f64(self.dur.as_secs_f64() * 1.05));
+        let max = Duration::from_secs_f64(self.dur.as_secs_f64() * 1.05);
+        assert!(d <= max, "{d:?} <= {max:?}");
     }
 }
 
@@ -52,9 +53,26 @@ fn time_wheel_sleep_multi() {
     ex.spawn({
         let ex = ex.clone();
         async move {
+            let sleep_time = Duration::from_millis(100);
+
             for _ in 0..3 {
-                let _guard = DurationGuard::new(Duration::from_millis(100));
-                fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(100)).await;
+                let _guard = DurationGuard::new(sleep_time);
+                fiona::timer_wheel::sleep_for(&ex, sleep_time).await;
+            }
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let sleep_time = Duration::from_millis(30);
+
+            for _ in 0..3 {
+                let _guard = DurationGuard::new(sleep_time);
+                fiona::timer_wheel::sleep_for(&ex, sleep_time).await;
             }
         }
     });

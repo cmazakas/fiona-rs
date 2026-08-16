@@ -300,7 +300,7 @@ impl Future for TimerFuture {
             }
             (false, false) => {
                 let deadline = Instant::now() + self.duration;
-                let dur_since = deadline.duration_since(self.ex.p.wheel_start_time);
+                let dur_since = round_up_ms(deadline.duration_since(self.ex.p.wheel_start_time));
 
                 let deadline: u64 = dur_since.as_millis().try_into().unwrap();
                 self.state.deadline = deadline;
@@ -333,7 +333,19 @@ pub fn sleep_for(ex: &Executor, duration: Duration) -> impl Future<Output = ()> 
     }
 }
 
-//-----------------------------------------------------------------------------v
+//-----------------------------------------------------------------------------
+
+pub(crate) fn round_up_ms(dur: Duration) -> Duration {
+    let s = dur.as_secs();
+    let mut ms = dur.subsec_millis();
+    let us = dur.subsec_micros();
+    if us == ms * 1_000 {
+        return dur;
+    }
+    Duration::new(s, (ms + 1) * 1_000_000)
+}
+
+//-----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod test {
@@ -613,5 +625,20 @@ mod test {
             .collect::<Vec<_>>();
 
         assert_eq!(*queue.borrow(), expected);
+    }
+
+    #[test]
+    fn timer_wheel_round_up_ms() {
+        let test_cases = vec![
+            (1_000_500_000, 1_001_000_000),
+            (1_456_400_000, 1_457_000_000),
+            (1_456_004_000, 1_457_000_000),
+            (1_456_000_000, 1_456_000_000),
+            (1_456_000_123, 1_456_000_123),
+        ];
+
+        for &(x, expected) in &test_cases {
+            assert_eq!(round_up_ms(Duration::from_nanos(x)), Duration::from_nanos(expected));
+        }
     }
 }
