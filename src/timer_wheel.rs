@@ -318,6 +318,7 @@ impl Future for TimerFuture {
 //-----------------------------------------------------------------------------
 
 pub fn sleep_for(ex: &Executor, duration: Duration) -> impl Future<Output = ()> {
+    let duration = round_up_ms(duration);
     TimerFuture {
         state: TimerState {
             prev: null_mut(),
