@@ -91,17 +91,17 @@ dependencies = [
 
 [[package]]
 name = "axboe-liburing"
-version = "2.15.3"
-source = "git+https://github.com/cmazakas/liburing.git?rev=7d982c1ada5ac747c7e5f4f4d8bff8f2be6415a4#7d982c1ada5ac747c7e5f4f4d8bff8f2be6415a4"
+version = "2.16.0"
+source = "git+https://github.com/cmazakas/liburing.git?rev=aec39b1552b7dc62af8edc4c2d5a79b156baec01#aec39b1552b7dc62af8edc4c2d5a79b156baec01"
 dependencies = [
  "bindgen",
 ]
 
 [[package]]
 name = "bindgen"
-version = "0.71.1"
+version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
 dependencies = [
  "bitflags",
  "cexpr",
