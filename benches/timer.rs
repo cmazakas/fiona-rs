@@ -4,41 +4,57 @@
 
 mod utils;
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicI32, Ordering::Relaxed},
-    },
-    time::Duration,
-};
+use std::time::Duration;
 
-async fn timer_op(ex: fiona::Executor, anums: Arc<AtomicI32>) {
-    let timer = fiona::time::Timer::new(&ex);
-    for _ in 0..10_000 {
-        assert!(timer.wait(Duration::from_millis(1)).await.is_ok());
-        anums.fetch_add(1, Relaxed);
-    }
-}
+use tokio::task::JoinSet;
+
+const NUM_TIMERS: usize = 1_000_000;
 
 fn fiona_timer() -> Result<(), String> {
-    let mut ioc = fiona::IoContext::builder()
-        .sq_entries(16 * 1024)
-        .cq_entries(16 * 1024)
-        .build();
-
+    let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
-    let anums = Arc::new(AtomicI32::new(0));
-    for _ in 0..10_000 {
-        ex.spawn(timer_op(ex.clone(), anums.clone()));
+    for _ in 0..NUM_TIMERS {
+        ex.spawn({
+            let ex = ex.clone();
+            async move {
+                let sleep_time = Duration::from_millis(100);
+                fiona::timer_wheel::sleep_for(&ex, sleep_time).await;
+            }
+        });
     }
 
-    ioc.run();
-    assert_eq!(anums.load(Relaxed), 10_000 * 10_000);
+    let n = ioc.run();
+    assert_eq!(n, NUM_TIMERS as _);
+
+    Ok(())
+}
+
+fn tokio_timer() -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let sleep_time = Duration::from_millis(100);
+
+        let mut join_set = JoinSet::new();
+
+        for _ in 0..NUM_TIMERS {
+            join_set.spawn(async move {
+                tokio::time::sleep(sleep_time).await;
+            });
+        }
+
+        let done = join_set.join_all().await;
+        assert_eq!(done.len(), NUM_TIMERS)
+    });
 
     Ok(())
 }
 
 fn main() {
     utils::run_once("fiona_timer", fiona_timer).unwrap();
+    utils::run_once("tokio_timer", tokio_timer).unwrap();
 }
