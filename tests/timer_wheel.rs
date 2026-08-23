@@ -2,7 +2,10 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-use std::time::{Duration, Instant};
+use std::{
+    task::{Context, Waker},
+    time::{Duration, Instant},
+};
 
 use futures::{StreamExt, stream::FuturesUnordered};
 
@@ -171,4 +174,96 @@ fn timer_wheel_stress_test() {
 
     let n = ioc.run();
     assert_eq!(n, 1);
+}
+
+#[test]
+fn timer_wheel_externally_polled() {
+    // Test what happens when we externally create a timer_wheel::TimerFuture, poll
+    // it manually and then drop the backing I/O context and all other external
+    // Executor instances. The TimerFuture should keep the runtime data alive and
+    // because it was not dropped, its entry in the timer wheel should be active. If
+    // we wait long enough inside our run of the event loop, it should be marked
+    // complete.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let timer_future = fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(100));
+    let timer_future2 = fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(10000));
+
+    let mut cx = Context::from_waker(Waker::noop());
+
+    let mut timer_future = std::pin::pin!(timer_future);
+    assert!(timer_future.as_mut().poll(&mut cx).is_pending());
+
+    let mut timer_future2 = std::pin::pin!(timer_future2);
+    assert!(timer_future2.as_mut().poll(&mut cx).is_pending());
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let _guard = DurationGuard::new(Duration::from_millis(500));
+            fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(500)).await;
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+
+    drop(ioc);
+    drop(ex);
+
+    assert!(timer_future.as_mut().poll(&mut cx).is_ready());
+    assert!(timer_future2.as_mut().poll(&mut cx).is_pending());
+}
+
+#[test]
+fn timer_wheel_externally_polled_double_run() {
+    // Same as the test above be we spread it out over 2 `ioc.run()` calls.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let timer_future = fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(100));
+    let timer_future2 = fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(1000));
+
+    let mut cx = Context::from_waker(Waker::noop());
+
+    let mut timer_future = std::pin::pin!(timer_future);
+    assert!(timer_future.as_mut().poll(&mut cx).is_pending());
+
+    let mut timer_future2 = std::pin::pin!(timer_future2);
+    assert!(timer_future2.as_mut().poll(&mut cx).is_pending());
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let _guard = DurationGuard::new(Duration::from_millis(500));
+            fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(500)).await;
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+
+    assert!(timer_future.as_mut().poll(&mut cx).is_ready());
+    assert!(timer_future2.as_mut().poll(&mut cx).is_pending());
+
+    // This proves that our wheel start time member is preserved properly and the
+    // TimerWheel works properly when spread across multiple run() calls.
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let _guard = DurationGuard::new(Duration::from_millis(500));
+            fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(500)).await;
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+
+    drop(ioc);
+    drop(ex);
+
+    assert!(timer_future2.as_mut().poll(&mut cx).is_ready());
 }
