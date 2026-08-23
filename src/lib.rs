@@ -28,7 +28,7 @@ use std::{
     mem::{ManuallyDrop, forget},
     ops::{Deref, DerefMut},
     pin::Pin,
-    ptr::{self, DynMetadata, NonNull, metadata},
+    ptr::{self, DynMetadata, NonNull, metadata, null_mut},
     range::Range,
     rc::Rc,
     slice,
@@ -60,7 +60,8 @@ use liburing_rs::{
     io_uring_register_ring_fd, io_uring_register_sync_msg, io_uring_setup_buf_ring,
     io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data, io_uring_sqe_set_data64,
     io_uring_sqe_set_flags, io_uring_submit_and_get_events, io_uring_submit_and_wait,
-    io_uring_unregister_buf_ring, io_uring_unregister_buffers, iovec,
+    io_uring_submit_and_wait_timeout, io_uring_unregister_buf_ring, io_uring_unregister_buffers,
+    iovec,
 };
 
 pub mod fs;
@@ -991,16 +992,21 @@ impl IoContext {
                 // tad too early.
                 let sleep_time = round_up_ms(next_timeout.saturating_duration_since(now));
 
-                let sqe = get_sqe(&ex);
-                let ts: __kernel_timespec = sleep_time.into();
-                unsafe { io_uring_sqe_set_data64(sqe, 0) };
-                unsafe { io_uring_prep_timeout(sqe, &raw const ts, 0, 0) };
-
-                // Must submit here as otherwise we have a stack UAF.
-                unsafe { io_uring_submit_and_wait(ring, 1) };
+                let mut ts: __kernel_timespec = sleep_time.into();
+                let mut cqe = null_mut();
+                unsafe {
+                    io_uring_submit_and_wait_timeout(
+                        ring,
+                        &raw mut cqe,
+                        1,
+                        &raw mut ts,
+                        null_mut(),
+                    );
+                }
             } else {
                 unsafe { io_uring_submit_and_wait(ring, 1) };
             }
+
             process_cqes(&ex);
         }
 
