@@ -70,6 +70,7 @@ struct TimerState {
     waker: Option<LocalWaker>,
     deadline: u64,
     done: bool,
+    eager_dropped: bool,
 }
 
 //-----------------------------------------------------------------------------
@@ -144,8 +145,7 @@ struct Level {
 
 impl Level {
     unsafe fn add_entry(&mut self, timer: *mut TimerState) {
-        let t = unsafe { &mut *timer };
-        let slot = slot_for(t.deadline, self.level);
+        let slot = slot_for(unsafe { (*timer).deadline }, self.level);
         unsafe { self.slots[slot].push_front(timer) };
         self.occupied |= 1 << slot;
     }
@@ -204,10 +204,9 @@ impl TimerWheel {
     }
 
     unsafe fn add_timer(&mut self, timer: *mut TimerState) {
-        let timer = unsafe { &mut *timer };
-        assert!(timer.deadline > self.elapsed);
+        assert!(unsafe { (*timer).deadline } > self.elapsed);
 
-        let level = level_for(self.elapsed, timer.deadline);
+        let level = level_for(self.elapsed, unsafe { (*timer).deadline });
         unsafe { self.levels[level].add_entry(timer) };
     }
 
@@ -250,12 +249,11 @@ impl TimerWheel {
         while let timer = unsafe { timer_list.pop_back() }
             && !timer.is_null()
         {
-            let timer = unsafe { &mut *timer };
-            if timer.deadline <= expiration.deadline {
-                timer.waker.as_ref().unwrap().wake_by_ref();
-                timer.done = true;
+            if unsafe { (*timer).deadline } <= expiration.deadline {
+                unsafe { (*timer).waker.as_ref().unwrap().wake_by_ref() };
+                unsafe { (*timer).done = true };
             } else {
-                let level = level_for(expiration.deadline, timer.deadline);
+                let level = level_for(expiration.deadline, unsafe { (*timer).deadline });
                 unsafe { self.levels[level].add_entry(timer) };
             }
         }
@@ -299,16 +297,18 @@ impl Future for TimerFuture {
                 Poll::Ready(())
             }
             (false, false) => {
+                let ex = self.ex.clone();
+
                 let deadline = Instant::now() + self.duration;
                 let dur_since = round_up_ms(deadline.duration_since(self.ex.p.wheel_start_time));
 
                 let deadline: u64 = dur_since.as_millis().try_into().unwrap();
-                self.state.deadline = deadline;
+                self.initiated = true;
 
                 let state = &raw mut self.state;
-                unsafe { self.ex.p.timer_wheel.borrow_mut().add_timer(state) };
-                self.initiated = true;
-                self.state.waker = Some(cx.local_waker().clone());
+                unsafe { (*state).deadline = deadline };
+                unsafe { (*state).waker = Some(cx.local_waker().clone()) };
+                unsafe { ex.p.timer_wheel.borrow_mut().add_timer(state) };
                 Poll::Pending
             }
         }
@@ -326,6 +326,7 @@ pub fn sleep_for(ex: &Executor, duration: Duration) -> impl Future<Output = ()> 
             waker: None,
             deadline: 0,
             done: false,
+            eager_dropped: false,
         },
         ex: ex.clone(),
         duration,
@@ -430,6 +431,7 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             deadline: 13,
             done: false,
+            eager_dropped: false,
         };
 
         let mut timer2 = TimerState {
@@ -438,6 +440,7 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             done: false,
             deadline: 27,
+            eager_dropped: false,
         };
 
         let mut timer3 = TimerState {
@@ -446,6 +449,7 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             done: false,
             deadline: 63,
+            eager_dropped: false,
         };
 
         unsafe { timer_wheel.add_timer(&raw mut timer1) };
@@ -458,6 +462,7 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             deadline: 13,
             done: false,
+            eager_dropped: false,
         };
 
         let mut timer2_copy = TimerState {
@@ -466,6 +471,7 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             deadline: 27,
             done: false,
+            eager_dropped: false,
         };
 
         let mut timer3_copy = TimerState {
@@ -474,6 +480,7 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             deadline: 63,
             done: false,
+            eager_dropped: false,
         };
 
         unsafe { timer_wheel.add_timer(&raw mut timer1_copy) };
@@ -505,6 +512,7 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             deadline,
             done: false,
+            eager_dropped: false,
         }
     }
 
