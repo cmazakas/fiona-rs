@@ -11,6 +11,9 @@
 
 use std::{
     array::from_fn,
+    cell::{Cell, UnsafeCell},
+    marker::PhantomPinned,
+    pin::UnsafePinned,
     ptr::{self, NonNull, null, null_mut},
     task::{LocalWaker, Poll},
     time::{Duration, Instant},
@@ -70,7 +73,6 @@ struct TimerState {
     waker: Option<LocalWaker>,
     deadline: u64,
     done: bool,
-    eager_dropped: bool,
 }
 
 //-----------------------------------------------------------------------------
@@ -124,6 +126,35 @@ impl LinkedList {
 
         node
     }
+
+    unsafe fn remove(&mut self, timer: *mut TimerState) {
+        let prev = unsafe { (*timer).prev };
+        let next = unsafe { (*timer).next };
+        unsafe { (*timer).prev = null_mut() };
+        unsafe { (*timer).next = null_mut() };
+
+        if !prev.is_null() {
+            unsafe { (*prev).next = next };
+        }
+
+        if !next.is_null() {
+            unsafe { (*next).prev = prev };
+        }
+
+        if timer == self.head {
+            assert!(prev.is_null());
+            self.head = next;
+        }
+
+        if timer == self.tail {
+            assert!(next.is_null());
+            self.tail = prev;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head.is_null()
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -148,6 +179,14 @@ impl Level {
         let slot = slot_for(unsafe { (*timer).deadline }, self.level);
         unsafe { self.slots[slot].push_front(timer) };
         self.occupied |= 1 << slot;
+    }
+
+    unsafe fn remove_entry(&mut self, timer: *mut TimerState) {
+        let slot = slot_for(unsafe { (*timer).deadline }, self.level);
+        unsafe { self.slots[slot].remove(timer) };
+        if self.slots[slot].is_empty() {
+            self.occupied &= !(1 << slot);
+        }
     }
 
     fn next_occupied_slot(&self, now: u64) -> Option<usize> {
@@ -208,6 +247,11 @@ impl TimerWheel {
 
         let level = level_for(self.elapsed, unsafe { (*timer).deadline });
         unsafe { self.levels[level].add_entry(timer) };
+    }
+
+    unsafe fn remove_timer(&mut self, timer: *mut TimerState) {
+        let level = level_for(self.elapsed, unsafe { (*timer).deadline });
+        unsafe { self.levels[level].remove_entry(timer) };
     }
 
     pub(crate) fn poll(&mut self, now: u64) {
@@ -272,40 +316,43 @@ impl TimerWheel {
 //-----------------------------------------------------------------------------
 
 struct TimerFuture {
-    state: TimerState,
+    state: UnsafePinned<TimerState>,
     ex: Executor,
-    duration: Duration,
-    initiated: bool,
-    completed: bool,
+    duration: Cell<Duration>,
+    initiated: Cell<bool>,
+    completed: Cell<bool>,
 }
 
 impl Future for TimerFuture {
     type Output = ();
 
     fn poll(
-        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+        self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        assert!(!self.completed);
-        match (self.initiated, self.state.done) {
+        assert!(!self.completed.get());
+
+        let state = &self.state;
+        let state = state.get();
+
+        match (self.initiated.get(), unsafe { (*state).done }) {
             (true, false) => {
-                self.state.waker = Some(cx.local_waker().clone());
+                unsafe { (*state).waker = Some(cx.local_waker().clone()) };
                 Poll::Pending
             }
             (false, true) => unreachable!(),
             (true, true) => {
-                self.completed = true;
+                self.completed.set(true);
                 Poll::Ready(())
             }
             (false, false) => {
                 let ex = self.ex.clone();
 
-                let deadline = Instant::now() + self.duration;
+                let deadline = Instant::now() + self.duration.get();
                 let dur_since = round_up_ms(deadline.duration_since(self.ex.p.wheel_start_time));
 
                 let deadline: u64 = dur_since.as_millis().try_into().unwrap();
-                self.initiated = true;
+                self.initiated.set(true);
 
-                let state = &raw mut self.state;
                 unsafe { (*state).deadline = deadline };
                 unsafe { (*state).waker = Some(cx.local_waker().clone()) };
                 unsafe { ex.p.timer_wheel.borrow_mut().add_timer(state) };
@@ -315,23 +362,38 @@ impl Future for TimerFuture {
     }
 }
 
+impl Drop for TimerFuture {
+    fn drop(&mut self) {
+        if self.completed.get() || !self.initiated.get() {
+            return;
+        }
+
+        unsafe {
+            self.ex
+                .p
+                .timer_wheel
+                .borrow_mut()
+                .remove_timer(self.state.get());
+        }
+    }
+}
+
 //-----------------------------------------------------------------------------
 
 pub fn sleep_for(ex: &Executor, duration: Duration) -> impl Future<Output = ()> + 'static {
-    let duration = round_up_ms(duration);
+    let duration = Cell::new(round_up_ms(duration));
     TimerFuture {
-        state: TimerState {
+        state: UnsafePinned::new(TimerState {
             prev: null_mut(),
             next: null_mut(),
             waker: None,
             deadline: 0,
             done: false,
-            eager_dropped: false,
-        },
+        }),
         ex: ex.clone(),
         duration,
-        initiated: false,
-        completed: false,
+        initiated: Cell::new(false),
+        completed: Cell::new(false),
     }
 }
 
@@ -431,7 +493,6 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             deadline: 13,
             done: false,
-            eager_dropped: false,
         };
 
         let mut timer2 = TimerState {
@@ -440,7 +501,6 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             done: false,
             deadline: 27,
-            eager_dropped: false,
         };
 
         let mut timer3 = TimerState {
@@ -449,7 +509,6 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             done: false,
             deadline: 63,
-            eager_dropped: false,
         };
 
         unsafe { timer_wheel.add_timer(&raw mut timer1) };
@@ -462,7 +521,6 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             deadline: 13,
             done: false,
-            eager_dropped: false,
         };
 
         let mut timer2_copy = TimerState {
@@ -471,7 +529,6 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             deadline: 27,
             done: false,
-            eager_dropped: false,
         };
 
         let mut timer3_copy = TimerState {
@@ -480,7 +537,6 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             deadline: 63,
             done: false,
-            eager_dropped: false,
         };
 
         unsafe { timer_wheel.add_timer(&raw mut timer1_copy) };
@@ -512,7 +568,6 @@ mod test {
             waker: Some(cx.local_waker().clone()),
             deadline,
             done: false,
-            eager_dropped: false,
         }
     }
 

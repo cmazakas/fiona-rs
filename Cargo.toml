@@ -16,6 +16,7 @@ slotmap = { version = "1.1.1" }
 
 [features]
 sanitizers = ["axboe-liburing/sanitizers"]
+bsan = []
 
 [dev-dependencies]
 blake2 = "0.10.6"

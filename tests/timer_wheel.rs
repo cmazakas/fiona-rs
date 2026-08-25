@@ -3,6 +3,9 @@
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    pin::{Pin, pin},
+    sync::Arc,
     task::{Context, Wake, Waker},
     time::{Duration, Instant},
 };
@@ -38,15 +41,19 @@ impl Drop for DurationGuard {
     fn drop(&mut self) {
         let now = Instant::now();
         let d = now - self.timepoint;
-        if d < self.dur {
-            eprintln!("{d:?} vs {:?}", self.dur);
-        }
-        // assert!(d >= self.dur, "{d:?} vs {:?}", self.dur);
         let max = self.max;
-        if d > max {
-            eprintln!("{d:?} <= {max:?}");
+
+        if cfg!(feature = "bsan") {
+            if d < self.dur {
+                eprintln!("{d:?} vs {:?}", self.dur);
+            }
+            if d > max {
+                eprintln!("{d:?} <= {max:?}");
+            }
+        } else {
+            assert!(d >= self.dur, "{d:?} vs {:?}", self.dur);
+            assert!(d <= max, "{d:?} <= {max:?}");
         }
-        // assert!(d <= max, "{d:?} <= {max:?}");
     }
 }
 
@@ -173,7 +180,8 @@ fn timer_wheel_stress_test() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let num_timers = 100;
+            let num_timers = if cfg!(feature = "bsan") { 100 } else { 100_000 };
+
             let sleep_time = Duration::from_millis(100);
 
             let join_set: FuturesUnordered<_> =
@@ -188,6 +196,28 @@ fn timer_wheel_stress_test() {
 
     let n = ioc.run();
     assert_eq!(n, 1);
+}
+
+#[test]
+fn timer_wheel_panic() {
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(100)).await;
+        }
+    });
+
+    ex.spawn(async { panic!() });
+
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            ioc.run();
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -291,6 +321,93 @@ fn timer_wheel_cancel_on_drop() {
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let mut noop_ctx = std::task::Context::from_waker(Waker::noop());
+            let poison_waker = Arc::new(PoisonWaker {}).into();
+            let mut poison_ctx = std::task::Context::from_waker(&poison_waker);
+
+            let _guard = DurationGuard::new(Duration::from_millis(321));
+
+            let mut t1 = pin!(fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(250)));
+            assert!(t1.as_mut().poll(&mut noop_ctx).is_pending());
+
+            {
+                let mut t2 = pin!(fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(100)));
+                assert!(t2.as_mut().poll(&mut poison_ctx).is_pending());
+            }
+
+            let mut t3 = pin!(fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(300)));
+            assert!(t3.as_mut().poll(&mut noop_ctx).is_pending());
+
+            {
+                let mut t4 = pin!(fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(123)));
+                assert!(t4.as_mut().poll(&mut poison_ctx).is_pending());
+            }
+
+            let mut t5 = pin!(fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(321)));
+            assert!(t5.as_mut().poll(&mut noop_ctx).is_pending());
+
+            {
+                let mut t6 = pin!(fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(50)));
+                assert!(t6.as_mut().poll(&mut poison_ctx).is_pending());
+            }
+
+            t3.await;
+            t5.await;
+            t1.await;
+        }
+    });
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let poison_waker = Arc::new(PoisonWaker {}).into();
+            let mut poison_ctx = std::task::Context::from_waker(&poison_waker);
+
+            let _guard = DurationGuard::new(Duration::from_millis(250));
+
+            {
+                let mut t1 = pin!(fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(250)));
+                assert!(t1.as_mut().poll(&mut poison_ctx).is_pending());
+            }
+
+            fiona::time::sleep(&ex, Duration::from_millis(250)).await;
+        }
+    });
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let poison_waker = Arc::new(PoisonWaker {}).into();
+            let mut poison_ctx = std::task::Context::from_waker(&poison_waker);
+
+            let _guard = DurationGuard::new(Duration::from_millis(250));
+
+            {
+                let mut t1 = fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(250));
+                assert!(unsafe {
+                    Pin::new_unchecked(&mut t1)
+                        .poll(&mut poison_ctx)
+                        .is_pending()
+                });
+
+                let mut t2 = fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(250));
+                assert!(unsafe {
+                    Pin::new_unchecked(&mut t2)
+                        .poll(&mut poison_ctx)
+                        .is_pending()
+                });
+
+                drop(t1);
+                drop(t2);
+            }
+
+            fiona::time::sleep(&ex, Duration::from_millis(250)).await;
+        }
+    });
+
     let n = ioc.run();
-    assert_eq!(n, 1);
+    assert_eq!(n, 3);
 }
