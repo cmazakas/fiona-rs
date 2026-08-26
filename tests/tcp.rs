@@ -1111,7 +1111,7 @@ fn tcp_concurrent_send_recv() {
 
     async fn send(stream: fiona::net::TcpStream, messages: Rc<Vec<Vec<u8>>>, message_idx: usize) {
         let mut message = Vec::<u8>::with_capacity(4 * 1024);
-        for buf in messages[message_idx].chunks_exact(4 * 1024) {
+        for buf in messages[message_idx].as_chunks::<{ 4 * 1024 }>().0 {
             message.clear();
             message.extend_from_slice(buf);
             let (sent, sendbuf) = stream.send(message).await;
