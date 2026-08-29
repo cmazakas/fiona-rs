@@ -44,24 +44,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nix::{errno::Errno, libc::ETIME, sys::socket::SockaddrStorage};
+use nix::{errno::Errno, sys::socket::SockaddrStorage};
 
 use liburing_rs::{
-    __kernel_timespec, AF_INET, AF_INET6, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
-    IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IORING_SETUP_COOP_TASKRUN,
-    IORING_SETUP_CQSIZE, IORING_SETUP_DEFER_TASKRUN, IORING_SETUP_SINGLE_ISSUER,
-    IORING_TIMEOUT_MULTISHOT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring,
+    __kernel_timespec, AF_INET, AF_INET6, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_MORE,
+    IORING_CQE_F_NOTIF, IORING_SETUP_COOP_TASKRUN, IORING_SETUP_CQSIZE, IORING_SETUP_DEFER_TASKRUN,
+    IORING_SETUP_SINGLE_ISSUER, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring,
     io_uring_buf_ring, io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask,
     io_uring_cq_advance, io_uring_cqe, io_uring_for_each_cqe, io_uring_free_buf_ring,
     io_uring_get_events, io_uring_get_sqe, io_uring_params, io_uring_peek_cqe,
-    io_uring_prep_cancel_fd, io_uring_prep_close_direct, io_uring_prep_connect,
-    io_uring_prep_link_timeout, io_uring_prep_msg_ring, io_uring_prep_timeout, io_uring_queue_exit,
-    io_uring_queue_init_params, io_uring_register_buffers, io_uring_register_files_sparse,
-    io_uring_register_ring_fd, io_uring_register_sync_msg, io_uring_setup_buf_ring,
-    io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data, io_uring_sqe_set_data64,
-    io_uring_sqe_set_flags, io_uring_submit_and_get_events, io_uring_submit_and_wait,
-    io_uring_submit_and_wait_timeout, io_uring_unregister_buf_ring, io_uring_unregister_buffers,
-    iovec,
+    io_uring_prep_close_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
+    io_uring_prep_msg_ring, io_uring_queue_exit, io_uring_queue_init_params,
+    io_uring_register_buffers, io_uring_register_files_sparse, io_uring_register_ring_fd,
+    io_uring_register_sync_msg, io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe,
+    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    io_uring_submit_and_get_events, io_uring_submit_and_wait, io_uring_submit_and_wait_timeout,
+    io_uring_unregister_buf_ring, io_uring_unregister_buffers, iovec,
 };
 
 pub mod fs;
@@ -70,7 +68,6 @@ pub mod time;
 pub mod timer_wheel;
 pub mod tls;
 
-use net::tcp::StreamImpl;
 use slotmap::{DefaultKey, KeyData};
 
 use crate::{
@@ -802,10 +799,6 @@ enum OpType {
     },
     #[allow(dead_code)]
     TimeoutCancel,
-    MultishotTimeout {
-        ts: __kernel_timespec,
-        stream: *mut StreamImpl,
-    },
     MultishotTcpAccept {
         streams: VecDeque<TcpStream>,
     },
@@ -821,19 +814,16 @@ enum OpType {
         num_sent: usize,
         subspan: Range<usize>,
         buf: Vec<u8>,
-        last_send: *mut Instant,
     },
     TcpSendFixed {
         num_sent: usize,
         subspan: Range<usize>,
         buf: Option<FixedBuf>,
-        last_send: *mut Instant,
     },
 
     MultishotTcpRecv {
         bufs: BorrowedBufs,
         buf_group: *mut BufGroup,
-        last_recv: *mut Instant,
     },
     TcpShutdown,
     TcpClose,
@@ -1339,7 +1329,6 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler {
     match &op.op_type {
         OpType::Timeout { .. } => on_timeout,
         OpType::TimeoutCancel => todo!(),
-        OpType::MultishotTimeout { .. } => on_timeout_multishot,
         OpType::MultishotTcpAccept { .. } => on_tcp_accept_multishot,
         OpType::TcpConnect { .. } => on_tcp_connect,
         OpType::TcpSend { .. } | OpType::TcpSendFixed { .. } => on_tcp_send,
@@ -1594,20 +1583,14 @@ fn on_tcp_send(ex: &Executor, cqe: &mut io_uring_cqe) {
     }
 
     let (OpType::TcpSend {
-        ref mut num_sent,
-        last_send,
-        ..
+        ref mut num_sent, ..
     }
     | OpType::TcpSendFixed {
-        ref mut num_sent,
-        last_send,
-        ..
+        ref mut num_sent, ..
     }) = op.op_type
     else {
         unreachable!()
     };
-
-    unsafe { *last_send = Instant::now() };
 
     if has_more_cqes {
         if cqe.res >= 0 {
@@ -1674,7 +1657,6 @@ fn on_tcp_recv_multishot(ex: &Executor, cqe: &mut io_uring_cqe) {
     let OpType::MultishotTcpRecv {
         ref mut bufs,
         buf_group,
-        last_recv,
     } = op.op_type
     else {
         unreachable!()
@@ -1706,8 +1688,6 @@ fn on_tcp_recv_multishot(ex: &Executor, cqe: &mut io_uring_cqe) {
         unsafe { release_op(op.ref_count) };
     }
 
-    unsafe { *last_recv = Instant::now() };
-
     op.res = cqe.res;
     if cqe.res > 0 {
         unsafe { append_recv_buffers(buf_group, cqe, bufs) };
@@ -1715,71 +1695,6 @@ fn on_tcp_recv_multishot(ex: &Executor, cqe: &mut io_uring_cqe) {
 
     if let Some(local_waker) = op.local_waker.take() {
         local_waker.wake();
-    }
-}
-
-fn on_timeout_multishot(ex: &Executor, cqe: &mut io_uring_cqe) {
-    let mut borrow_guard = ex.p.io_ops.borrow_mut();
-    let io_ops = &mut *borrow_guard;
-
-    let key_data = cqe.user_data;
-    let key = DefaultKey::from(KeyData::from_ffi(key_data));
-
-    let op = io_ops.get_mut(key).unwrap();
-
-    let has_more_cqes = (cqe.flags & IORING_CQE_F_MORE) > 0;
-    let io_object_dropped = op.eager_dropped;
-    if io_object_dropped {
-        if has_more_cqes {
-            return;
-        }
-
-        let op = io_ops.remove(key).unwrap();
-
-        drop(borrow_guard);
-
-        unsafe { release_op(op.ref_count) };
-        return;
-    }
-
-    if !has_more_cqes {
-        let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
-            unreachable!()
-        };
-
-        let ts = ptr::from_mut(ts).cast();
-
-        let sqe = get_sqe(ex);
-        unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
-        unsafe { io_uring_sqe_set_data64(sqe, key_data) };
-    }
-
-    if cqe.res != -ETIME {
-        assert!(!has_more_cqes);
-        return;
-    }
-
-    let OpType::MultishotTimeout { ref mut ts, stream } = op.op_type else {
-        unreachable!()
-    };
-
-    let dur = Duration::new(ts.tv_sec.try_into().unwrap(), ts.tv_nsec.try_into().unwrap());
-
-    let now = Instant::now();
-    let stream_impl = unsafe { &mut *stream };
-
-    let recv_expired =
-        stream_impl.recv_op.is_some() && now.duration_since(stream_impl.last_recv) > dur;
-
-    let send_expired = stream_impl.send_pending && now.duration_since(stream_impl.last_send) > dur;
-
-    if recv_expired || send_expired {
-        let sqe = get_sqe(ex);
-        let fd = stream_impl.fd_impl.fd;
-        let flags = IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD_FIXED;
-        unsafe { io_uring_prep_cancel_fd(sqe, fd, flags) };
-        unsafe { io_uring_sqe_set_data64(sqe, 0) };
-        unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
     }
 }
 

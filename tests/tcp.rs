@@ -10,7 +10,7 @@ use std::{
     future::Future,
     net::{Ipv4Addr, Ipv6Addr},
     panic::{AssertUnwindSafe, catch_unwind},
-    pin::Pin,
+    pin::{Pin, pin},
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll, Waker},
@@ -1190,32 +1190,32 @@ fn tcp_select_drop_ready_recv_future() {
 
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
-        let mut recv_future = stream.recv();
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        let r = Pin::new(&mut recv_future).poll(&mut cx);
-        assert!(r.is_pending());
-
         let mut timers = Vec::<fiona::time::Timer>::new();
         let mut timeouts = Vec::<fiona::time::TimerFuture>::new();
-
-        let num_ops = 17 + ex.get_params().sq_entries();
-
-        for _ in 0..num_ops {
-            let timer = fiona::time::Timer::new(&ex.clone());
-            timers.push(timer);
-        }
-
-        for i in 0..num_ops {
-            let i = i as usize;
-            timeouts.push(timers[i].wait(Duration::from_millis(10)));
-        }
-
-        for timeout in &mut timeouts {
-            let r = Pin::new(timeout).poll(&mut cx);
+        {
+            let recv_future = stream.recv();
+            let mut recv_future = pin!(recv_future);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let r = recv_future.as_mut().poll(&mut cx);
             assert!(r.is_pending());
-        }
 
-        drop(recv_future);
+            let num_ops = 17 + ex.get_params().sq_entries();
+
+            for _ in 0..num_ops {
+                let timer = fiona::time::Timer::new(&ex.clone());
+                timers.push(timer);
+            }
+
+            for i in 0..num_ops {
+                let i = i as usize;
+                timeouts.push(timers[i].wait(Duration::from_millis(10)));
+            }
+
+            for timeout in &mut timeouts {
+                let r = Pin::new(timeout).poll(&mut cx);
+                assert!(r.is_pending());
+            }
+        }
         drop(stream);
 
         for timeout in &mut timeouts {
@@ -2098,8 +2098,8 @@ fn tcp_sockets_outlive_io_context() {
     let mut send1 = server.send(vec![0, 1, 2, 3]);
     let mut send2 = client.send(vec![3, 2, 1, 0]);
 
-    let mut recv1 = server.recv();
-    let mut recv2 = client.recv();
+    let mut recv1 = pin!(server.recv());
+    let mut recv2 = pin!(client.recv());
 
     let mut close1 = server.close();
     let mut close2 = client.close();

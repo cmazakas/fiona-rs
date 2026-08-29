@@ -4,18 +4,16 @@
 
 use crate::{
     BorrowedBufs, Executor, FdImpl, FixedBuf, OpType, RefCount, Result, add_obj_ref, add_op_ref,
-    get_sqe, make_io_uring_op, release_impl, release_obj,
+    get_sqe, make_io_uring_op, release_impl, release_obj, timer_wheel,
 };
 use core::panic;
 use liburing_rs::{
-    __kernel_timespec, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED,
-    IORING_RECVSEND_BUNDLE, IORING_TIMEOUT_MULTISHOT, IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS,
-    IOSQE_FIXED_FILE, io_uring_prep_cancel_fd, io_uring_prep_cancel64, io_uring_prep_close,
-    io_uring_prep_close_direct, io_uring_prep_multishot_accept_direct,
-    io_uring_prep_recv_multishot, io_uring_prep_send_zc, io_uring_prep_send_zc_fixed,
-    io_uring_prep_shutdown, io_uring_prep_socket_direct_alloc, io_uring_prep_timeout,
-    io_uring_prep_timeout_remove, io_uring_prep_timeout_update, io_uring_sqe_set_buf_group,
-    io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED, IORING_RECVSEND_BUNDLE,
+    IOSQE_BUFFER_SELECT, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, io_uring_prep_cancel_fd,
+    io_uring_prep_cancel64, io_uring_prep_close, io_uring_prep_close_direct,
+    io_uring_prep_multishot_accept_direct, io_uring_prep_recv_multishot, io_uring_prep_send_zc,
+    io_uring_prep_send_zc_fixed, io_uring_prep_shutdown, io_uring_prep_socket_direct_alloc,
+    io_uring_sqe_set_buf_group, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
 use nix::{
     errno::Errno,
@@ -30,17 +28,17 @@ use slotmap::{DefaultKey, Key, KeyData};
 use std::{
     alloc::Layout,
     collections::VecDeque,
-    future::Future,
+    future::{Future, poll_fn},
     marker::PhantomData,
     mem::{self, offset_of},
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     ops::RangeBounds,
     os::fd::{AsRawFd, IntoRawFd},
-    pin::Pin,
+    pin::{Pin, pin},
     ptr::{self, NonNull},
     range::Range,
     task::Poll,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 //-----------------------------------------------------------------------------
@@ -435,12 +433,9 @@ pub(crate) struct StreamImpl {
     pub(crate) send_pending: bool,
     pub(crate) shutdown_pending: bool,
     pub(crate) recv_op: Option<u64>,
-    pub(crate) last_send: Instant,
-    pub(crate) last_recv: Instant,
-    ts: __kernel_timespec,
+    ts: Duration,
     buf_group: u16,
     recv_pending: bool,
-    timeout_op: Option<u64>,
 }
 
 impl Drop for StreamImpl {
@@ -490,55 +485,17 @@ impl TcpStream {
                     was_closed: false,
                     is_fixed: true,
                 },
-                ts: Duration::from_secs(3).into(),
+                ts: Duration::from_secs(3),
                 buf_group: u16::MAX,
                 send_pending: false,
                 recv_pending: false,
                 shutdown_pending: false,
-                last_send: Instant::now(),
-                last_recv: Instant::now(),
-                timeout_op: None,
                 recv_op: None,
             };
 
             p = ptr.cast::<StreamImpl>();
             unsafe { std::ptr::write(p.as_ptr(), stream_impl) };
         }
-
-        let stream_impl = unsafe { &mut *p.as_ptr() };
-        let ref_count = unsafe {
-            p.as_ptr()
-                .cast::<u8>()
-                .add(offset_of!(StreamImpl, fd_impl.ref_count))
-                .cast()
-        };
-
-        let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
-        let key = io_ops.insert(
-            make_io_uring_op(
-                ref_count,
-                OpType::MultishotTimeout {
-                    ts: stream_impl.ts,
-                    stream: p.as_ptr(),
-                },
-            ),
-            &stream_impl.fd_impl.ex,
-        );
-
-        let op = io_ops.get_mut(key).unwrap();
-        let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
-            unreachable!()
-        };
-
-        let ts = ptr::from_mut(ts).cast();
-        let user_data = key.data().as_ffi();
-
-        let sqe = get_sqe(&stream_impl.fd_impl.ex);
-        unsafe { io_uring_prep_timeout(sqe, ts, 0, IORING_TIMEOUT_MULTISHOT) };
-        unsafe { io_uring_sqe_set_data64(sqe, user_data) };
-
-        stream_impl.timeout_op = Some(key.data().as_ffi());
-        unsafe { add_op_ref(ref_count) };
 
         TcpStream { p }
     }
@@ -571,7 +528,6 @@ impl TcpStream {
         );
 
         let p = self.p.as_ptr();
-        let last_send = unsafe { p.cast::<u8>().add(offset_of!(StreamImpl, last_send)).cast() };
         let ref_count = unsafe {
             p.cast::<u8>()
                 .add(offset_of!(StreamImpl, fd_impl.ref_count))
@@ -596,13 +552,11 @@ impl TcpStream {
 
         let op = OpType::TcpSend {
             buf,
-            last_send,
             num_sent: 0,
             subspan,
         };
 
         stream_impl.send_pending = true;
-        stream_impl.last_send = Instant::now();
 
         let key = stream_impl
             .fd_impl
@@ -632,13 +586,6 @@ impl TcpStream {
         );
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
-        let last_send = unsafe {
-            self.p
-                .as_ptr()
-                .cast::<u8>()
-                .add(offset_of!(StreamImpl, last_send))
-                .cast()
-        };
 
         let ref_count = unsafe {
             self.p
@@ -665,13 +612,11 @@ impl TcpStream {
 
         let op = OpType::TcpSendFixed {
             buf: Some(buf),
-            last_send,
             num_sent: 0,
             subspan,
         };
 
         stream_impl.send_pending = true;
-        stream_impl.last_send = Instant::now();
 
         let key = stream_impl
             .fd_impl
@@ -688,15 +633,33 @@ impl TcpStream {
         })
     }
 
-    pub fn recv(&self) -> impl Future<Output = Result<BorrowedBufs>> {
+    pub async fn recv(&self) -> Result<BorrowedBufs> {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!stream_impl.recv_pending);
         stream_impl.recv_pending = true;
 
-        RecvFuture {
+        let mut recv_future = pin!(RecvFuture {
             stream: self,
             completed: false,
-        }
+        });
+
+        let mut timer_future = pin!(timer_wheel::sleep_for(&self.get_executor(), stream_impl.ts));
+
+        let mut timed_out = false;
+
+        poll_fn(|cx| {
+            if let Poll::Ready(bufs) = recv_future.as_mut().poll(cx) {
+                return Poll::Ready(bufs);
+            }
+
+            if !timed_out && let Poll::Ready(()) = timer_future.as_mut().poll(cx) {
+                timed_out = true;
+                let _ = pin!(self.cancel()).poll(cx);
+            }
+
+            Poll::Pending
+        })
+        .await
     }
 
     pub fn shutdown(&self, how: i32) -> impl Future<Output = Result<()>> {
@@ -807,29 +770,7 @@ impl TcpStream {
 
     pub fn set_timeout(&self, dur: Duration) {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
-        stream_impl.ts = dur.into();
-
-        if let Some(timeout_op) = stream_impl.timeout_op {
-            let sqe = get_sqe(&stream_impl.fd_impl.ex);
-
-            let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
-            let op = io_ops
-                .get_mut(DefaultKey::from(KeyData::from_ffi(timeout_op)))
-                .unwrap();
-
-            let OpType::MultishotTimeout { ref mut ts, .. } = op.op_type else {
-                unreachable!()
-            };
-
-            *ts = stream_impl.ts;
-
-            let ts = ptr::from_mut(ts).cast::<__kernel_timespec>();
-            let flags = 0;
-            let user_data = timeout_op;
-            unsafe { io_uring_prep_timeout_update(sqe, ts, user_data, flags) };
-            unsafe { io_uring_sqe_set_data64(sqe, 0) };
-            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-        }
+        stream_impl.ts = dur;
     }
 }
 
@@ -838,25 +779,6 @@ impl Drop for TcpStream {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
         if unsafe { (*rc).obj_count } == 1 {
             let stream_impl = unsafe { &mut *self.p.as_ptr() };
-
-            {
-                let key_data = stream_impl.timeout_op.take().unwrap();
-                let key = DefaultKey::from(KeyData::from_ffi(key_data));
-
-                let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
-                let op = io_ops.get_mut(key).unwrap();
-
-                let user_data = key_data;
-                // Makes sure this gets cleaned up, not really an eager-dropped operation.
-                op.eager_dropped = true;
-
-                let sqe = get_sqe(&stream_impl.fd_impl.ex);
-                unsafe { io_uring_prep_timeout_remove(sqe, user_data, 0) };
-                unsafe { io_uring_sqe_set_data64(sqe, 0) };
-                unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
-
-                // unsafe { submit_ring(ring) };
-            }
 
             if stream_impl.recv_op.is_some() {
                 let key_data = stream_impl.recv_op.take().unwrap();
@@ -1488,16 +1410,6 @@ impl Future for RecvFuture<'_> {
                     Some(buf_group) => buf_group.get(),
                 };
 
-                stream_impl.last_recv = Instant::now();
-                let last_recv: *mut Instant = unsafe {
-                    self.stream
-                        .p
-                        .as_ptr()
-                        .cast::<u8>()
-                        .add(offset_of!(StreamImpl, last_recv))
-                        .cast()
-                };
-
                 let io_ops = &mut *stream_impl.fd_impl.ex.p.io_ops.borrow_mut();
                 let key = io_ops.insert(
                     make_io_uring_op(
@@ -1505,7 +1417,6 @@ impl Future for RecvFuture<'_> {
                         OpType::MultishotTcpRecv {
                             bufs: BorrowedBufs::new(&ex, buf_group),
                             buf_group,
-                            last_recv,
                         },
                     ),
                     &stream_impl.fd_impl.ex,
