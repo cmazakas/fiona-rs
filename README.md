@@ -22,7 +22,7 @@ LIBCLANG_PATH = "/usr/lib/llvm-20/lib"
 
 # Preliminary Benchmarks
 
-Benchmarks were build against commit [ff37219f55b8c32bf9541dbfd476db4d1824e4f3](https://github.com/cmazakas/fiona-rs/tree/ff37219f55b8c32bf9541dbfd476db4d1824e4f3).
+Benchmarks were build against commit [c1936ffedf9542e3f70878c855b92eb96c88cfb5](https://github.com/cmazakas/fiona-rs/tree/c1936ffedf9542e3f70878c855b92eb96c88cfb5).
 
 Benchmarks were run using two physical machines, a gaming desktop with a 2.5 Gb NIC and a Dell XPS 17 laptop. A 2.5 Gb ethernet cable was used to connect the two machines. The Dell XPS functioned as the server, the gaming desktop functioned as the client.
 
@@ -40,20 +40,26 @@ cargo bench --bench echo2 -- --ipv4-addr 192.168.10.12 --port 8015 --tokio --cli
 
 Current benchmark data applies to [echo2](benches/echo2.rs).
 
+Kernel version:
+```
+❯ uname -a
+Linux pleiades 7.0.0-30-generic #30-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 31 18:22:54 UTC 2026 x86_64 GNU/Linux
+```
+
 | Number of Connections | fiona-rs (Total client loop time) | Tokio (Total client loop time) | fiona-rs (Average client duration) | Tokio (Average client duration) |
 | --------------------- | --------------------------------- | ------------------------------ | ---------------------------------- | ------------------------------- |
-| 1000                  | 5.78s                             | 6.45s                          | 4.79s                              | 5.55s                           |
-| 2000                  | 11.95s                            | 13.59s                         | 9.99s                              | 10.41s                          |
-| 3000                  | 18.79s                            | 21.82s                         | 15.72s                             | 16.40s                          |
-| 4000                  | 27.69s                            | 36.73s                         | 23.35s                             | 22.64s                          |
-| 5000                  | 37.40s                            | 47.45s                         | 31.64s                             | 31.23s                          |
-| 6000                  | 48.48s                            | 58.10s                         | 39.17s                             | 39.24s                          |
-| 7000                  | 68.62s                            | 75.54s                         | 46.93s                             | 46.84s                          |
-| 8000                  | 67.96s                            | 102.84s                        | 54.28s                             | 54.45s                          |
-| 9000                  | 76.64s                            | 108.29s                        | 61.22s                             | 61.04s                          |
-| 10000                 | 112.34s                           | Timed out                      | 68.07s                             | Timed out                       |
+| 1000                  | 5.89s                             | 6.50s                          | 4.99s                              | 5.54s                           |
+| 2000                  | 11.78s                            | 12.82s                         | 9.62s                              | 10.45s                          |
+| 3000                  | 19.06s                            | 19.59s                         | 16.80s                             | 16.08s                          |
+| 4000                  | 26.98s                            | 32.40s                         | 23.64s                             | 22.19s                          |
+| 5000                  | 39.93s                            | 46.48s                         | 31.36s                             | 31.01s                          |
+| 6000                  | 44.71s                            | 57.36s                         | 38.64s                             | 38.54s                          |
+| 7000                  | 52.83s                            | 71.47s                         | 45.94s                             | 45.43s                          |
+| 8000                  | 66.25s                            | 94.25s                         | 53.39s                             | 50.06s                          |
+| 9000                  | 75.56s                            | 131.53s                        | 61.28s                             | 59.02s                          |
+| 10000                 | 95.46s                            | Timed out                      | 67.68s                             | Timed out                       |
 
-The benchmarks also track strong statistical outliers. No outliers meeting the current critertia were detected for either runtime during the benchmark runs.
+The benchmarks also track strong statistical outliers. Only one statistical outlier was detected for Tokio with 9000 connections.
 
 Note: results are preliminary and are subject to noise and are not absolutely conclusive of overall performance.
 
