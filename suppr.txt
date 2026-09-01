@@ -2,3 +2,4 @@ leak:time_forget_expired
 leak:tcp_acceptor_outlives_io_context
 leak:tcp_sockets_outlive_io_context
 leak:tcp_ephemeral_port_exhaustion_panic
+leak:timer_wheel_forget

@@ -3,10 +3,11 @@
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 use std::{
+    future::poll_fn,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::pin,
     sync::Arc,
-    task::{Context, Wake, Waker},
+    task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
 
@@ -57,6 +58,8 @@ impl Drop for DurationGuard {
     }
 }
 
+//-----------------------------------------------------------------------------
+
 struct PoisonWaker {}
 
 impl Wake for PoisonWaker {
@@ -64,6 +67,8 @@ impl Wake for PoisonWaker {
         unreachable!()
     }
 }
+
+//-----------------------------------------------------------------------------
 
 #[test]
 fn timer_wheel_sleep() {
@@ -449,4 +454,58 @@ fn timer_wheel_cancel_on_drop() {
 
     let n = ioc.run();
     assert_eq!(n, 4);
+}
+
+#[test]
+fn timer_wheel_forget() {
+    // Prove that if we poll() a TimerFuture that our I/O loop will expire it
+    // and invoke the Waker.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let mut timer =
+                Box::pin(fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(100)));
+
+            poll_fn(|cx| {
+                assert!(timer.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+
+            std::mem::forget(timer);
+        }
+    });
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            fiona::time::sleep(&ex, Duration::from_millis(150)).await;
+            fiona::time::sleep(&ex, Duration::from_millis(150)).await;
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let _guard = DurationGuard::new(Duration::from_millis(100));
+            fiona::timer_wheel::sleep_for(&ex, Duration::from_millis(100)).await;
+        }
+    });
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            fiona::time::sleep(&ex, Duration::from_millis(150)).await;
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
 }
