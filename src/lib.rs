@@ -192,8 +192,8 @@ impl Task {
         unsafe { &*self.p.as_ptr().cast::<TaskHeader>() }
     }
 
-    // unsafe because of potential aliasing violations as Task implements Clone with
-    // Rc-like semantics
+    // unsafe because of potential aliasing violations as Task implements Clone
+    // with Rc-like semantics
     unsafe fn poll(&mut self, cx: &mut Context) -> Poll<()> {
         let offset = self.task_header().future_offset;
         let p = unsafe {
@@ -837,6 +837,11 @@ enum OpType {
         subspan: Range<usize>,
         offset: u64,
     },
+    FileRead {
+        buf: Option<FixedBuf>,
+        subspan: Range<usize>,
+        offset: u64,
+    },
 }
 
 type CqeHandler = fn(ex: &Executor, cqe: &mut io_uring_cqe);
@@ -977,8 +982,9 @@ impl IoContext {
             if let Some(next) = ex.p.timer_wheel.borrow().next_expiration_time() {
                 let now = Instant::now();
                 let next_timeout = wheel_start_time + Duration::from_millis(next);
-                // io_uring isn't epoll and supports sub-millisecond timeouts _too_ well, so we
-                // have to manually round up to the nearest whole ms otherwise we fire timers a
+                // io_uring isn't epoll and supports sub-millisecond timeouts
+                // _too_ well, so we have to manually round up
+                // to the nearest whole ms otherwise we fire timers a
                 // tad too early.
                 let sleep_time = round_up_ms(next_timeout.saturating_duration_since(now));
 
@@ -1337,6 +1343,7 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler {
         OpType::DropCancel => on_drop_cancel,
         OpType::FileOpen { .. } => on_file_open,
         OpType::FileWrite { .. } => on_file_write,
+        OpType::FileRead { .. } => on_file_read,
     }
 }
 
@@ -1730,6 +1737,33 @@ fn on_file_open(ex: &Executor, cqe: &mut io_uring_cqe) {
 }
 
 fn on_file_write(ex: &Executor, cqe: &mut io_uring_cqe) {
+    let mut borrow_guard = ex.p.io_ops.borrow_mut();
+    let io_ops = &mut *borrow_guard;
+
+    let key_data = cqe.user_data;
+    let key = DefaultKey::from(KeyData::from_ffi(key_data));
+
+    let op = io_ops.get_mut(key).unwrap();
+
+    op.done = true;
+    op.res = cqe.res;
+
+    if op.eager_dropped {
+        let op = io_ops.remove(key).unwrap();
+        drop(borrow_guard);
+
+        let rc = op.ref_count;
+        unsafe { release_op(rc) };
+        return;
+    }
+
+    unsafe { release_op(op.ref_count) };
+    if let Some(local_waker) = op.local_waker.take() {
+        local_waker.wake();
+    }
+}
+
+fn on_file_read(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
 
