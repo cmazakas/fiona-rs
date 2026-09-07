@@ -3,9 +3,10 @@
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 use std::{
+    future::poll_fn,
     path::Path,
-    pin::Pin,
-    task::{Context, Waker},
+    pin::{Pin, pin},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -366,6 +367,8 @@ fn file_eager_drop_write() {
 
 #[test]
 fn file_read() {
+    // Elementary test of file reading.
+
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
 
@@ -425,6 +428,93 @@ fn file_read() {
 
             assert_eq!(total, message.len() as u64);
             assert_eq!(assembled_msg, message);
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn file_read_eager_drop() {
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let pathname = "tests/file.rs";
+
+            let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
+
+            ex.register_fixed_buffers(16, 1024).unwrap();
+
+            {
+                let mut f = pin!(file.read_at(ex.get_fixed_buf().unwrap(), -1 as _));
+                poll_fn(|cx| {
+                    assert!(f.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+
+                fiona::time::sleep(&ex, Duration::from_micros(100)).await;
+            }
+
+            // Helps make sure we cleanup the stray CQEs and that cancellation
+            // is observed.
+            fiona::time::sleep(&ex, Duration::from_millis(100)).await;
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn file_read_incremental() {
+    // Test incremental reading of a file.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let pathname = "src/lib.rs";
+
+            let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
+
+            let md = std::fs::metadata(pathname).unwrap();
+            let file_size = md.len() as usize;
+
+            ex.register_fixed_buffers(8, file_size.next_power_of_two() as _)
+                .unwrap();
+
+            let mut total = 0_usize;
+            let mut buf = ex.get_fixed_buf().unwrap();
+
+            let mut contents = Vec::new();
+
+            while total < file_size {
+                let (n, b) = if total + 512 >= file_size {
+                    file.read_subspan_at(total.., buf, total as u64).await
+                } else {
+                    file.read_subspan_at(total..(total + 512), buf, total as u64)
+                        .await
+                };
+
+                let n = n.unwrap();
+                buf = b;
+
+                contents.extend_from_slice(&buf[total..(total + n)]);
+                total += n;
+            }
+
+            let expected = std::fs::read_to_string(pathname).unwrap();
+            let contents = String::from_utf8(contents).unwrap();
+
+            assert!(!expected.is_empty());
+            assert_eq!(contents, expected);
         }
     });
 
