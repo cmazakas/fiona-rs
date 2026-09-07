@@ -39,7 +39,7 @@ pub enum Error {
 pub(crate) struct FileImpl {
     pub(crate) fd_impl: FdImpl,
     write_pending: bool,
-    read_pending: bool,
+    read_pending: u64,
 }
 
 impl Drop for FileImpl {
@@ -83,6 +83,10 @@ impl File {
     ) -> impl Future<Output = (Result<usize, Error>, FixedBuf)> {
         let file_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!file_impl.write_pending, "A write is already pending.");
+        assert_eq!(
+            file_impl.read_pending, 0,
+            "A read and a write cannot be scheduled concurrently."
+        );
         file_impl.write_pending = true;
 
         let start = match range.start_bound() {
@@ -137,8 +141,11 @@ impl File {
         &self, range: R, buf: FixedBuf, offset: u64,
     ) -> impl Future<Output = (Result<usize, Error>, FixedBuf)> {
         let file_impl = unsafe { &mut *self.p.as_ptr() };
-        assert!(!file_impl.read_pending, "A read is already pending.");
-        file_impl.read_pending = true;
+        assert!(
+            !file_impl.write_pending,
+            "A read and write to the same file cannot be concurrent."
+        );
+        file_impl.read_pending += 1;
 
         let start = match range.start_bound() {
             std::ops::Bound::Included(&s) => s,
@@ -215,7 +222,7 @@ impl File {
                     is_fixed: true,
                 },
                 write_pending: false,
-                read_pending: false,
+                read_pending: 0,
             };
 
             p = ptr.cast::<FileImpl>();
@@ -538,7 +545,7 @@ impl Future for ReadFuture<'_> {
 impl Drop for ReadFuture<'_> {
     fn drop(&mut self) {
         let file_impl = unsafe { &mut *self.file.p.as_ptr() };
-        file_impl.read_pending = false;
+        file_impl.read_pending -= 1;
 
         let ref_count = unsafe {
             self.file

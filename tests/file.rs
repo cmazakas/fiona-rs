@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use futures::poll;
+use futures::{StreamExt, poll, stream::FuturesUnordered};
 use rand::SeedableRng;
 
 #[test]
@@ -508,6 +508,59 @@ fn file_read_incremental() {
 
                 contents.extend_from_slice(&buf[total..(total + n)]);
                 total += n;
+            }
+
+            let expected = std::fs::read_to_string(pathname).unwrap();
+            let contents = String::from_utf8(contents).unwrap();
+
+            assert!(!expected.is_empty());
+            assert_eq!(contents, expected);
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn file_read_concurrent() {
+    // Test concurrent reading of a file.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let pathname = "src/lib.rs";
+
+            let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
+
+            let md = std::fs::metadata(pathname).unwrap();
+            let file_size = md.len() as usize;
+            let buf_len = 512;
+
+            ex.register_fixed_buffers(
+                (file_size / buf_len + 1).next_power_of_two() as u32,
+                buf_len,
+            )
+            .unwrap();
+
+            let mut joinset = FuturesUnordered::new();
+            let mut contents = vec![0_u8; file_size];
+            let num_reads = file_size.div_ceil(buf_len);
+            for i in 0..num_reads {
+                joinset.push(
+                    file.read_at(ex.get_fixed_buf().unwrap(), (buf_len * i).try_into().unwrap()),
+                );
+            }
+
+            while let Some((n, buf)) = joinset.next().await {
+                let n = n.unwrap();
+                let idx = buf.buf_idx();
+                let s = idx * buf_len;
+                let e = s + n;
+                contents[s..e].copy_from_slice(&buf[..n]);
             }
 
             let expected = std::fs::read_to_string(pathname).unwrap();
