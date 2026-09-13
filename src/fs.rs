@@ -3,8 +3,9 @@
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 use crate::{
-    Executor, FdImpl, FixedBuf, OpType, RefCount, add_op_ref, get_sqe, make_io_uring_op,
-    release_impl, release_obj,
+    Executor, FdImpl, FixedBuf, OpType, RefCount, add_obj_ref, add_op_ref,
+    common::{CancelFuture, CloseFuture},
+    get_sqe, make_io_uring_op, release_impl, release_obj,
 };
 use liburing_rs::{
     IORING_FILE_INDEX_ALLOC, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, io_uring_prep_cancel64,
@@ -16,6 +17,7 @@ use slotmap::{DefaultKey, Key, KeyData};
 use std::{
     alloc::Layout,
     ffi::CString,
+    marker::PhantomData,
     mem::offset_of,
     ops::RangeBounds,
     os::unix::ffi::OsStrExt,
@@ -32,6 +34,8 @@ pub enum Error {
     OpenError,
     WriteError,
     ReadError,
+    CancelError,
+    CloseError,
 }
 
 //-----------------------------------------------------------------------------
@@ -231,12 +235,112 @@ impl File {
 
         File { p }
     }
+
+    pub fn cancel(&self) -> impl Future<Output = Result<(), Error>> {
+        assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
+
+        let file_impl = unsafe { &mut *self.p.as_ptr() };
+        file_impl.fd_impl.cancel_pending = true;
+
+        let fd_impl = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(FileImpl, fd_impl))
+                .cast()
+        };
+
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(FileImpl, fd_impl.ref_count))
+                .cast()
+        };
+
+        let key = file_impl
+            .fd_impl
+            .ex
+            .p
+            .io_ops
+            .borrow_mut()
+            .insert(make_io_uring_op(ref_count, OpType::FdCancel), &file_impl.fd_impl.ex);
+
+        async move {
+            let r = CancelFuture {
+                fd_impl,
+                completed: false,
+                op: Some(key.data().as_ffi()),
+                _m: PhantomData,
+            }
+            .await;
+
+            match r {
+                Ok(()) => Ok(()),
+                Err(_) => Err(Error::CancelError),
+            }
+        }
+    }
+
+    pub fn close(&self) -> impl Future<Output = Result<(), Error>> {
+        assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
+
+        let file_impl = unsafe { &mut *self.p.as_ptr() };
+        file_impl.fd_impl.close_pending = true;
+
+        let fd_impl = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(FileImpl, fd_impl))
+                .cast()
+        };
+
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(FileImpl, fd_impl.ref_count))
+                .cast()
+        };
+
+        let key = file_impl
+            .fd_impl
+            .ex
+            .p
+            .io_ops
+            .borrow_mut()
+            .insert(make_io_uring_op(ref_count, OpType::FdClose), &file_impl.fd_impl.ex);
+
+        async move {
+            let r = CloseFuture {
+                fd_impl,
+                completed: false,
+                op: Some(key.data().as_ffi()),
+                _m: PhantomData,
+            }
+            .await;
+
+            match r {
+                Ok(()) => Ok(()),
+                Err(_) => Err(Error::CloseError),
+            }
+        }
+    }
 }
 
 impl Drop for File {
     fn drop(&mut self) {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
         unsafe { release_obj(rc) };
+    }
+}
+
+impl Clone for File {
+    fn clone(&self) -> Self {
+        let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
+        unsafe { add_obj_ref(rc) };
+        Self { p: self.p }
     }
 }
 

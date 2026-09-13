@@ -31,7 +31,7 @@ fn file_open() {
 }
 
 #[test]
-fn file_close_on_drop() {
+fn file_open_close_on_drop() {
     // Test that we successfully close files on Drop.
 
     const NUM_FILES: u32 = 16;
@@ -76,7 +76,7 @@ fn file_close_on_drop() {
 }
 
 #[test]
-fn file_close_on_future_drop() {
+fn file_open_close_on_future_drop() {
     // Test that our file is properly closed when the Future contains a success
     // result, but has not yet been polled to completion.
 
@@ -573,4 +573,38 @@ fn file_read_concurrent() {
 
     let n = ioc.run();
     assert_eq!(n, 1);
+}
+
+#[test]
+fn file_close() {
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let pathname = "src/lib.rs";
+
+            let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
+            ex.register_fixed_buffers(8, 512 * 1024).unwrap();
+
+            let h = ex.spawn({
+                let file = file.clone();
+                async move {
+                    file.close().await.unwrap();
+                }
+            });
+
+            let (n, _buf) = file.read_at(ex.get_fixed_buf().unwrap(), -1 as _).await;
+            assert!(n.unwrap() > 0);
+
+            h.await;
+
+            let (n, _buf) = file.read_at(ex.get_fixed_buf().unwrap(), 0).await;
+            assert!(n.is_err());
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 2);
 }
