@@ -62,6 +62,7 @@ use liburing_rs::{
     io_uring_unregister_buf_ring, io_uring_unregister_buffers, iovec,
 };
 
+mod common;
 pub mod fs;
 pub mod net;
 pub mod time;
@@ -826,8 +827,8 @@ enum OpType {
         buf_group: *mut BufGroup,
     },
     TcpShutdown,
-    TcpClose,
-    TcpCancel,
+    FdClose,
+    FdCancel,
     DropCancel,
     FileOpen {
         path: CString,
@@ -1339,7 +1340,7 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler {
         OpType::TcpConnect { .. } => on_tcp_connect,
         OpType::TcpSend { .. } | OpType::TcpSendFixed { .. } => on_tcp_send,
         OpType::MultishotTcpRecv { .. } => on_tcp_recv_multishot,
-        OpType::TcpShutdown | OpType::TcpClose | OpType::TcpCancel => on_tcp_close,
+        OpType::TcpShutdown | OpType::FdClose | OpType::FdCancel => on_fd_close,
         OpType::DropCancel => on_drop_cancel,
         OpType::FileOpen { .. } => on_file_open,
         OpType::FileWrite { .. } => on_file_write,
@@ -1623,7 +1624,7 @@ fn on_tcp_send(ex: &Executor, cqe: &mut io_uring_cqe) {
     }
 }
 
-fn on_tcp_close(ex: &Executor, cqe: &mut io_uring_cqe) {
+fn on_fd_close(ex: &Executor, cqe: &mut io_uring_cqe) {
     let mut borrow_guard = ex.p.io_ops.borrow_mut();
     let io_ops = &mut *borrow_guard;
 
