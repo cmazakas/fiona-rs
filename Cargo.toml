@@ -8,7 +8,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "3240844825b5e7eabe377f8dde99c2ad529f9a89" }
+axboe-liburing = { git = "https://github.com/cmazakas/liburing.git", rev = "ff2539ce399c4c43821c68ae9147188baf71e80d" }
 nix = { version = "0.31.2", features = ["event", "socket", "net"] }
 rustls = "0.23.40"
 rustls-pki-types = "1.14.1"
