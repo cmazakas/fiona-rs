@@ -12,7 +12,7 @@ use liburing_rs::{
     io_uring_prep_close_direct, io_uring_prep_open_direct, io_uring_prep_read_fixed,
     io_uring_prep_write_fixed, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
-use nix::libc::{O_CREAT, O_DIRECT, O_RDWR, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP, S_IWUSR};
+use nix::libc::{O_CREAT, O_RDWR, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP, S_IWUSR};
 use slotmap::{DefaultKey, Key, KeyData};
 use std::{
     alloc::Layout,
@@ -387,7 +387,7 @@ impl Future for OpenFuture {
                     io_uring_prep_open_direct(
                         sqe,
                         path.as_ptr(),
-                        O_RDWR | O_CREAT | O_DIRECT,
+                        O_RDWR | O_CREAT,
                         S_IRUSR | S_IWUSR | S_IWGRP | S_IRGRP | S_IROTH,
                         IORING_FILE_INDEX_ALLOC as _,
                     );

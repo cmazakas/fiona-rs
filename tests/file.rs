@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use futures::{StreamExt, poll, stream::FuturesUnordered};
+use futures::{Stream, StreamExt, poll, stream::FuturesUnordered};
 use rand::SeedableRng;
 
 #[test]
@@ -586,7 +586,7 @@ fn file_close() {
             let pathname = "src/lib.rs";
 
             let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
-            ex.register_fixed_buffers(8, 512 * 1024).unwrap();
+            ex.register_fixed_buffers(128, 512 * 1024).unwrap();
 
             let h = ex.spawn({
                 let file = file.clone();
@@ -607,4 +607,47 @@ fn file_close() {
 
     let n = ioc.run();
     assert_eq!(n, 2);
+}
+
+#[test]
+fn file_cancel() {
+    // This test only _attempts_ cancellation and never actually hits it. This
+    // is due how io_uring interacts with the underlying file system and how
+    // fast it is. In theory, cancellation is possible here but it's basically
+    // impossible to trigger.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let pathname = "src/lib.rs";
+
+            let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
+            ex.register_fixed_buffers(128, 1024).unwrap();
+
+            let mut joinset = FuturesUnordered::new();
+            for i in 0..128 {
+                joinset.push(file.read_at(ex.get_fixed_buf().unwrap(), i as _));
+            }
+
+            poll_fn(|cx| {
+                for _ in 0..128 {
+                    assert!(Pin::new(&mut joinset).poll_next(cx).is_pending());
+                }
+                Poll::Ready(())
+            })
+            .await;
+
+            file.cancel().await.unwrap();
+
+            while let Some((n, _buf)) = joinset.next().await {
+                assert!(n.is_ok());
+            }
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
 }
