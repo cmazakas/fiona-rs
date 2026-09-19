@@ -586,7 +586,7 @@ fn file_close() {
             let pathname = "src/lib.rs";
 
             let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
-            ex.register_fixed_buffers(128, 512 * 1024).unwrap();
+            ex.register_fixed_buffers(128, 16 * 1024).unwrap();
 
             let h = ex.spawn({
                 let file = file.clone();
@@ -614,7 +614,7 @@ fn file_cancel() {
     // This test only _attempts_ cancellation and never actually hits it. This
     // is due how io_uring interacts with the underlying file system and how
     // fast it is. In theory, cancellation is possible here but it's basically
-    // impossible to trigger.
+    // impossible to trigger, unless we're running in bsan.
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
@@ -643,7 +643,11 @@ fn file_cancel() {
             file.cancel().await.unwrap();
 
             while let Some((n, _buf)) = joinset.next().await {
-                assert!(n.is_ok());
+                if cfg!(feature = "bsan") {
+                    assert!(!n.is_ok());
+                } else {
+                    assert!(n.is_ok());
+                }
             }
         }
     });
