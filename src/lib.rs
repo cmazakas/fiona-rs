@@ -2,6 +2,51 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
+//! Fiona is a single-threaded asynchronous runtime that aims to leverage all of
+//! `io_uring`'s (currently) unique features. This includes support for
+//! multishot operations and use of registered buffers. Fiona is competitively
+//! fast compared to its peers and can scale up dramatically well on just a
+//! single thread.
+//!
+//! Fiona is strongly rooted in the idea of value semantics. By this, we mean
+//! that Fiona does not use thread-local storage like many runtimes in the Rust
+//! ecosystem do. Instead, Fiona has users pass around a handle to a runtime,
+//! called an [Executor], by value. Executors are used to spawn work on the
+//! runtime and are also used to create I/O objects, which includes sockets,
+//! file handles, and high-resolution timers. Fiona's interface takes a lot of
+//! inspiration from Boost.Asio.
+//!
+//! # Example
+//!
+//! ```
+//! // Create the IoContext, which owns the ring, provided buffer groups,
+//! // registered buffers, etc.
+//! let mut ioc = fiona::IoContext::new();
+//!
+//! // Create an instance of an Executor, which is a lightweight handle used
+//! // to manipulate the IoContext data.
+//! let ex = ioc.get_executor();
+//!
+//! // Spawn work onto the backing task queues using this Executor.
+//! ex.spawn(async { println!("Hello, world!");});
+//!
+//! // `ioc.run()` forms an exclusive mutable borrow over the runtime and runs
+//! // until all the spawned tasks are completed.
+//! let n = ioc.run();
+//!
+//! // `run()` returns the number of tasks completed by the runtime.
+//! assert_eq!(n, 1);
+//! ```
+//!
+//! # Usage
+//!
+//! * To setup a TCP server or client, see the documentation for [net].
+//! * To read and write files, see the documentation for [fs].
+//! * To use high-resolution ring-backed timers, see [time].
+//! * To use coarse-grain timers backed by a hierarchical timer wheel, see
+//!   [timer_wheel].
+//! * To setup a TLS server or client, see [tls].
+
 #![feature(ptr_metadata, local_waker, sync_unsafe_cell, unsafe_pinned)]
 #![warn(clippy::pedantic)]
 #![allow(
@@ -871,11 +916,76 @@ fn make_io_uring_op(ref_count: *mut RefCount, op_type: OpType) -> IoUringOp {
 
 //-----------------------------------------------------------------------------
 
+/// The `IoContext` is responsible for running the user's posted work and
+/// manages the underlying ring.
+///
+/// The user can configure an `IoContext`'s ring by using the
+/// [`IoContextBuilder`] struct, which enables configuration of the size of the
+/// submission queue (SQ), the completion queue (CQ), and the amount of direct
+/// descriptors that the ring can use.
+///
+/// # Sizing the `io_uring` Submission Queue and Completion Queue
+///
+/// When using `io_uring`, it can be very important to appropriately size your
+/// SQ and CQ.
+///
+/// During [`IoContext::run`], the SQ is only submitted to the ring when there
+/// is either no more work to be done or the SQ is completely full. This means
+/// that there is an inherent scheduling delay between when work items are
+/// created and when they're processed. If a SQ is over-sized, it can delay the
+/// useful submission of work. Similarly, if the application cannot process CQEs
+/// quickly enough, the CQ will become full and the kernel has no choice but to
+/// manually handle the backpressure itself, which is a signifcant performance
+/// penalty.
+///
+/// In general, users should prefer a short SQ and a large CQ. For most
+/// workloads, an SQ size of 256 is sufficent.
+///
+/// For a CQ length, typically the larger the better and the exact number that
+/// should be used is dependent upon the amount of ingress work. For networking
+/// workloads, a deep CQ can be incredibly useful, something along the lines of
+/// `16 * 1024` depending on the amount of concurrent connections and how much
+/// ingress traffic there is.
+///
+/// Fiona uses a default SQ size of `256` and a CQ size of `1024`.
+///
+/// # Choosing the Number of Files
+///
+/// Fiona makes use of [registered files](https://docs.rs/axboe-liburing/latest/liburing_rs/io_uring_registered_files/index.html).
+/// This means that the `IoContext` owns its own table of file descriptors.
+/// Similar to how most Linux distributions work today with `ulimit -n`, the
+/// user can configure the size of the file table.
+///
+/// Like modern distros, Fiona uses a default of `1024` file descriptors, but
+/// this can be sized to however large a user may need.
+///
+/// # Example
+///
+/// ```
+/// // Build a default-constructed instance.
+/// let mut ioc1 = fiona::IoContext::new();
+///
+/// // Use the builder pattern to fine-tune parameters.
+/// let mut ioc2 = fiona::IoContext::builder()
+///     .sq_entries(1024)
+///     .cq_entries(1024)
+///     .num_files(4096)
+///     .build();
+///
+/// ioc1.get_executor().spawn(async { println!("Doing some work now..."); });
+/// ioc1.run();
+///
+/// ioc2.get_executor().spawn(async { println!("Doing some other work now..."); });
+/// ioc2.run();
+/// ```
 pub struct IoContext {
     p: Rc<IoContextFrame>,
 }
 
 impl IoContext {
+    /// Create an instance of the [`IoContextBuilder`] which is used to
+    /// incrementally configure the parameters used during initialization of the
+    /// ring and the `IoContext` itself.
     #[must_use]
     pub fn builder() -> IoContextBuilder {
         IoContextBuilder {
@@ -883,11 +993,15 @@ impl IoContext {
         }
     }
 
+    /// Default-constructs the `IoContext`.
     #[must_use]
     pub fn new() -> Self {
         Self::builder().build()
     }
 
+    /// Used to obtain an instance of an [`Executor`], which shares ownership of
+    /// the underlying ring. Users should use [`Executor::spawn`] to schedule
+    /// work before calling [`IoContext::run`].
     #[must_use]
     pub fn get_executor(&self) -> Executor {
         Executor { p: self.p.clone() }
@@ -952,6 +1066,10 @@ impl IoContext {
         unsafe { tail.set_prev(head) };
     }
 
+    /// Blocks the current thread until all outstanding tasks are completed.
+    /// Returns the amount of completed tasks.
+    ///
+    /// No work is started until this function is called.
     pub fn run(&mut self) -> u64 {
         let _guard = RunGuard {
             p: self.p.clone(),
@@ -1028,6 +1146,8 @@ impl Default for IoContext {
 
 //-----------------------------------------------------------------------------
 
+/// A structure representing the currently configured state of the
+/// [`IoContext`]. It describes the sizes of the SQ, CQ, and file table.
 #[derive(Clone, Copy)]
 pub struct IoContextParams {
     sq_entries: u32,
@@ -1045,16 +1165,19 @@ impl IoContextParams {
         }
     }
 
+    /// Obtain the total amount of available SQEs.
     #[must_use]
     pub fn sq_entries(&self) -> u32 {
         self.sq_entries
     }
 
+    /// Obtain the total amount of CQEs the CQ supports.
     #[must_use]
     pub fn cq_entries(&self) -> u32 {
         self.cq_entries
     }
 
+    // Obtain the size of the table used for registered files.
     #[must_use]
     pub fn num_files(&self) -> u32 {
         self.nr_files
@@ -1069,29 +1192,36 @@ impl Default for IoContextParams {
 
 //-----------------------------------------------------------------------------
 
+/// A simple builder struct that enables piecewise configuration of the
+/// [`IoContextParams`] that will be used during ring construction.
 pub struct IoContextBuilder {
     params: IoContextParams,
 }
 
 impl IoContextBuilder {
+    /// Sets the size of the SQ to hold at least `n` SQEs.
     #[must_use]
     pub fn sq_entries(mut self, n: u32) -> Self {
         self.params.sq_entries = n;
         self
     }
 
+    /// Sets the size of the CQ to hold at least `n` CQEs.
     #[must_use]
     pub fn cq_entries(mut self, n: u32) -> Self {
         self.params.cq_entries = n;
         self
     }
 
+    /// Sets the size of the file table to hold at least `n` files.
     #[must_use]
     pub fn num_files(mut self, n: u32) -> Self {
         self.params.nr_files = n;
         self
     }
 
+    /// Consumes the current builder instance and produces an [`IoContext`] with
+    /// the provided configuration.
     #[must_use]
     pub fn build(self) -> IoContext {
         let (tx, rx) = std::sync::mpsc::channel();
