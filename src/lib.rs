@@ -924,6 +924,10 @@ fn make_io_uring_op(ref_count: *mut RefCount, op_type: OpType) -> IoUringOp {
 /// submission queue (SQ), the completion queue (CQ), and the amount of direct
 /// descriptors that the ring can use.
 ///
+/// The `IoContext` shares ownership of all underlying resources with all
+/// [`Executor`] instances. No resources are released until all `Executor`s are
+/// dropped along with the `IoContext`.
+///
 /// # Sizing the `io_uring` Submission Queue and Completion Queue
 ///
 /// When using `io_uring`, it can be very important to appropriately size your
@@ -993,7 +997,18 @@ impl IoContext {
         }
     }
 
-    /// Default-constructs the `IoContext`.
+    /// Returns a default-constructed `IoContext`. Equivalent to
+    /// `IoContext::default()`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let ioc = fiona::IoContext::default();
+    /// let params = ioc.get_executor().get_params();
+    /// assert_eq!(params.sq_entries(), 256);
+    /// assert_eq!(params.cq_entries(), 1024);
+    /// assert_eq!(params.num_files(), 1024);
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::builder().build()
@@ -1005,6 +1020,90 @@ impl IoContext {
     #[must_use]
     pub fn get_executor(&self) -> Executor {
         Executor { p: self.p.clone() }
+    }
+
+    /// Blocks the current thread until all outstanding tasks are completed.
+    /// Returns the amount of completed tasks.
+    ///
+    /// No work is started until this function is called.
+    ///
+    /// This function can also be called repeatedly to run more work. So for
+    /// example, work can be posted for the `IoContext` to process, it
+    /// completes, and then the user is free to schedule additional work and
+    /// re-run as many times as needed.
+    ///
+    /// # Example
+    /// ```
+    /// let mut ioc = fiona::IoContext::new();
+    /// let ex = ioc.get_executor();
+    /// ex.spawn(async move { println!("Task 1"); });
+    /// ex.spawn(async move { println!("Task 2"); });
+    /// ex.spawn({
+    ///   let ex = ex.clone();
+    ///   async move {
+    ///     println!("Captured the Executor!");
+    ///   }
+    /// });
+    ///
+    /// let n = ioc.run();
+    /// assert_eq!(n, 3);
+    /// ```
+    pub fn run(&mut self) -> u64 {
+        let _guard = RunGuard {
+            p: self.p.clone(),
+            preserve_head_and_tail: true,
+        };
+
+        let mut num_completed = 0;
+
+        let ex = self.get_executor();
+        let ring = ex.ring();
+
+        let wheel_start_time = ex.p.wheel_start_time;
+        loop {
+            {
+                let now = wheel_start_time.elapsed().as_millis().try_into().unwrap();
+                ex.p.timer_wheel.borrow_mut().poll(now);
+            }
+
+            if self.process_task_queues(&mut num_completed) {
+                break;
+            }
+
+            self.p.needs_wake.store(true, Release);
+
+            if self.process_task_queues(&mut num_completed) {
+                break;
+            }
+
+            if let Some(next) = ex.p.timer_wheel.borrow().next_expiration_time() {
+                let now = Instant::now();
+                let next_timeout = wheel_start_time + Duration::from_millis(next);
+                // io_uring isn't epoll and supports sub-millisecond timeouts
+                // _too_ well, so we have to manually round up
+                // to the nearest whole ms otherwise we fire timers a
+                // tad too early.
+                let sleep_time = round_up_ms(next_timeout.saturating_duration_since(now));
+
+                let mut ts: __kernel_timespec = sleep_time.into();
+                let mut cqe = null_mut();
+                unsafe {
+                    io_uring_submit_and_wait_timeout(
+                        ring,
+                        &raw mut cqe,
+                        1,
+                        &raw mut ts,
+                        null_mut(),
+                    );
+                }
+            } else {
+                unsafe { io_uring_submit_and_wait(ring, 1) };
+            }
+
+            process_cqes(&ex);
+        }
+
+        num_completed
     }
 
     fn process_task_queues(&mut self, num_completed: &mut u64) -> bool {
@@ -1065,71 +1164,11 @@ impl IoContext {
         unsafe { head.set_next(tail) };
         unsafe { tail.set_prev(head) };
     }
-
-    /// Blocks the current thread until all outstanding tasks are completed.
-    /// Returns the amount of completed tasks.
-    ///
-    /// No work is started until this function is called.
-    pub fn run(&mut self) -> u64 {
-        let _guard = RunGuard {
-            p: self.p.clone(),
-            preserve_head_and_tail: true,
-        };
-
-        let mut num_completed = 0;
-
-        let ex = self.get_executor();
-        let ring = ex.ring();
-
-        let wheel_start_time = ex.p.wheel_start_time;
-        loop {
-            {
-                let now = wheel_start_time.elapsed().as_millis().try_into().unwrap();
-                ex.p.timer_wheel.borrow_mut().poll(now);
-            }
-
-            if self.process_task_queues(&mut num_completed) {
-                break;
-            }
-
-            self.p.needs_wake.store(true, Release);
-
-            if self.process_task_queues(&mut num_completed) {
-                break;
-            }
-
-            if let Some(next) = ex.p.timer_wheel.borrow().next_expiration_time() {
-                let now = Instant::now();
-                let next_timeout = wheel_start_time + Duration::from_millis(next);
-                // io_uring isn't epoll and supports sub-millisecond timeouts
-                // _too_ well, so we have to manually round up
-                // to the nearest whole ms otherwise we fire timers a
-                // tad too early.
-                let sleep_time = round_up_ms(next_timeout.saturating_duration_since(now));
-
-                let mut ts: __kernel_timespec = sleep_time.into();
-                let mut cqe = null_mut();
-                unsafe {
-                    io_uring_submit_and_wait_timeout(
-                        ring,
-                        &raw mut cqe,
-                        1,
-                        &raw mut ts,
-                        null_mut(),
-                    );
-                }
-            } else {
-                unsafe { io_uring_submit_and_wait(ring, 1) };
-            }
-
-            process_cqes(&ex);
-        }
-
-        num_completed
-    }
 }
 
 impl Drop for IoContext {
+    /// Releases all resources associated with the runtime if no other
+    /// `Executor` instances are alive.
     fn drop(&mut self) {
         drop(RunGuard {
             p: self.p.clone(),
@@ -1139,6 +1178,18 @@ impl Drop for IoContext {
 }
 
 impl Default for IoContext {
+    /// Returns a default-constructed `IoContext`. Equivalent to
+    /// `IoContext::new()`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let ioc = fiona::IoContext::default();
+    /// let params = ioc.get_executor().get_params();
+    /// assert_eq!(params.sq_entries(), 256);
+    /// assert_eq!(params.cq_entries(), 1024);
+    /// assert_eq!(params.num_files(), 1024);
+    /// ```
     fn default() -> Self {
         Self::new()
     }
@@ -1156,6 +1207,8 @@ pub struct IoContextParams {
 }
 
 impl IoContextParams {
+    /// Returns a default-constructed instance of the `IoContextParams`, which
+    /// has a SQ size of 256, CQ size of 1024 and 1024 file entries.
     #[must_use]
     fn new() -> Self {
         Self {
@@ -1185,6 +1238,8 @@ impl IoContextParams {
 }
 
 impl Default for IoContextParams {
+    /// Default-constructs an instance of the `IoContextParams`. Equivalent to
+    /// `IoContextParams::new()`.
     fn default() -> Self {
         Self::new()
     }
@@ -1222,6 +1277,16 @@ impl IoContextBuilder {
 
     /// Consumes the current builder instance and produces an [`IoContext`] with
     /// the provided configuration.
+    ///
+    /// # Example
+    /// ```
+    /// let builder = fiona::IoContext::builder();
+    /// let ioc = builder
+    ///     .sq_entries(512)
+    ///     .cq_entries(16 * 1024)
+    ///     .num_files(64 * 1024)
+    ///     .build();
+    /// ```
     #[must_use]
     pub fn build(self) -> IoContext {
         let (tx, rx) = std::sync::mpsc::channel();
