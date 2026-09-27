@@ -3,7 +3,7 @@
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 use crate::{
-    Executor, FdImpl, FixedBuf, OpType, RefCount, add_obj_ref, add_op_ref,
+    Executor, FdImpl, FixedBuf, OpType, RefCount, Result, add_obj_ref, add_op_ref,
     common::{CancelFuture, CloseFuture},
     get_sqe, make_io_uring_op, release_impl, release_obj,
 };
@@ -12,7 +12,10 @@ use liburing_rs::{
     io_uring_prep_close_direct, io_uring_prep_open_direct, io_uring_prep_read_fixed,
     io_uring_prep_write_fixed, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
-use nix::libc::{O_CREAT, O_RDWR, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP, S_IWUSR};
+use nix::{
+    errno::Errno,
+    libc::{O_CREAT, O_RDWR, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP, S_IWUSR},
+};
 use slotmap::{DefaultKey, Key, KeyData};
 use std::{
     alloc::Layout,
@@ -26,17 +29,6 @@ use std::{
     range::Range,
     task::Poll,
 };
-
-//-----------------------------------------------------------------------------
-
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum Error {
-    OpenError,
-    WriteError,
-    ReadError,
-    CancelError,
-    CloseError,
-}
 
 //-----------------------------------------------------------------------------
 
@@ -68,7 +60,7 @@ pub struct File {
 impl File {
     pub fn open(
         ex: &Executor, path: impl AsRef<Path>,
-    ) -> impl Future<Output = Result<File, Error>> + 'static {
+    ) -> impl Future<Output = Result<File>> + 'static {
         let ex = ex.clone();
 
         let path = CString::new(path.as_ref().as_os_str().as_bytes()).unwrap();
@@ -84,7 +76,7 @@ impl File {
 
     pub fn write_subspan_at<R: RangeBounds<usize>>(
         &self, range: R, buf: FixedBuf, offset: u64,
-    ) -> impl Future<Output = (Result<usize, Error>, FixedBuf)> {
+    ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
         let file_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!file_impl.write_pending, "A write is already pending.");
         assert_eq!(
@@ -137,13 +129,13 @@ impl File {
 
     pub fn write_at(
         &self, buf: FixedBuf, offset: u64,
-    ) -> impl Future<Output = (Result<usize, Error>, FixedBuf)> {
+    ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
         self.write_subspan_at(.., buf, offset)
     }
 
     pub fn read_subspan_at<R: RangeBounds<usize>>(
         &self, range: R, buf: FixedBuf, offset: u64,
-    ) -> impl Future<Output = (Result<usize, Error>, FixedBuf)> {
+    ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
         let file_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(
             !file_impl.write_pending,
@@ -195,7 +187,7 @@ impl File {
 
     pub fn read_at(
         &self, buf: FixedBuf, offset: u64,
-    ) -> impl Future<Output = (Result<usize, Error>, FixedBuf)> {
+    ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
         self.read_subspan_at(.., buf, offset)
     }
 
@@ -236,7 +228,7 @@ impl File {
         File { p }
     }
 
-    pub fn cancel(&self) -> impl Future<Output = Result<(), Error>> {
+    pub fn cancel(&self) -> impl Future<Output = Result<()>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
         let file_impl = unsafe { &mut *self.p.as_ptr() };
@@ -266,23 +258,15 @@ impl File {
             .borrow_mut()
             .insert(make_io_uring_op(ref_count, OpType::FdCancel), &file_impl.fd_impl.ex);
 
-        async move {
-            let r = CancelFuture {
-                fd_impl,
-                completed: false,
-                op: Some(key.data().as_ffi()),
-                _m: PhantomData,
-            }
-            .await;
-
-            match r {
-                Ok(()) => Ok(()),
-                Err(_) => Err(Error::CancelError),
-            }
+        CancelFuture {
+            fd_impl,
+            completed: false,
+            op: Some(key.data().as_ffi()),
+            _m: PhantomData,
         }
     }
 
-    pub fn close(&self) -> impl Future<Output = Result<(), Error>> {
+    pub fn close(&self) -> impl Future<Output = Result<()>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
 
         let file_impl = unsafe { &mut *self.p.as_ptr() };
@@ -312,19 +296,11 @@ impl File {
             .borrow_mut()
             .insert(make_io_uring_op(ref_count, OpType::FdClose), &file_impl.fd_impl.ex);
 
-        async move {
-            let r = CloseFuture {
-                fd_impl,
-                completed: false,
-                op: Some(key.data().as_ffi()),
-                _m: PhantomData,
-            }
-            .await;
-
-            match r {
-                Ok(()) => Ok(()),
-                Err(_) => Err(Error::CloseError),
-            }
+        CloseFuture {
+            fd_impl,
+            completed: false,
+            op: Some(key.data().as_ffi()),
+            _m: PhantomData,
         }
     }
 }
@@ -353,7 +329,7 @@ struct OpenFuture {
 }
 
 impl Future for OpenFuture {
-    type Output = Result<File, Error>;
+    type Output = Result<File>;
 
     #[inline]
     fn poll(
@@ -404,7 +380,7 @@ impl Future for OpenFuture {
 
                 let res = op.res;
                 if res < 0 {
-                    Poll::Ready(Err(Error::OpenError))
+                    Poll::Ready(Err(Errno::from_raw(-res)))
                 } else {
                     let fd = res;
                     drop(io_ops);
@@ -454,7 +430,7 @@ struct WriteFuture<'a> {
 }
 
 impl Future for WriteFuture<'_> {
-    type Output = (Result<usize, Error>, FixedBuf);
+    type Output = (Result<usize>, FixedBuf);
 
     #[inline]
     fn poll(
@@ -484,7 +460,7 @@ impl Future for WriteFuture<'_> {
 
                 let res = op.res;
                 if res < 0 {
-                    Poll::Ready((Err(Error::WriteError), buf.take().unwrap()))
+                    Poll::Ready((Err(Errno::from_raw(-res)), buf.take().unwrap()))
                 } else {
                     Poll::Ready((Ok(op.res as _), buf.take().unwrap()))
                 }
@@ -573,7 +549,7 @@ struct ReadFuture<'a> {
 }
 
 impl Future for ReadFuture<'_> {
-    type Output = (Result<usize, Error>, FixedBuf);
+    type Output = (Result<usize>, FixedBuf);
 
     #[inline]
     fn poll(
@@ -603,7 +579,7 @@ impl Future for ReadFuture<'_> {
 
                 let res = op.res;
                 if res < 0 {
-                    Poll::Ready((Err(Error::ReadError), buf.take().unwrap()))
+                    Poll::Ready((Err(Errno::from_raw(-res)), buf.take().unwrap()))
                 } else {
                     Poll::Ready((Ok(op.res as _), buf.take().unwrap()))
                 }
