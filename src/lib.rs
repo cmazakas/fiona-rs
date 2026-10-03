@@ -2081,6 +2081,8 @@ impl<T, F: Future<Output = T>> Future for WrapperFuture<T, F> {
 
 //-----------------------------------------------------------------------------
 
+/// A [`JoinHandle`] permits awaiting a spawned task. Dropping the
+/// [`JoinHandle`] does not cancel the backing task.
 pub struct JoinHandle<T> {
     done: bool,
     task: Option<Task>,
@@ -2092,6 +2094,7 @@ impl<T: Unpin> Unpin for JoinHandle<T> {}
 impl<T> Future for JoinHandle<T> {
     type Output = T;
 
+    /// Check if the backing task has completed and if so, return the result.
     #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         assert!(!self.done);
@@ -2125,26 +2128,63 @@ impl<T> Future for JoinHandle<T> {
 
 //-----------------------------------------------------------------------------
 
+/// The [`Executor`] is a lightweight, cheaply-copyable handle to a ring and all
+/// of its associated data.
+///
+/// The `Executor` is the main way a user interacts with the runtime and it's used for [registered buffers](https://docs.rs/axboe-liburing/latest/liburing_rs/io_uring_registered_buffers/index.html)
+/// and [provided buffers](https://docs.rs/axboe-liburing/latest/liburing_rs/io_uring_provided_buffers/index.html).
+/// The `Executor` is the mechanism through which callers schedule work, via
+/// [`Executor::spawn`] calls. Callers can also inspect the [`IoContextParams`]
+/// that were used to conigure the ring via [`Executor::get_params`].
 #[derive(Clone)]
 pub struct Executor {
     p: Rc<IoContextFrame>,
 }
 
 impl Executor {
-    fn ring(&self) -> *mut io_uring {
-        &raw mut *self.p.ioring.as_ptr()
-    }
-
+    /// Return a copy of the parameters used to configure the ring. See
+    /// [`IoContextParams`] for more details.
     #[must_use]
     pub fn get_params(&self) -> IoContextParams {
         *self.p.params.borrow()
     }
 
+    /// Returns whether or not the ring has a provided buffer group with id
+    /// `bgid` registered to it.
     #[must_use]
     pub fn has_buf_group(&self, bgid: u16) -> bool {
         self.p.buf_groups.borrow().contains_key(&bgid)
     }
 
+    /// Registers a [provided buffer group](https://docs.rs/axboe-liburing/latest/liburing_rs/io_uring_provided_buffers/index.html)
+    /// with the ring, under the id `bgid`. The buffer group will contain
+    /// `num_bufs` buffers, each with size `buf_len`. This is accomplished
+    /// using a single flat allocation, sub-divided accordingly.
+    ///
+    /// Provided buffers enable the kernel to select a buffer from a ring buffer
+    /// of ids. This is primarily used by the library to support multishot recv,
+    /// an io_uring-specific operation where a single recv is scheduled and
+    /// completions are posted as ingress traffic is processed, using the
+    /// provided buffer ring for buffer selection.
+    ///
+    /// Multishot io_uring operations require a buffer group id at startup, and
+    /// this is manually supplied by the user. The user is responsible for
+    /// managing buffer groups and balancing operations among them, if one
+    /// buffer group is not sufficient.
+    ///
+    /// # Example
+    /// ```
+    /// let ioc = fiona::IoContext::new();
+    /// let ex = ioc.get_executor();
+    /// // The kernel now has 1024 buffers to choose from, each with a size of
+    /// // 1024 bytes.
+    /// ex.register_buf_group(1234, 1024, 1024).unwrap();
+    /// // We can register another buffer group to use as well.
+    /// ex.register_buf_group(4321, 1024, 1024).unwrap();
+    ///
+    /// assert!(ex.has_buf_group(1234));
+    /// assert!(ex.has_buf_group(4321));
+    /// ```
     pub fn register_buf_group(&self, bgid: u16, num_bufs: u32, buf_len: usize) -> Result<()> {
         let mut ret = 0_i32;
 
@@ -2208,6 +2248,11 @@ impl Executor {
         Ok(())
     }
 
+    /// Registers a set of buffers with the kernel, via
+    /// [`liburing_rs::io_uring_register_buffers`]. These are used by the
+    /// runtime for file reads and writes. Once registered, the user can call
+    /// [`Executor::get_fixed_buf`] to grab a free buffer from the pool and then
+    /// use it for file operations.
     pub fn register_fixed_buffers(&self, num_bufs: u32, buf_len: usize) -> Result<()> {
         assert!(
             self.p.fixed_bufs.borrow().buf.is_empty(),
@@ -2251,9 +2296,48 @@ impl Executor {
         Ok(())
     }
 
+    /// Returns an instance of [`FixedBuf`] if one is available, or `None`
+    /// otherwise. A `FixedBuf` is returned to the registered pool on Drop.
     #[must_use]
     pub fn get_fixed_buf(&self) -> Option<FixedBuf> {
         self.p.fixed_bufs.borrow_mut().get_next_buf(self)
+    }
+
+    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> JoinHandle<T> {
+        assert!(unsafe { !self.p.head.get_inner().is_null() });
+
+        let task = self.spawn_impl_helper(f);
+
+        let header = task.task_header();
+
+        unsafe { header.next.set_inner(&self.p.head.get_next()) };
+        unsafe { header.prev.set_inner(&self.p.head.unsafe_clone()) };
+
+        unsafe {
+            self.p
+                .head
+                .get_next()
+                .set_prev(&DanglingTask::new(task.task_header_as_ptr()));
+        }
+
+        unsafe {
+            self.p
+                .head
+                .set_next(&DanglingTask::new(task.task_header_as_ptr()));
+        }
+
+        forget(task.clone());
+
+        self.p
+            .local_task_queue
+            .borrow_mut()
+            .push_back(Task::downgrade(&task));
+
+        JoinHandle::<T> {
+            task: Some(task),
+            done: false,
+            _marker: PhantomData,
+        }
     }
 
     fn spawn_impl_helper<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> Task {
@@ -2311,41 +2395,8 @@ impl Executor {
         }
     }
 
-    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> JoinHandle<T> {
-        assert!(unsafe { !self.p.head.get_inner().is_null() });
-
-        let task = self.spawn_impl_helper(f);
-
-        let header = task.task_header();
-
-        unsafe { header.next.set_inner(&self.p.head.get_next()) };
-        unsafe { header.prev.set_inner(&self.p.head.unsafe_clone()) };
-
-        unsafe {
-            self.p
-                .head
-                .get_next()
-                .set_prev(&DanglingTask::new(task.task_header_as_ptr()));
-        }
-
-        unsafe {
-            self.p
-                .head
-                .set_next(&DanglingTask::new(task.task_header_as_ptr()));
-        }
-
-        forget(task.clone());
-
-        self.p
-            .local_task_queue
-            .borrow_mut()
-            .push_back(Task::downgrade(&task));
-
-        JoinHandle::<T> {
-            task: Some(task),
-            done: false,
-            _marker: PhantomData,
-        }
+    fn ring(&self) -> *mut io_uring {
+        &raw mut *self.p.ioring.as_ptr()
     }
 }
 
