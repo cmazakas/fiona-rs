@@ -94,17 +94,18 @@ use nix::{errno::Errno, sys::socket::SockaddrStorage};
 use liburing_rs::{
     __kernel_timespec, AF_INET, AF_INET6, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_MORE,
     IORING_CQE_F_NOTIF, IORING_SETUP_COOP_TASKRUN, IORING_SETUP_CQSIZE, IORING_SETUP_DEFER_TASKRUN,
-    IORING_SETUP_SINGLE_ISSUER, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring,
-    io_uring_buf_ring, io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask,
-    io_uring_cq_advance, io_uring_cqe, io_uring_for_each_cqe, io_uring_free_buf_ring,
-    io_uring_get_events, io_uring_get_sqe, io_uring_params, io_uring_peek_cqe,
-    io_uring_prep_close_direct, io_uring_prep_connect, io_uring_prep_link_timeout,
-    io_uring_prep_msg_ring, io_uring_queue_exit, io_uring_queue_init_params,
-    io_uring_register_buffers, io_uring_register_files_sparse, io_uring_register_ring_fd,
-    io_uring_register_sync_msg, io_uring_setup_buf_ring, io_uring_sq_space_left, io_uring_sqe,
-    io_uring_sqe_set_data, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
-    io_uring_submit_and_get_events, io_uring_submit_and_wait, io_uring_submit_and_wait_timeout,
-    io_uring_unregister_buf_ring, io_uring_unregister_buffers, iovec,
+    IORING_SETUP_NO_SQARRAY, IORING_SETUP_SINGLE_ISSUER, IORING_SETUP_SQ_REWIND,
+    IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring, io_uring_buf_ring,
+    io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_cq_advance,
+    io_uring_cqe, io_uring_for_each_cqe, io_uring_free_buf_ring, io_uring_get_events,
+    io_uring_get_sqe, io_uring_params, io_uring_peek_cqe, io_uring_prep_close_direct,
+    io_uring_prep_connect, io_uring_prep_link_timeout, io_uring_prep_msg_ring, io_uring_queue_exit,
+    io_uring_queue_init_params, io_uring_register_buffers, io_uring_register_files_sparse,
+    io_uring_register_ring_fd, io_uring_register_sync_msg, io_uring_setup_buf_ring,
+    io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data, io_uring_sqe_set_data64,
+    io_uring_sqe_set_flags, io_uring_submit_and_get_events, io_uring_submit_and_wait,
+    io_uring_submit_and_wait_timeout, io_uring_unregister_buf_ring, io_uring_unregister_buffers,
+    iovec,
 };
 
 mod common;
@@ -1304,6 +1305,8 @@ impl IoContextBuilder {
         params.flags |= IORING_SETUP_SINGLE_ISSUER;
         params.flags |= IORING_SETUP_DEFER_TASKRUN;
         params.flags |= IORING_SETUP_COOP_TASKRUN;
+        params.flags |= IORING_SETUP_NO_SQARRAY;
+        params.flags |= IORING_SETUP_SQ_REWIND;
 
         let ioring = unsafe { std::mem::zeroed::<io_uring>() };
 

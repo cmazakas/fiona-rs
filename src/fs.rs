@@ -415,6 +415,8 @@ impl Drop for OpenFuture {
             let sqe = get_sqe(&self.ex);
             let fd = op.res as _;
             unsafe { io_uring_prep_close_direct(sqe, fd) };
+            unsafe { io_uring_sqe_set_data64(sqe, 0) };
+            unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
         }
 
         io_ops.remove(key).unwrap();
