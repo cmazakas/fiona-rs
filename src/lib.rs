@@ -2136,7 +2136,6 @@ impl<T> Future for JoinHandle<T> {
 /// The `Executor` is the mechanism through which callers schedule work, via
 /// [`Executor::spawn`] calls. Callers can also inspect the [`IoContextParams`]
 /// that were used to conigure the ring via [`Executor::get_params`].
-#[derive(Clone)]
 pub struct Executor {
     p: Rc<IoContextFrame>,
 }
@@ -2253,6 +2252,20 @@ impl Executor {
     /// runtime for file reads and writes. Once registered, the user can call
     /// [`Executor::get_fixed_buf`] to grab a free buffer from the pool and then
     /// use it for file operations.
+    ///
+    /// Unliked provided buffers, registered buffers are a single group and as
+    /// such have no buffer id. A global set is registered once before usage and
+    /// then released by the ring on destruction.
+    ///
+    /// # Example
+    /// ```
+    /// let ioc = fiona::IoContext::new();
+    /// let ex = ioc.get_executor();
+    /// // Registers 128 4KB buffers with the ring.
+    /// ex.register_fixed_buffers(128, 4096).unwrap();
+    /// let mut buf = ex.get_fixed_buf().unwrap();
+    /// buf.as_mut_slice().iter_mut().for_each(|x| { *x = 0x12; });
+    /// ```
     pub fn register_fixed_buffers(&self, num_bufs: u32, buf_len: usize) -> Result<()> {
         assert!(
             self.p.fixed_bufs.borrow().buf.is_empty(),
@@ -2303,6 +2316,24 @@ impl Executor {
         self.p.fixed_bufs.borrow_mut().get_next_buf(self)
     }
 
+    /// Creates and schedules a task that will run on the next tick of
+    /// [`IoContext::run`]. Callers can use the returned [`JoinHandle`] to await
+    /// the results of the task. Dropping the `JoinHandle` does not cancel the
+    /// backing task.
+    ///
+    /// # Example
+    /// ```
+    /// let mut ioc = fiona::IoContext::new();
+    /// let ex = ioc.get_executor();
+    /// ex.spawn({
+    ///     let ex = ex.clone();
+    ///     async move {
+    ///         let h = ex.spawn(async { vec![1, 2, 3, 4] });
+    ///         let xs = h.await;
+    ///         println!("{xs:?}");
+    ///     }
+    /// });
+    /// ```
     pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, f: F) -> JoinHandle<T> {
         assert!(unsafe { !self.p.head.get_inner().is_null() });
 
@@ -2397,6 +2428,16 @@ impl Executor {
 
     fn ring(&self) -> *mut io_uring {
         &raw mut *self.p.ioring.as_ptr()
+    }
+}
+
+impl Clone for Executor {
+    /// Clones the `Executor` by cloning the underlying `Rc`. Note, `Executor`
+    /// participates in ownership of the same underlying data as the `IoContext`
+    /// itself. All data is released when the `IoContext` and every `Executor`
+    /// instance are destructed.
+    fn clone(&self) -> Self {
+        Self { p: self.p.clone() }
     }
 }
 
