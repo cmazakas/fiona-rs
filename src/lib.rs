@@ -880,11 +880,21 @@ enum OpType {
         path: CString,
     },
     FileWrite {
-        buf: Option<FixedBuf>,
+        buf: Vec<u8>,
         subspan: Range<usize>,
         offset: u64,
     },
     FileRead {
+        buf: Vec<u8>,
+        subspan: Range<usize>,
+        offset: u64,
+    },
+    FileWriteFixed {
+        buf: Option<FixedBuf>,
+        subspan: Range<usize>,
+        offset: u64,
+    },
+    FileReadFixed {
         buf: Option<FixedBuf>,
         subspan: Range<usize>,
         offset: u64,
@@ -1541,8 +1551,8 @@ fn get_cqe_handler(op: &IoUringOp) -> CqeHandler {
         OpType::TcpShutdown | OpType::FdClose | OpType::FdCancel => on_fd_close,
         OpType::DropCancel => on_drop_cancel,
         OpType::FileOpen { .. } => on_file_open,
-        OpType::FileWrite { .. } => on_file_write,
-        OpType::FileRead { .. } => on_file_read,
+        OpType::FileWrite { .. } | OpType::FileWriteFixed { .. } => on_file_write,
+        OpType::FileRead { .. } | OpType::FileReadFixed { .. } => on_file_read,
     }
 }
 

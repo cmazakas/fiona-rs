@@ -210,7 +210,7 @@ fn file_write() {
             }
 
             for buf in fixed_bufs {
-                let (written, b) = file.write_at(buf, -1 as _).await;
+                let (written, b) = file.write_at_fixed(buf, -1 as _).await;
                 assert_eq!(written.unwrap(), b.len());
             }
 
@@ -255,7 +255,7 @@ fn file_subspan_write() {
             let mut written = 0;
             while written < message.len() {
                 let (n, b) = file
-                    .write_subspan_at(written..written + 1024, buf, -1 as _)
+                    .write_subspan_at_fixed(written..written + 1024, buf, -1 as _)
                     .await;
                 buf = b;
 
@@ -294,11 +294,11 @@ fn file_offset_out_of_bounds() {
             let n = msg.len();
             buf[..n].copy_from_slice(msg.as_bytes());
 
-            let (written, _buf) = file.write_subspan_at(..n, buf, -1 as _).await;
+            let (written, _buf) = file.write_subspan_at_fixed(..n, buf, -1 as _).await;
             buf = _buf;
             assert_eq!(written.unwrap(), msg.len());
 
-            let (n, _buf) = file.write_subspan_at(..n, buf, 1234).await;
+            let (n, _buf) = file.write_subspan_at_fixed(..n, buf, 1234).await;
             assert_eq!(n.unwrap(), msg.len());
         }
     });
@@ -347,7 +347,7 @@ fn file_eager_drop_write() {
             let mut tasks = Vec::new();
 
             for (i, buf) in bufs.into_iter().enumerate() {
-                let task = files[i].write_subspan_at(..n, buf, -1 as _);
+                let task = files[i].write_subspan_at_fixed(..n, buf, -1 as _);
                 tasks.push(task);
             }
 
@@ -403,7 +403,7 @@ fn file_read() {
             }
 
             for buf in fixed_bufs {
-                let (written, b) = file.write_at(buf, -1 as _).await;
+                let (written, b) = file.write_at_fixed(buf, -1 as _).await;
                 assert_eq!(written.unwrap(), b.len());
             }
 
@@ -417,7 +417,7 @@ fn file_read() {
             for _ in 0..8 {
                 let buf = ex.get_fixed_buf().unwrap();
 
-                let (n, buf) = file.read_at(buf, total).await;
+                let (n, buf) = file.read_at_fixed(buf, total).await;
                 assert!(n.is_ok());
 
                 let n = n.unwrap();
@@ -450,7 +450,7 @@ fn file_read_eager_drop() {
             ex.register_fixed_buffers(16, 1024).unwrap();
 
             {
-                let mut f = pin!(file.read_at(ex.get_fixed_buf().unwrap(), -1 as _));
+                let mut f = pin!(file.read_at_fixed(ex.get_fixed_buf().unwrap(), -1 as _));
                 poll_fn(|cx| {
                     assert!(f.as_mut().poll(cx).is_pending());
                     Poll::Ready(())
@@ -497,9 +497,9 @@ fn file_read_incremental() {
 
             while total < file_size {
                 let (n, b) = if total + 512 >= file_size {
-                    file.read_subspan_at(total.., buf, total as u64).await
+                    file.read_subspan_at_fixed(total.., buf, total as u64).await
                 } else {
-                    file.read_subspan_at(total..(total + 512), buf, total as u64)
+                    file.read_subspan_at_fixed(total..(total + 512), buf, total as u64)
                         .await
                 };
 
@@ -551,7 +551,10 @@ fn file_read_concurrent() {
             let num_reads = file_size.div_ceil(buf_len);
             for i in 0..num_reads {
                 joinset.push(
-                    file.read_at(ex.get_fixed_buf().unwrap(), (buf_len * i).try_into().unwrap()),
+                    file.read_at_fixed(
+                        ex.get_fixed_buf().unwrap(),
+                        (buf_len * i).try_into().unwrap(),
+                    ),
                 );
             }
 
@@ -595,12 +598,14 @@ fn file_close() {
                 }
             });
 
-            let (n, _buf) = file.read_at(ex.get_fixed_buf().unwrap(), -1 as _).await;
+            let (n, _buf) = file
+                .read_at_fixed(ex.get_fixed_buf().unwrap(), -1 as _)
+                .await;
             assert!(n.unwrap() > 0);
 
             h.await;
 
-            let (n, _buf) = file.read_at(ex.get_fixed_buf().unwrap(), 0).await;
+            let (n, _buf) = file.read_at_fixed(ex.get_fixed_buf().unwrap(), 0).await;
             assert!(n.is_err());
         }
     });
@@ -629,7 +634,7 @@ fn file_cancel() {
 
             let mut joinset = FuturesUnordered::new();
             for i in 0..128 {
-                joinset.push(file.read_at(ex.get_fixed_buf().unwrap(), i as _));
+                joinset.push(file.read_at_fixed(ex.get_fixed_buf().unwrap(), i as _));
             }
 
             poll_fn(|cx| {
@@ -649,6 +654,73 @@ fn file_cancel() {
                     assert!(n.is_ok());
                 }
             }
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn file_read_write_non_fixed() {
+    // Elementary test of file reading.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let pathname = "/tmp/fiona_test_file_read.txt";
+
+            let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
+
+            let mut message = vec![0; 8 * 1024];
+            {
+                let mut rng = rand::rngs::StdRng::from_os_rng();
+                rand::RngCore::fill_bytes(&mut rng, &mut message);
+            }
+
+            let mut bufs = Vec::new();
+            {
+                let mut msg = &message[..];
+                for _ in 0..8 {
+                    let mut buf = vec![0_u8; 1024];
+
+                    let (to_write, remaining) = msg.split_at(1024);
+                    msg = remaining;
+
+                    buf.as_mut_slice().copy_from_slice(to_write);
+                    bufs.push(buf);
+                }
+            }
+
+            for buf in bufs {
+                let (written, b) = file.write_at(buf, -1 as _).await;
+                assert_eq!(written.unwrap(), b.len());
+            }
+
+            let content = std::fs::read(pathname).unwrap();
+            assert_eq!(message, content);
+
+            // Now read back what we wrote.
+            let mut total = 0;
+
+            let mut assembled_msg = Vec::new();
+            for _ in 0..8 {
+                let buf = vec![0_u8; 1024];
+
+                let (n, buf) = file.read_at(buf, total).await;
+                assert!(n.is_ok());
+
+                let n = n.unwrap();
+                total += n as u64;
+
+                assembled_msg.extend_from_slice(&buf[..n]);
+            }
+
+            assert_eq!(total, message.len() as u64);
+            assert_eq!(assembled_msg, message);
         }
     });
 

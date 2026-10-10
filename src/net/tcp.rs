@@ -4,7 +4,7 @@
 
 use crate::{
     BorrowedBufs, Executor, FdImpl, FixedBuf, OpType, RefCount, Result, add_obj_ref, add_op_ref,
-    common::{CancelFuture, CloseFuture},
+    common::{CancelFuture, CloseFuture, ErasedBuf},
     get_sqe, make_io_uring_op, release_impl, release_obj, timer_wheel,
 };
 use core::panic;
@@ -861,11 +861,6 @@ impl Drop for SendFutureImpl<'_> {
             io_ops.remove(key).unwrap();
         }
     }
-}
-
-enum ErasedBuf {
-    Vec(Vec<u8>),
-    FixedBuf(FixedBuf),
 }
 
 impl SendFutureImpl<'_> {

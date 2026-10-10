@@ -4,7 +4,7 @@
 
 use std::{marker::PhantomData, mem::offset_of, task::Poll};
 
-use crate::{FdImpl, OpType, add_op_ref, get_sqe, make_io_uring_op};
+use crate::{FdImpl, FixedBuf, OpType, add_op_ref, get_sqe, make_io_uring_op};
 use liburing_rs::{
     IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_FD_FIXED, io_uring_prep_cancel_fd,
     io_uring_prep_cancel64, io_uring_prep_close, io_uring_prep_close_direct,
@@ -12,6 +12,15 @@ use liburing_rs::{
 };
 use nix::errno::Errno;
 use slotmap::{DefaultKey, Key, KeyData};
+
+//-----------------------------------------------------------------------------
+
+pub(crate) enum ErasedBuf {
+    Vec(Vec<u8>),
+    FixedBuf(FixedBuf),
+}
+
+//-----------------------------------------------------------------------------
 
 pub(crate) struct CancelFuture<'a> {
     pub(crate) fd_impl: *mut FdImpl,

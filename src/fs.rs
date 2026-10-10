@@ -4,13 +4,14 @@
 
 use crate::{
     Executor, FdImpl, FixedBuf, OpType, RefCount, Result, add_obj_ref, add_op_ref,
-    common::{CancelFuture, CloseFuture},
+    common::{CancelFuture, CloseFuture, ErasedBuf},
     get_sqe, make_io_uring_op, release_impl, release_obj,
 };
 use liburing_rs::{
     IORING_FILE_INDEX_ALLOC, IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, io_uring_prep_cancel64,
-    io_uring_prep_close_direct, io_uring_prep_open_direct, io_uring_prep_read_fixed,
-    io_uring_prep_write_fixed, io_uring_sqe_set_data64, io_uring_sqe_set_flags,
+    io_uring_prep_close_direct, io_uring_prep_open_direct, io_uring_prep_read,
+    io_uring_prep_read_fixed, io_uring_prep_write, io_uring_prep_write_fixed,
+    io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
 use nix::{
     errno::Errno,
@@ -25,10 +26,32 @@ use std::{
     ops::RangeBounds,
     os::unix::ffi::OsStrExt,
     path::Path,
+    pin::Pin,
     ptr::{self, NonNull},
     range::Range,
     task::Poll,
 };
+
+//-----------------------------------------------------------------------------
+
+fn make_range<R: RangeBounds<usize>>(range: R, buf_len: usize) -> Range<usize> {
+    let start = match range.start_bound() {
+        std::ops::Bound::Included(&s) => s,
+        std::ops::Bound::Excluded(&s) => s + 1,
+        std::ops::Bound::Unbounded => 0,
+    };
+
+    let end = match range.end_bound() {
+        std::ops::Bound::Included(&e) => e + 1,
+        std::ops::Bound::Excluded(&e) => e,
+        std::ops::Bound::Unbounded => buf_len,
+    };
+
+    let subspan = Range { start, end };
+    assert!(subspan.end <= buf_len);
+
+    subspan
+}
 
 //-----------------------------------------------------------------------------
 
@@ -74,7 +97,7 @@ impl File {
         }
     }
 
-    pub fn write_subspan_at<R: RangeBounds<usize>>(
+    pub fn write_subspan_at_fixed<R: RangeBounds<usize>>(
         &self, range: R, buf: FixedBuf, offset: u64,
     ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
         let file_impl = unsafe { &mut *self.p.as_ptr() };
@@ -85,20 +108,53 @@ impl File {
         );
         file_impl.write_pending = true;
 
-        let start = match range.start_bound() {
-            std::ops::Bound::Included(&s) => s,
-            std::ops::Bound::Excluded(&s) => s + 1,
-            std::ops::Bound::Unbounded => 0,
+        let subspan = make_range(range, buf.len());
+
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(FileImpl, fd_impl.ref_count))
+                .cast()
         };
 
-        let end = match range.end_bound() {
-            std::ops::Bound::Included(&e) => e + 1,
-            std::ops::Bound::Excluded(&e) => e,
-            std::ops::Bound::Unbounded => buf.len(),
-        };
+        let key = file_impl.fd_impl.ex.p.io_ops.borrow_mut().insert(
+            make_io_uring_op(
+                ref_count,
+                OpType::FileWriteFixed {
+                    buf: Some(buf),
+                    subspan,
+                    offset,
+                },
+            ),
+            &file_impl.fd_impl.ex,
+        );
 
-        let subspan = Range { start, end };
-        assert!(subspan.end <= buf.len());
+        WriteFixedFuture(WriteFutureImpl {
+            file: self,
+            completed: false,
+            op: Some(key.data().as_ffi()),
+        })
+    }
+
+    pub fn write_at_fixed(
+        &self, buf: FixedBuf, offset: u64,
+    ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
+        self.write_subspan_at_fixed(.., buf, offset)
+    }
+
+    pub fn write_subspan_at<R: RangeBounds<usize>>(
+        &self, range: R, buf: Vec<u8>, offset: u64,
+    ) -> impl Future<Output = (Result<usize>, Vec<u8>)> {
+        let file_impl = unsafe { &mut *self.p.as_ptr() };
+        assert!(!file_impl.write_pending, "A write is already pending.");
+        assert_eq!(
+            file_impl.read_pending, 0,
+            "A read and a write cannot be scheduled concurrently."
+        );
+        file_impl.write_pending = true;
+
+        let subspan = make_range(range, buf.len());
 
         let ref_count = unsafe {
             self.p
@@ -112,7 +168,7 @@ impl File {
             make_io_uring_op(
                 ref_count,
                 OpType::FileWrite {
-                    buf: Some(buf),
+                    buf,
                     subspan,
                     offset,
                 },
@@ -120,20 +176,20 @@ impl File {
             &file_impl.fd_impl.ex,
         );
 
-        WriteFuture {
+        WriteFuture(WriteFutureImpl {
             file: self,
             completed: false,
             op: Some(key.data().as_ffi()),
-        }
+        })
     }
 
     pub fn write_at(
-        &self, buf: FixedBuf, offset: u64,
-    ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
+        &self, buf: Vec<u8>, offset: u64,
+    ) -> impl Future<Output = (Result<usize>, Vec<u8>)> {
         self.write_subspan_at(.., buf, offset)
     }
 
-    pub fn read_subspan_at<R: RangeBounds<usize>>(
+    pub fn read_subspan_at_fixed<R: RangeBounds<usize>>(
         &self, range: R, buf: FixedBuf, offset: u64,
     ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
         let file_impl = unsafe { &mut *self.p.as_ptr() };
@@ -143,20 +199,52 @@ impl File {
         );
         file_impl.read_pending += 1;
 
-        let start = match range.start_bound() {
-            std::ops::Bound::Included(&s) => s,
-            std::ops::Bound::Excluded(&s) => s + 1,
-            std::ops::Bound::Unbounded => 0,
+        let subspan = make_range(range, buf.len());
+
+        let ref_count = unsafe {
+            self.p
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(FileImpl, fd_impl.ref_count))
+                .cast()
         };
 
-        let end = match range.end_bound() {
-            std::ops::Bound::Included(&e) => e + 1,
-            std::ops::Bound::Excluded(&e) => e,
-            std::ops::Bound::Unbounded => buf.len(),
-        };
+        let key = file_impl.fd_impl.ex.p.io_ops.borrow_mut().insert(
+            make_io_uring_op(
+                ref_count,
+                OpType::FileReadFixed {
+                    buf: Some(buf),
+                    subspan,
+                    offset,
+                },
+            ),
+            &file_impl.fd_impl.ex,
+        );
 
-        let subspan = Range { start, end };
-        assert!(subspan.end <= buf.len());
+        ReadFutureFixed(ReadFutureImpl {
+            file: self,
+            completed: false,
+            op: Some(key.data().as_ffi()),
+        })
+    }
+
+    pub fn read_at_fixed(
+        &self, buf: FixedBuf, offset: u64,
+    ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
+        self.read_subspan_at_fixed(.., buf, offset)
+    }
+
+    pub fn read_subspan_at<R: RangeBounds<usize>>(
+        &self, range: R, buf: Vec<u8>, offset: u64,
+    ) -> impl Future<Output = (Result<usize>, Vec<u8>)> {
+        let file_impl = unsafe { &mut *self.p.as_ptr() };
+        assert!(
+            !file_impl.write_pending,
+            "A read and write to the same file cannot be concurrent."
+        );
+        file_impl.read_pending += 1;
+
+        let subspan = make_range(range, buf.len());
 
         let ref_count = unsafe {
             self.p
@@ -170,7 +258,7 @@ impl File {
             make_io_uring_op(
                 ref_count,
                 OpType::FileRead {
-                    buf: Some(buf),
+                    buf,
                     subspan,
                     offset,
                 },
@@ -178,16 +266,16 @@ impl File {
             &file_impl.fd_impl.ex,
         );
 
-        ReadFuture {
+        ReadFuture(ReadFutureImpl {
             file: self,
             completed: false,
             op: Some(key.data().as_ffi()),
-        }
+        })
     }
 
     pub fn read_at(
-        &self, buf: FixedBuf, offset: u64,
-    ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
+        &self, buf: Vec<u8>, offset: u64,
+    ) -> impl Future<Output = (Result<usize>, Vec<u8>)> {
         self.read_subspan_at(.., buf, offset)
     }
 
@@ -425,19 +513,17 @@ impl Drop for OpenFuture {
 
 //-----------------------------------------------------------------------------
 
-struct WriteFuture<'a> {
+struct WriteFutureImpl<'a> {
     file: &'a File,
     completed: bool,
     op: Option<u64>,
 }
 
-impl Future for WriteFuture<'_> {
-    type Output = (Result<usize>, FixedBuf);
-
+impl WriteFutureImpl<'_> {
     #[inline]
-    fn poll(
+    fn poll_impl_optype(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
-    ) -> Poll<Self::Output> {
+    ) -> Poll<(Result<usize>, ErasedBuf)> {
         assert!(!self.completed);
         let file_impl = unsafe { &mut *self.file.p.as_ptr() };
 
@@ -456,23 +542,35 @@ impl Future for WriteFuture<'_> {
             }
             (true, true) => {
                 self.completed = true;
-                let OpType::FileWrite { buf, .. } = &mut op.op_type else {
-                    unreachable!()
-                };
-
                 let res = op.res;
-                if res < 0 {
-                    Poll::Ready((Err(Errno::from_raw(-res)), buf.take().unwrap()))
-                } else {
-                    Poll::Ready((Ok(op.res as _), buf.take().unwrap()))
+
+                if let OpType::FileWrite { ref mut buf, .. } = op.op_type {
+                    return if res < 0 {
+                        Poll::Ready((
+                            Err(Errno::from_raw(-res)),
+                            ErasedBuf::Vec(std::mem::take(buf)),
+                        ))
+                    } else {
+                        Poll::Ready((Ok(op.res as _), ErasedBuf::Vec(std::mem::take(buf))))
+                    };
                 }
+
+                if let OpType::FileWriteFixed { ref mut buf, .. } = op.op_type {
+                    return if res < 0 {
+                        Poll::Ready((
+                            Err(Errno::from_raw(-res)),
+                            ErasedBuf::FixedBuf(buf.take().unwrap()),
+                        ))
+                    } else {
+                        Poll::Ready((Ok(op.res as _), ErasedBuf::FixedBuf(buf.take().unwrap())))
+                    };
+                }
+
+                unreachable!()
             }
             (false, false) => {
-                let &OpType::FileWrite {
-                    ref buf,
-                    subspan,
-                    offset,
-                } = &op.op_type
+                let (OpType::FileWrite { subspan, .. } | OpType::FileWriteFixed { subspan, .. }) =
+                    op.op_type
                 else {
                     unreachable!()
                 };
@@ -480,17 +578,41 @@ impl Future for WriteFuture<'_> {
                 let sqe = get_sqe(&file_impl.fd_impl.ex);
 
                 let fd = file_impl.fd_impl.fd;
-                let buf = buf.as_ref().unwrap();
 
-                unsafe {
-                    io_uring_prep_write_fixed(
-                        sqe,
-                        fd,
-                        buf.as_ptr().add(subspan.start).cast(),
-                        (subspan.end - subspan.start).try_into().unwrap(),
-                        offset,
-                        buf.buf_idx as _,
-                    );
+                if let OpType::FileWrite {
+                    ref mut buf,
+                    offset,
+                    ..
+                } = op.op_type
+                {
+                    unsafe {
+                        io_uring_prep_write(
+                            sqe,
+                            fd,
+                            buf.as_ptr().add(subspan.start).cast(),
+                            (subspan.end - subspan.start).try_into().unwrap(),
+                            offset,
+                        );
+                    }
+                } else if let OpType::FileWriteFixed {
+                    ref mut buf,
+                    offset,
+                    ..
+                } = op.op_type
+                {
+                    let buf = buf.as_mut().unwrap();
+                    unsafe {
+                        io_uring_prep_write_fixed(
+                            sqe,
+                            fd,
+                            buf.as_ptr().add(subspan.start).cast(),
+                            (subspan.end - subspan.start).try_into().unwrap(),
+                            offset,
+                            buf.buf_idx as _,
+                        );
+                    }
+                } else {
+                    unreachable!()
                 }
 
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) };
@@ -505,7 +627,7 @@ impl Future for WriteFuture<'_> {
     }
 }
 
-impl Drop for WriteFuture<'_> {
+impl Drop for WriteFutureImpl<'_> {
     fn drop(&mut self) {
         let file_impl = unsafe { &mut *self.file.p.as_ptr() };
         file_impl.write_pending = false;
@@ -544,19 +666,61 @@ impl Drop for WriteFuture<'_> {
 
 //-----------------------------------------------------------------------------
 
-struct ReadFuture<'a> {
-    file: &'a File,
-    completed: bool,
-    op: Option<u64>,
+struct WriteFuture<'a>(WriteFutureImpl<'a>);
+
+impl Future for WriteFuture<'_> {
+    type Output = (Result<usize>, Vec<u8>);
+
+    #[inline]
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        match Pin::new(&mut self.0).poll_impl_optype(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready((n, erased_buf)) => {
+                let ErasedBuf::Vec(buf) = erased_buf else {
+                    unreachable!()
+                };
+                Poll::Ready((n, buf))
+            }
+        }
+    }
 }
 
-impl Future for ReadFuture<'_> {
+struct WriteFixedFuture<'a>(WriteFutureImpl<'a>);
+
+impl Future for WriteFixedFuture<'_> {
     type Output = (Result<usize>, FixedBuf);
 
     #[inline]
     fn poll(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> Poll<Self::Output> {
+        match Pin::new(&mut self.0).poll_impl_optype(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready((n, erased_buf)) => {
+                let ErasedBuf::FixedBuf(buf) = erased_buf else {
+                    unreachable!()
+                };
+                Poll::Ready((n, buf))
+            }
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+struct ReadFutureImpl<'a> {
+    file: &'a File,
+    completed: bool,
+    op: Option<u64>,
+}
+
+impl ReadFutureImpl<'_> {
+    #[inline]
+    fn poll_impl_optype(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<(Result<usize>, ErasedBuf)> {
         assert!(!self.completed);
         let file_impl = unsafe { &mut *self.file.p.as_ptr() };
 
@@ -575,41 +739,77 @@ impl Future for ReadFuture<'_> {
             }
             (true, true) => {
                 self.completed = true;
-                let OpType::FileRead { buf, .. } = &mut op.op_type else {
-                    unreachable!()
-                };
 
                 let res = op.res;
-                if res < 0 {
-                    Poll::Ready((Err(Errno::from_raw(-res)), buf.take().unwrap()))
-                } else {
-                    Poll::Ready((Ok(op.res as _), buf.take().unwrap()))
+
+                if let OpType::FileRead { ref mut buf, .. } = op.op_type {
+                    return if res < 0 {
+                        Poll::Ready((
+                            Err(Errno::from_raw(-res)),
+                            ErasedBuf::Vec(std::mem::take(buf)),
+                        ))
+                    } else {
+                        Poll::Ready((Ok(op.res as _), ErasedBuf::Vec(std::mem::take(buf))))
+                    };
                 }
+
+                if let OpType::FileReadFixed { ref mut buf, .. } = op.op_type {
+                    return if res < 0 {
+                        Poll::Ready((
+                            Err(Errno::from_raw(-res)),
+                            ErasedBuf::FixedBuf(buf.take().unwrap()),
+                        ))
+                    } else {
+                        Poll::Ready((Ok(op.res as _), ErasedBuf::FixedBuf(buf.take().unwrap())))
+                    };
+                }
+
+                unreachable!()
             }
             (false, false) => {
-                let &mut OpType::FileRead {
-                    ref mut buf,
-                    subspan,
-                    offset,
-                } = &mut op.op_type
+                let (OpType::FileRead { subspan, .. } | OpType::FileReadFixed { subspan, .. }) =
+                    op.op_type
                 else {
                     unreachable!()
                 };
 
                 let sqe = get_sqe(&file_impl.fd_impl.ex);
-
                 let fd = file_impl.fd_impl.fd;
-                let buf = buf.as_mut().unwrap();
 
-                unsafe {
-                    io_uring_prep_read_fixed(
-                        sqe,
-                        fd,
-                        buf.as_mut_ptr().add(subspan.start).cast(),
-                        (subspan.end - subspan.start).try_into().unwrap(),
-                        offset,
-                        buf.buf_idx as _,
-                    );
+                if let OpType::FileRead {
+                    ref mut buf,
+                    offset,
+                    ..
+                } = op.op_type
+                {
+                    unsafe {
+                        io_uring_prep_read(
+                            sqe,
+                            fd,
+                            buf.as_mut_ptr().add(subspan.start).cast(),
+                            (subspan.end - subspan.start).try_into().unwrap(),
+                            offset,
+                        );
+                    }
+                } else if let OpType::FileReadFixed {
+                    ref mut buf,
+                    offset,
+                    ..
+                } = op.op_type
+                {
+                    let buf = buf.as_mut().unwrap();
+                    unsafe {
+                        io_uring_prep_read_fixed(
+                            sqe,
+                            fd,
+                            buf.as_mut_ptr().add(subspan.start).cast(),
+                            (subspan.end - subspan.start).try_into().unwrap(),
+                            offset,
+                            buf.buf_idx as _,
+                        );
+                    }
+                } else {
+                    unreachable!()
                 }
 
                 unsafe { io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE) };
@@ -624,7 +824,7 @@ impl Future for ReadFuture<'_> {
     }
 }
 
-impl Drop for ReadFuture<'_> {
+impl Drop for ReadFutureImpl<'_> {
     fn drop(&mut self) {
         let file_impl = unsafe { &mut *self.file.p.as_ptr() };
         file_impl.read_pending -= 1;
@@ -657,6 +857,50 @@ impl Drop for ReadFuture<'_> {
             unsafe { add_op_ref(ref_count) };
         } else {
             io_ops.remove(key).unwrap();
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+struct ReadFuture<'a>(ReadFutureImpl<'a>);
+
+impl Future for ReadFuture<'_> {
+    type Output = (Result<usize>, Vec<u8>);
+
+    #[inline]
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        match Pin::new(&mut self.0).poll_impl_optype(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready((n, erased_buf)) => {
+                let ErasedBuf::Vec(buf) = erased_buf else {
+                    unreachable!()
+                };
+                Poll::Ready((n, buf))
+            }
+        }
+    }
+}
+
+struct ReadFutureFixed<'a>(ReadFutureImpl<'a>);
+
+impl Future for ReadFutureFixed<'_> {
+    type Output = (Result<usize>, FixedBuf);
+
+    #[inline]
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        match Pin::new(&mut self.0).poll_impl_optype(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready((n, erased_buf)) => {
+                let ErasedBuf::FixedBuf(buf) = erased_buf else {
+                    unreachable!()
+                };
+                Poll::Ready((n, buf))
+            }
         }
     }
 }
