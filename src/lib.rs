@@ -878,6 +878,7 @@ enum OpType {
     DropCancel,
     FileOpen {
         path: CString,
+        o_direct: bool,
     },
     FileWrite {
         buf: Vec<u8>,

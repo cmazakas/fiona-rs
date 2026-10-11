@@ -11,6 +11,7 @@ use std::{
 };
 
 use futures::{Stream, StreamExt, poll, stream::FuturesUnordered};
+use nix::errno::Errno::EINVAL;
 use rand::SeedableRng;
 
 #[test]
@@ -21,7 +22,7 @@ fn file_open() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let path = Path::new("/tmp/rawr.txt");
+            let path = Path::new("/tmp/fiona_test_file_open");
             let _file = fiona::fs::File::open(&ex, path).await.unwrap();
         }
     });
@@ -44,16 +45,21 @@ fn file_open_close_on_drop() {
         async move {
             let mut files = Vec::new();
             for i in 0..NUM_FILES {
-                let file = fiona::fs::File::open(&ex, &format!("/tmp/file_close_on_drop_{i}"))
-                    .await
-                    .unwrap();
+                let file = fiona::fs::File::open(
+                    &ex,
+                    &format!("/tmp/fiona_test_file_open_close_on_drop_{i}"),
+                )
+                .await
+                .unwrap();
 
                 files.push(file);
             }
 
-            let file =
-                fiona::fs::File::open(&ex, &format!("/tmp/file_close_on_drop_{}", NUM_FILES + 1))
-                    .await;
+            let file = fiona::fs::File::open(
+                &ex,
+                &format!("/tmp/fiona_test_file_open_close_on_drop_{}", NUM_FILES + 1),
+            )
+            .await;
 
             assert!(file.is_err());
 
@@ -62,9 +68,12 @@ fn file_open_close_on_drop() {
             fiona::time::sleep(&ex, Duration::from_millis(100)).await;
 
             for i in 0..NUM_FILES {
-                let file = fiona::fs::File::open(&ex, &format!("/tmp/file_close_on_drop_{i}"))
-                    .await
-                    .unwrap();
+                let file = fiona::fs::File::open(
+                    &ex,
+                    &format!("/tmp/fiona_test_file_open_close_on_drop_{i}"),
+                )
+                .await
+                .unwrap();
 
                 files.push(file);
             }
@@ -92,8 +101,10 @@ fn file_open_close_on_future_drop() {
             let mut tasks = Vec::new();
 
             for i in 0..NUM_FILES {
-                let mut task =
-                    fiona::fs::File::open(&ex, &format!("/tmp/file_close_on_future_drop_{i}"));
+                let mut task = fiona::fs::File::open(
+                    &ex,
+                    &format!("/tmp/fiona_test_file_open_close_on_future_drop_{i}"),
+                );
                 let r = poll!(&mut task);
                 assert!(r.is_pending());
 
@@ -104,7 +115,7 @@ fn file_open_close_on_future_drop() {
 
             let file = fiona::fs::File::open(
                 &ex,
-                &format!("/tmp/file_close_on_future_drop_{}", NUM_FILES + 1),
+                &format!("/tmp/fiona_test_file_open_close_on_future_drop_{}", NUM_FILES + 1),
             )
             .await;
 
@@ -113,10 +124,12 @@ fn file_open_close_on_future_drop() {
             tasks.clear();
 
             for i in 0..NUM_FILES {
-                let file =
-                    fiona::fs::File::open(&ex, &format!("/tmp/file_close_on_future_drop_{i}"))
-                        .await
-                        .unwrap();
+                let file = fiona::fs::File::open(
+                    &ex,
+                    &format!("/tmp/fiona_test_file_open_close_on_future_drop_{i}"),
+                )
+                .await
+                .unwrap();
 
                 files.push(file);
             }
@@ -143,8 +156,10 @@ fn file_open_eager_drop_cancel() {
             let mut files = Vec::new();
 
             for i in 0..NUM_FILES {
-                let mut task =
-                    fiona::fs::File::open(&ex, &format!("/tmp/file_open_eager_drop_cancel_{i}"));
+                let mut task = fiona::fs::File::open(
+                    &ex,
+                    &format!("/tmp/fiona_test_file_open_eager_drop_cancel_{i}"),
+                );
                 let r = poll!(&mut task);
                 assert!(r.is_pending());
 
@@ -155,10 +170,12 @@ fn file_open_eager_drop_cancel() {
             fiona::time::sleep(&ex, Duration::from_millis(100)).await;
 
             for i in 0..NUM_FILES {
-                let file =
-                    fiona::fs::File::open(&ex, &format!("/tmp/file_open_eager_drop_cancel_{i}"))
-                        .await
-                        .unwrap();
+                let file = fiona::fs::File::open(
+                    &ex,
+                    &format!("/tmp/fiona_test_file_open_eager_drop_cancel_{i}"),
+                )
+                .await
+                .unwrap();
 
                 files.push(file);
             }
@@ -179,7 +196,7 @@ fn file_write() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let pathname = "/tmp/fiona_test_file_write.txt";
+            let pathname = "/tmp/fiona_test_file_write";
 
             let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
 
@@ -375,7 +392,7 @@ fn file_read() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let pathname = "/tmp/fiona_test_file_read.txt";
+            let pathname = "/tmp/fiona_test_file_read";
 
             let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
 
@@ -669,7 +686,7 @@ fn file_read_write_non_fixed() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let pathname = "/tmp/fiona_test_file_read.txt";
+            let pathname = "/tmp/fiona_test_file_read_write_non_fixed";
 
             let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
 
@@ -719,6 +736,92 @@ fn file_read_write_non_fixed() {
 
             assert_eq!(total, message.len() as u64);
             assert_eq!(assembled_msg, message);
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn file_read_write_direct() {
+    // Test reading/writing for a file opened in O_DIRECT mode.
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let pathname = "/tmp/fiona_test_file_read_write_direct";
+
+            let file = fiona::fs::File::open_direct(&ex, pathname).await.unwrap();
+            ex.register_fixed_buffers(16, 1024).unwrap();
+
+            let mut message = vec![0; 8 * 1024];
+            {
+                let mut rng = rand::rngs::StdRng::from_os_rng();
+                rand::RngCore::fill_bytes(&mut rng, &mut message);
+            }
+
+            let mut fixed_bufs = Vec::new();
+            {
+                let mut msg = &message[..];
+                for i in 0..8 {
+                    let mut buf = ex.get_fixed_buf().unwrap();
+                    assert_eq!(buf.buf_idx(), i as _);
+
+                    let (to_write, remaining) = msg.split_at(1024);
+                    msg = remaining;
+
+                    buf.as_mut_slice().copy_from_slice(to_write);
+                    fixed_bufs.push(buf);
+                }
+            }
+
+            for buf in fixed_bufs {
+                let (written, b) = file.write_at_fixed(buf, -1 as _).await;
+                assert_eq!(written.unwrap(), b.len());
+            }
+
+            let content = std::fs::read(pathname).unwrap();
+            assert_eq!(message, content);
+
+            // Now read back what we wrote.
+            let mut total = 0;
+
+            let mut assembled_msg = Vec::new();
+            for _ in 0..8 {
+                let buf = ex.get_fixed_buf().unwrap();
+
+                let (n, buf) = file.read_at_fixed(buf, total).await;
+                assert!(n.is_ok());
+
+                let n = n.unwrap();
+                total += n as u64;
+
+                assembled_msg.extend_from_slice(&buf[..n]);
+            }
+
+            assert_eq!(total, message.len() as u64);
+            assert_eq!(assembled_msg, message);
+
+            {
+                let file = fiona::fs::File::open_direct(&ex, "src/lib.rs")
+                    .await
+                    .unwrap();
+
+                // Reading/writing to an arbitrary offset should fail.
+                let buf = ex.get_fixed_buf().unwrap();
+
+                let (n, buf) = file.write_at_fixed(buf, 13).await;
+                assert_eq!(n.unwrap_err(), EINVAL);
+
+                let (n, buf) = file.read_at_fixed(buf, 13).await;
+                assert_eq!(n.unwrap_err(), EINVAL);
+
+                let _ = buf;
+            }
         }
     });
 

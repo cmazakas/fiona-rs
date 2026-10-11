@@ -15,7 +15,7 @@ use liburing_rs::{
 };
 use nix::{
     errno::Errno,
-    libc::{O_CREAT, O_RDWR, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP, S_IWUSR},
+    libc::{O_CREAT, O_DIRECT, O_RDWR, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP, S_IWUSR},
 };
 use slotmap::{DefaultKey, Key, KeyData};
 use std::{
@@ -87,7 +87,37 @@ impl File {
         let ex = ex.clone();
 
         let path = CString::new(path.as_ref().as_os_str().as_bytes()).unwrap();
-        let op = make_io_uring_op(ptr::null_mut(), OpType::FileOpen { path });
+        let op = make_io_uring_op(
+            ptr::null_mut(),
+            OpType::FileOpen {
+                path,
+                o_direct: false,
+            },
+        );
+
+        let key = ex.p.io_ops.borrow_mut().insert(op, &ex);
+
+        OpenFuture {
+            completed: false,
+            op: Some(key.data().as_ffi()),
+            ex,
+        }
+    }
+
+    pub fn open_direct(
+        ex: &Executor, path: impl AsRef<Path>,
+    ) -> impl Future<Output = Result<File>> + 'static {
+        let ex = ex.clone();
+
+        let path = CString::new(path.as_ref().as_os_str().as_bytes()).unwrap();
+        let op = make_io_uring_op(
+            ptr::null_mut(),
+            OpType::FileOpen {
+                path,
+                o_direct: true,
+            },
+        );
+
         let key = ex.p.io_ops.borrow_mut().insert(op, &ex);
 
         OpenFuture {
@@ -279,43 +309,6 @@ impl File {
         self.read_subspan_at(.., buf, offset)
     }
 
-    #[must_use]
-    fn new(ex: &Executor, fd: i32) -> File {
-        let ex = ex.clone();
-        let layout = Layout::new::<FileImpl>();
-        let p;
-
-        {
-            let ptr = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
-
-            let ref_count = RefCount {
-                obj_count: 1,
-                op_count: 0,
-                release_impl: release_impl::<FileImpl>,
-                obj: ptr.as_ptr(),
-            };
-
-            let file_impl = FileImpl {
-                fd_impl: FdImpl {
-                    ref_count,
-                    ex,
-                    fd,
-                    close_pending: false,
-                    cancel_pending: false,
-                    was_closed: false,
-                    is_fixed: true,
-                },
-                write_pending: false,
-                read_pending: 0,
-            };
-
-            p = ptr.cast::<FileImpl>();
-            unsafe { std::ptr::write(p.as_ptr(), file_impl) };
-        }
-
-        File { p }
-    }
-
     pub fn cancel(&self) -> impl Future<Output = Result<()>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
@@ -391,6 +384,43 @@ impl File {
             _m: PhantomData,
         }
     }
+
+    #[must_use]
+    fn new(ex: &Executor, fd: i32) -> File {
+        let ex = ex.clone();
+        let layout = Layout::new::<FileImpl>();
+        let p;
+
+        {
+            let ptr = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
+
+            let ref_count = RefCount {
+                obj_count: 1,
+                op_count: 0,
+                release_impl: release_impl::<FileImpl>,
+                obj: ptr.as_ptr(),
+            };
+
+            let file_impl = FileImpl {
+                fd_impl: FdImpl {
+                    ref_count,
+                    ex,
+                    fd,
+                    close_pending: false,
+                    cancel_pending: false,
+                    was_closed: false,
+                    is_fixed: true,
+                },
+                write_pending: false,
+                read_pending: 0,
+            };
+
+            p = ptr.cast::<FileImpl>();
+            unsafe { std::ptr::write(p.as_ptr(), file_impl) };
+        }
+
+        File { p }
+    }
 }
 
 impl Drop for File {
@@ -443,15 +473,20 @@ impl Future for OpenFuture {
 
                 let sqe = get_sqe(&ex);
 
-                let OpType::FileOpen { ref path } = op.op_type else {
+                let OpType::FileOpen { ref path, o_direct } = op.op_type else {
                     unreachable!()
                 };
+
+                let mut flags = O_RDWR | O_CREAT;
+                if o_direct {
+                    flags |= O_DIRECT;
+                }
 
                 unsafe {
                     io_uring_prep_open_direct(
                         sqe,
                         path.as_ptr(),
-                        O_RDWR | O_CREAT,
+                        flags,
                         S_IRUSR | S_IWUSR | S_IWGRP | S_IRGRP | S_IROTH,
                         IORING_FILE_INDEX_ALLOC as _,
                     );
