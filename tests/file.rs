@@ -619,7 +619,7 @@ fn file_cancel() {
     // This test only _attempts_ cancellation and never actually hits it. This
     // is due how io_uring interacts with the underlying file system and how
     // fast it is. In theory, cancellation is possible here but it's basically
-    // impossible to trigger, unless we're running in bsan (sometimes).
+    // impossible to trigger, unless we're running in bsan.
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
@@ -648,7 +648,9 @@ fn file_cancel() {
             file.cancel().await.unwrap();
 
             while let Some((n, _buf)) = joinset.next().await {
-                assert!(n.is_ok());
+                if !cfg!(feature = "bsan") {
+                    assert!(n.is_ok());
+                }
             }
         }
     });
