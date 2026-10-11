@@ -1,0 +1,8 @@
+[book]
+title = "Fiona User Guide"
+authors = ["Christian Mazakas"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/cmazakas/fiona-rs"
