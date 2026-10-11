@@ -22,7 +22,7 @@ fn file_open() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let path = Path::new("/tmp/fiona_test_file_open");
+            let path = Path::new("tests/data/fiona_test_file_open");
             let _file = fiona::fs::File::open(&ex, path).await.unwrap();
         }
     });
@@ -47,7 +47,7 @@ fn file_open_close_on_drop() {
             for i in 0..NUM_FILES {
                 let file = fiona::fs::File::open(
                     &ex,
-                    &format!("/tmp/fiona_test_file_open_close_on_drop_{i}"),
+                    &format!("tests/data/fiona_test_file_open_close_on_drop_{i}"),
                 )
                 .await
                 .unwrap();
@@ -57,7 +57,7 @@ fn file_open_close_on_drop() {
 
             let file = fiona::fs::File::open(
                 &ex,
-                &format!("/tmp/fiona_test_file_open_close_on_drop_{}", NUM_FILES + 1),
+                &format!("tests/data/fiona_test_file_open_close_on_drop_{}", NUM_FILES + 1),
             )
             .await;
 
@@ -70,7 +70,7 @@ fn file_open_close_on_drop() {
             for i in 0..NUM_FILES {
                 let file = fiona::fs::File::open(
                     &ex,
-                    &format!("/tmp/fiona_test_file_open_close_on_drop_{i}"),
+                    &format!("tests/data/fiona_test_file_open_close_on_drop_{i}"),
                 )
                 .await
                 .unwrap();
@@ -103,7 +103,7 @@ fn file_open_close_on_future_drop() {
             for i in 0..NUM_FILES {
                 let mut task = fiona::fs::File::open(
                     &ex,
-                    &format!("/tmp/fiona_test_file_open_close_on_future_drop_{i}"),
+                    &format!("tests/data/fiona_test_file_open_close_on_future_drop_{i}"),
                 );
                 let r = poll!(&mut task);
                 assert!(r.is_pending());
@@ -115,7 +115,7 @@ fn file_open_close_on_future_drop() {
 
             let file = fiona::fs::File::open(
                 &ex,
-                &format!("/tmp/fiona_test_file_open_close_on_future_drop_{}", NUM_FILES + 1),
+                &format!("tests/data/fiona_test_file_open_close_on_future_drop_{}", NUM_FILES + 1),
             )
             .await;
 
@@ -126,7 +126,7 @@ fn file_open_close_on_future_drop() {
             for i in 0..NUM_FILES {
                 let file = fiona::fs::File::open(
                     &ex,
-                    &format!("/tmp/fiona_test_file_open_close_on_future_drop_{i}"),
+                    &format!("tests/data/fiona_test_file_open_close_on_future_drop_{i}"),
                 )
                 .await
                 .unwrap();
@@ -158,7 +158,7 @@ fn file_open_eager_drop_cancel() {
             for i in 0..NUM_FILES {
                 let mut task = fiona::fs::File::open(
                     &ex,
-                    &format!("/tmp/fiona_test_file_open_eager_drop_cancel_{i}"),
+                    &format!("tests/data/fiona_test_file_open_eager_drop_cancel_{i}"),
                 );
                 let r = poll!(&mut task);
                 assert!(r.is_pending());
@@ -172,7 +172,7 @@ fn file_open_eager_drop_cancel() {
             for i in 0..NUM_FILES {
                 let file = fiona::fs::File::open(
                     &ex,
-                    &format!("/tmp/fiona_test_file_open_eager_drop_cancel_{i}"),
+                    &format!("tests/data/fiona_test_file_open_eager_drop_cancel_{i}"),
                 )
                 .await
                 .unwrap();
@@ -196,7 +196,7 @@ fn file_write() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let pathname = "/tmp/fiona_test_file_write";
+            let pathname = "tests/data/fiona_test_file_write";
 
             let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
 
@@ -251,7 +251,7 @@ fn file_subspan_write() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let pathname = "/tmp/fiona_test_file_subspan_write";
+            let pathname = "tests/data/fiona_test_file_subspan_write";
 
             let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
 
@@ -302,7 +302,7 @@ fn file_offset_out_of_bounds() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let pathname = "/tmp/fiona_test_file_offset_out_of_bounds";
+            let pathname = "tests/data/fiona_test_file_offset_out_of_bounds";
 
             let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
 
@@ -341,7 +341,7 @@ fn file_eager_drop_write() {
             for i in 0..16 {
                 let file = fiona::fs::File::open(
                     &ex,
-                    format!("/tmp/fiona_test_file_eager_drop_write_{}", i),
+                    format!("tests/data/fiona_test_file_eager_drop_write_{}", i),
                 )
                 .await
                 .unwrap();
@@ -392,7 +392,7 @@ fn file_read() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let pathname = "/tmp/fiona_test_file_read";
+            let pathname = "tests/data/fiona_test_file_read";
 
             let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
 
@@ -686,7 +686,7 @@ fn file_read_write_non_fixed() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let pathname = "/tmp/fiona_test_file_read_write_non_fixed";
+            let pathname = "tests/data/fiona_test_file_read_write_non_fixed";
 
             let file = fiona::fs::File::open(&ex, pathname).await.unwrap();
 
@@ -753,7 +753,7 @@ fn file_read_write_direct() {
     ex.spawn({
         let ex = ex.clone();
         async move {
-            let pathname = "/tmp/fiona_test_file_read_write_direct";
+            let pathname = "tests/data/fiona_test_file_read_write_direct";
 
             let file = fiona::fs::File::open_direct(&ex, pathname).await.unwrap();
             ex.register_fixed_buffers(16, 1024).unwrap();
@@ -779,13 +779,16 @@ fn file_read_write_direct() {
                 }
             }
 
+            let mut offset = 0;
             for buf in fixed_bufs {
-                let (written, b) = file.write_at_fixed(buf, -1 as _).await;
+                let (written, b) = file.write_at_fixed(buf, offset).await;
+                offset += written.unwrap() as u64;
                 assert_eq!(written.unwrap(), b.len());
             }
 
             let content = std::fs::read(pathname).unwrap();
-            assert_eq!(message, content);
+            assert_eq!(message.len(), content.len());
+            assert!(message == content);
 
             // Now read back what we wrote.
             let mut total = 0;
@@ -807,10 +810,6 @@ fn file_read_write_direct() {
             assert_eq!(assembled_msg, message);
 
             {
-                let file = fiona::fs::File::open_direct(&ex, "src/lib.rs")
-                    .await
-                    .unwrap();
-
                 // Reading/writing to an arbitrary offset should fail.
                 let buf = ex.get_fixed_buf().unwrap();
 

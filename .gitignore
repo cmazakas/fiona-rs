@@ -6,3 +6,4 @@
 /tests/test_certs/server.csr
 /tests/test_certs/server.crt
 /tests/test_certs/ca.srl
+/tests/data/fiona_test_*
