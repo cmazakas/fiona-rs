@@ -533,6 +533,25 @@ impl BufGroup {
 
 //-----------------------------------------------------------------------------
 
+/// A subset of the buffers from a group of [provided
+/// buffers](liburing_rs::io_uring_provided_buffers), registered via
+/// [`Executor::register_buf_group`].
+///
+/// While a `BorowedBufs` instance is alive, the buffers are independently held
+/// from the backing provided buf group. This is so that the buffers are
+/// prevented from being erroneously used for further recv operations. Buffers
+/// are returned back to the group upon destruction.
+///
+/// It is important for application authors to understand this to prevent issues
+/// with buffer starvation. The longer a `BorrowedBufs` instance lives, the
+/// longer the runtime goes without those buffers being available to it. This
+/// means that the lifetime of `BorrowedBuf` instances should be kept to a
+/// minimum.
+///
+/// If no buffers are returned back to the group, operations will begin to fail
+/// with `ENOBUFS`. This is a harmless error and means the application should
+/// attempt the operation again, and is part of expected normal application
+/// flow.
 pub struct BorrowedBufs {
     buf_group: *mut BufGroup,
     head: isize,
@@ -540,6 +559,7 @@ pub struct BorrowedBufs {
     ex: Executor,
 }
 
+/// An iterator over a [`BorrowedBufs`] subsequence.
 pub struct BorrowedBufsIterator<'a> {
     bufs: &'a BorrowedBufs,
     buf_id: isize,
@@ -555,11 +575,14 @@ impl BorrowedBufs {
         }
     }
 
+    /// Returns whether or not the current buffer sequence contains zero
+    /// buffers.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.head == -1
     }
 
+    /// Returns an iterator over the current set of borrowed buffers.
     #[must_use]
     pub fn iter(&self) -> BorrowedBufsIterator<'_> {
         self.into_iter()
@@ -567,6 +590,7 @@ impl BorrowedBufs {
 }
 
 impl Drop for BorrowedBufs {
+    /// Returns all of the contained buffers back to the provided buffer group.
     fn drop(&mut self) {
         let buf_group = unsafe { &mut *self.buf_group };
         let br = buf_group.br;
@@ -667,6 +691,24 @@ impl FixedBufs {
     }
 }
 
+/// A `FixedBuf` is an owning handle over a [registered
+/// buffer](liburing_rs::io_uring_registered_buffers), acquired via
+/// [`Executor::get_fixed_buf`]. Upon destruction, the registered buffer is
+/// returned back to the runtime where it can be acquired again.
+///
+/// # Example
+///
+/// ```rs
+/// let mut ioc = fiona::IoContext::new();
+/// let ex = ioc.get_executor();
+/// ex.register_fixed_buffers(16, 1024).unwrap();
+///
+/// let buf = ex.get_fixed_buf();
+/// assert_eq!(buf.buf_idx(), 0);
+///
+/// // From here, we can update the contents by exposing a mutable slice via `as_mut_slice()`.
+/// let _xs = ex.as_mut_slice();
+/// ```
 pub struct FixedBuf {
     ex: Executor,
     p: *mut u8,
@@ -675,17 +717,22 @@ pub struct FixedBuf {
 }
 
 impl FixedBuf {
+    /// Obtain an immutable view over the fixed buffer.
     #[must_use]
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.p, self.len) }
     }
 
+    /// Obtain a mutable view over the fixed buffer. This is used when writing
+    /// to a file and the data needs to be populated.
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.p, self.len) }
     }
 
+    /// Obtain the index of the buffer as it was registered with the backing
+    /// ring.
     #[must_use]
     #[inline]
     pub fn buf_idx(&self) -> usize {
@@ -694,6 +741,8 @@ impl FixedBuf {
 }
 
 impl Drop for FixedBuf {
+    /// Returns the buffer back to the runtime where it can be acquired again
+    /// via a call to [`Executor::get_fixed_buf`].
     fn drop(&mut self) {
         self.ex
             .p
@@ -1248,7 +1297,7 @@ impl IoContextParams {
         self.cq_entries
     }
 
-    // Obtain the size of the table used for registered files.
+    /// Obtain the size of the table used for registered files.
     #[must_use]
     pub fn num_files(&self) -> u32 {
         self.nr_files
