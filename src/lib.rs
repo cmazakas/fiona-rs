@@ -48,7 +48,7 @@
 //! * To setup a TLS server or client, see [tls].
 
 #![feature(ptr_metadata, local_waker, sync_unsafe_cell, unsafe_pinned)]
-#![warn(clippy::pedantic)]
+#![warn(clippy::pedantic, missing_docs)]
 #![allow(
     clippy::mutable_key_type,
     clippy::missing_panics_doc,
@@ -62,6 +62,29 @@
     clippy::struct_excessive_bools
 )]
 
+use crate::{
+    io_ops::IoOpsMap,
+    net::TcpStream,
+    timer_wheel::{TimerWheel, round_up_ms},
+};
+use liburing_rs::{
+    __kernel_timespec, AF_INET, AF_INET6, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_MORE,
+    IORING_CQE_F_NOTIF, IORING_SETUP_COOP_TASKRUN, IORING_SETUP_CQSIZE, IORING_SETUP_DEFER_TASKRUN,
+    IORING_SETUP_NO_SQARRAY, IORING_SETUP_SINGLE_ISSUER, IORING_SETUP_SQ_REWIND,
+    IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring, io_uring_buf_ring,
+    io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_cq_advance,
+    io_uring_cqe, io_uring_for_each_cqe, io_uring_free_buf_ring, io_uring_get_events,
+    io_uring_get_sqe, io_uring_params, io_uring_peek_cqe, io_uring_prep_close_direct,
+    io_uring_prep_connect, io_uring_prep_link_timeout, io_uring_prep_msg_ring, io_uring_queue_exit,
+    io_uring_queue_init_params, io_uring_register_buffers, io_uring_register_files_sparse,
+    io_uring_register_ring_fd, io_uring_register_sync_msg, io_uring_setup_buf_ring,
+    io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data, io_uring_sqe_set_data64,
+    io_uring_sqe_set_flags, io_uring_submit_and_get_events, io_uring_submit_and_wait,
+    io_uring_submit_and_wait_timeout, io_uring_unregister_buf_ring, io_uring_unregister_buffers,
+    iovec,
+};
+use nix::{errno::Errno, sys::socket::SockaddrStorage};
+use slotmap::{DefaultKey, KeyData};
 use std::{
     alloc::Layout,
     cell::{RefCell, SyncUnsafeCell, UnsafeCell},
@@ -89,41 +112,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nix::{errno::Errno, sys::socket::SockaddrStorage};
-
-use liburing_rs::{
-    __kernel_timespec, AF_INET, AF_INET6, IORING_CQE_BUFFER_SHIFT, IORING_CQE_F_MORE,
-    IORING_CQE_F_NOTIF, IORING_SETUP_COOP_TASKRUN, IORING_SETUP_CQSIZE, IORING_SETUP_DEFER_TASKRUN,
-    IORING_SETUP_NO_SQARRAY, IORING_SETUP_SINGLE_ISSUER, IORING_SETUP_SQ_REWIND,
-    IOSQE_CQE_SKIP_SUCCESS, IOSQE_FIXED_FILE, IOSQE_IO_LINK, io_uring, io_uring_buf_ring,
-    io_uring_buf_ring_add, io_uring_buf_ring_advance, io_uring_buf_ring_mask, io_uring_cq_advance,
-    io_uring_cqe, io_uring_for_each_cqe, io_uring_free_buf_ring, io_uring_get_events,
-    io_uring_get_sqe, io_uring_params, io_uring_peek_cqe, io_uring_prep_close_direct,
-    io_uring_prep_connect, io_uring_prep_link_timeout, io_uring_prep_msg_ring, io_uring_queue_exit,
-    io_uring_queue_init_params, io_uring_register_buffers, io_uring_register_files_sparse,
-    io_uring_register_ring_fd, io_uring_register_sync_msg, io_uring_setup_buf_ring,
-    io_uring_sq_space_left, io_uring_sqe, io_uring_sqe_set_data, io_uring_sqe_set_data64,
-    io_uring_sqe_set_flags, io_uring_submit_and_get_events, io_uring_submit_and_wait,
-    io_uring_submit_and_wait_timeout, io_uring_unregister_buf_ring, io_uring_unregister_buffers,
-    iovec,
-};
-
 mod common;
+
+/// The filesystem module, responsible for allowing users to open files and
+/// read/write them.
 pub mod fs;
+
+/// The networking module. Provides TCP sockets.
 pub mod net;
+
+/// The timer module. Provides a ring-backed fine-grained timer.
 pub mod time;
+
+/// The timer_wheel module. Provides coarse-grained userspace timers,
+/// implemented as a timer wheel.
 pub mod timer_wheel;
+
+/// The TLS module. Provides a TLS wrapper around TCP streams.
 pub mod tls;
-
-use slotmap::{DefaultKey, KeyData};
-
-use crate::{
-    io_ops::IoOpsMap,
-    net::TcpStream,
-    timer_wheel::{TimerWheel, round_up_ms},
-};
-
-pub type Result<T> = std::result::Result<T, nix::Error>;
 
 //-----------------------------------------------------------------------------
 
@@ -928,7 +934,7 @@ fn make_io_uring_op(ref_count: *mut RefCount, op_type: OpType) -> IoUringOp {
 
 //-----------------------------------------------------------------------------
 
-/// The `IoContext` is responsible for running the user's posted work and
+/// The [`IoContext`] is responsible for running the user's posted work and
 /// manages the underlying ring.
 ///
 /// The user can configure an `IoContext`'s ring by using the
@@ -2195,7 +2201,9 @@ impl Executor {
     /// assert!(ex.has_buf_group(1234));
     /// assert!(ex.has_buf_group(4321));
     /// ```
-    pub fn register_buf_group(&self, bgid: u16, num_bufs: u32, buf_len: usize) -> Result<()> {
+    pub fn register_buf_group(
+        &self, bgid: u16, num_bufs: u32, buf_len: usize,
+    ) -> Result<(), nix::Error> {
         let mut ret = 0_i32;
 
         let ring = self.ring();
@@ -2277,7 +2285,7 @@ impl Executor {
     /// let mut buf = ex.get_fixed_buf().unwrap();
     /// buf.as_mut_slice().iter_mut().for_each(|x| { *x = 0x12; });
     /// ```
-    pub fn register_fixed_buffers(&self, num_bufs: u32, buf_len: usize) -> Result<()> {
+    pub fn register_fixed_buffers(&self, num_bufs: u32, buf_len: usize) -> Result<(), nix::Error> {
         assert!(
             self.p.fixed_bufs.borrow().buf.is_empty(),
             "A fixed buffer sequence is already registered."

@@ -4,19 +4,18 @@
 
 extern crate liburing_rs;
 
-use std::{future::Future, mem::offset_of, ptr::NonNull, task::Poll, time::Duration};
-
-use nix::{errno::Errno, libc::ETIME};
-
+use crate::{
+    Executor, OpType, RefCount, add_obj_ref, add_op_ref, get_sqe, make_io_uring_op, release_impl,
+    release_obj,
+};
 use liburing_rs::{
     __kernel_timespec, IOSQE_CQE_SKIP_SUCCESS, io_uring_prep_timeout, io_uring_prep_timeout_remove,
     io_uring_sqe_set_data64, io_uring_sqe_set_flags,
 };
+use nix::{errno::Errno, libc::ETIME};
 use slotmap::{DefaultKey, Key, KeyData};
-
-use crate::{
-    Executor, OpType, RefCount, Result, add_obj_ref, add_op_ref, get_sqe, make_io_uring_op,
-    release_impl, release_obj,
+use std::{
+    future::Future, mem::offset_of, ptr::NonNull, result::Result, task::Poll, time::Duration,
 };
 
 struct TimerImpl {
@@ -147,9 +146,10 @@ impl Drop for TimerFuture<'_> {
             unsafe { io_uring_sqe_set_data64(sqe, 0) };
             unsafe { io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS) };
             // TODO: should we eventually remove this? because we now allocate
-            // per-Future state, so long as we mark this operation as eager-dropped,
-            // our CQE loop can safely ignore it which means we no longer need to
-            // cancel ASAP from the Drop impl and can instead rely on the next tick
+            // per-Future state, so long as we mark this operation as
+            // eager-dropped, our CQE loop can safely ignore it
+            // which means we no longer need to cancel ASAP from the
+            // Drop impl and can instead rely on the next tick
             // of the event loop to cancel the operation for us
             //
             // unsafe { submit_ring(ring) };
@@ -164,7 +164,7 @@ impl Drop for TimerFuture<'_> {
 }
 
 impl Future for TimerFuture<'_> {
-    type Output = Result<()>;
+    type Output = Result<(), nix::Error>;
 
     #[inline]
     fn poll(

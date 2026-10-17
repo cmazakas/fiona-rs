@@ -3,7 +3,7 @@
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 use crate::{
-    BorrowedBufs, Executor, FdImpl, FixedBuf, OpType, RefCount, Result, add_obj_ref, add_op_ref,
+    BorrowedBufs, Executor, FdImpl, FixedBuf, OpType, RefCount, add_obj_ref, add_op_ref,
     common::{CancelFuture, CloseFuture, ErasedBuf},
     get_sqe, make_io_uring_op, release_impl, release_obj, timer_wheel,
 };
@@ -37,6 +37,7 @@ use std::{
     pin::{Pin, pin},
     ptr::{self, NonNull},
     range::Range,
+    result::Result,
     task::Poll,
     time::Duration,
 };
@@ -70,7 +71,7 @@ impl TcpListener {
 
     fn bind_ip_impl(
         ex: &Executor, ip_addr: &dyn SockaddrLike, opts: &TcpListenerOpts, af: AddressFamily,
-    ) -> Result<TcpListener> {
+    ) -> Result<TcpListener, nix::Error> {
         let ex = ex.clone();
         let socket = socket(af, SockType::Stream, SockFlag::empty(), SockProtocol::Tcp)?;
 
@@ -121,24 +122,28 @@ impl TcpListener {
 
     pub fn bind_ipv4_with_params(
         ex: &Executor, ipv4_addr: Ipv4Addr, port: u16, opts: &TcpListenerOpts,
-    ) -> Result<TcpListener> {
+    ) -> Result<TcpListener, nix::Error> {
         let addr = SockaddrIn::from(SocketAddrV4::new(ipv4_addr, port));
         Self::bind_ip_impl(ex, &addr, opts, AddressFamily::Inet)
     }
 
-    pub fn bind_ipv4(ex: &Executor, ipv4_addr: Ipv4Addr, port: u16) -> Result<TcpListener> {
+    pub fn bind_ipv4(
+        ex: &Executor, ipv4_addr: Ipv4Addr, port: u16,
+    ) -> Result<TcpListener, nix::Error> {
         let addr = SockaddrIn::from(SocketAddrV4::new(ipv4_addr, port));
         Self::bind_ip_impl(ex, &addr, &TcpListenerOpts::default(), AddressFamily::Inet)
     }
 
-    pub fn bind_ipv6(ex: &Executor, ipv6_addr: Ipv6Addr, port: u16) -> Result<TcpListener> {
+    pub fn bind_ipv6(
+        ex: &Executor, ipv6_addr: Ipv6Addr, port: u16,
+    ) -> Result<TcpListener, nix::Error> {
         let addr = SockaddrIn6::from(SocketAddrV6::new(ipv6_addr, port, 0, 0));
         Self::bind_ip_impl(ex, &addr, &TcpListenerOpts::default(), AddressFamily::Inet6)
     }
 
     pub fn bind_ipv6_with_params(
         ex: &Executor, ipv6_addr: Ipv6Addr, port: u16, opts: &TcpListenerOpts,
-    ) -> Result<TcpListener> {
+    ) -> Result<TcpListener, nix::Error> {
         let addr = SockaddrIn6::from(SocketAddrV6::new(ipv6_addr, port, 0, 0));
         Self::bind_ip_impl(ex, &addr, opts, AddressFamily::Inet6)
     }
@@ -157,7 +162,7 @@ impl TcpListener {
         unreachable!();
     }
 
-    pub fn accept(&self) -> impl Future<Output = Result<TcpStream>> {
+    pub fn accept(&self) -> impl Future<Output = Result<TcpStream, nix::Error>> {
         let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!acceptor_impl.accept_pending);
         acceptor_impl.accept_pending = true;
@@ -174,7 +179,7 @@ impl TcpListener {
         acceptor_impl.fd_impl.ex.clone()
     }
 
-    pub fn cancel(&self) -> impl Future<Output = Result<()>> {
+    pub fn cancel(&self) -> impl Future<Output = Result<(), nix::Error>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
         let listener = unsafe { &mut *self.p.as_ptr() };
@@ -212,7 +217,7 @@ impl TcpListener {
         }
     }
 
-    pub fn close(&self) -> impl Future<Output = Result<()>> {
+    pub fn close(&self) -> impl Future<Output = Result<(), nix::Error>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
 
         let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
@@ -318,7 +323,7 @@ struct AcceptFuture<'a> {
 }
 
 impl Future for AcceptFuture<'_> {
-    type Output = Result<TcpStream>;
+    type Output = Result<TcpStream, nix::Error>;
 
     #[inline]
     fn poll(
@@ -515,13 +520,13 @@ impl TcpStream {
         // gets called or at least figure out the correct behavior.
     }
 
-    pub fn send(&self, buf: Vec<u8>) -> impl Future<Output = (Result<usize>, Vec<u8>)> {
+    pub fn send(&self, buf: Vec<u8>) -> impl Future<Output = (Result<usize, nix::Error>, Vec<u8>)> {
         self.send_subspan(0..buf.len(), buf)
     }
 
     pub fn send_subspan<R: RangeBounds<usize>>(
         &self, range: R, buf: Vec<u8>,
-    ) -> impl Future<Output = (Result<usize>, Vec<u8>)> {
+    ) -> impl Future<Output = (Result<usize, nix::Error>, Vec<u8>)> {
         assert!(
             unsafe { !(*self.p.as_ptr()).send_pending },
             "Send is already pending for this TCP socket."
@@ -573,13 +578,15 @@ impl TcpStream {
         })
     }
 
-    pub fn send_fixed(&self, buf: FixedBuf) -> impl Future<Output = (Result<usize>, FixedBuf)> {
+    pub fn send_fixed(
+        &self, buf: FixedBuf,
+    ) -> impl Future<Output = (Result<usize, nix::Error>, FixedBuf)> {
         self.send_subspan_fixed(0..buf.len(), buf)
     }
 
     pub fn send_subspan_fixed<R: RangeBounds<usize>>(
         &self, range: R, buf: FixedBuf,
-    ) -> impl Future<Output = (Result<usize>, FixedBuf)> {
+    ) -> impl Future<Output = (Result<usize, nix::Error>, FixedBuf)> {
         assert!(
             unsafe { !(*self.p.as_ptr()).send_pending },
             "Send is already pending for this TCP socket."
@@ -633,7 +640,7 @@ impl TcpStream {
         })
     }
 
-    pub async fn recv(&self) -> Result<BorrowedBufs> {
+    pub async fn recv(&self) -> Result<BorrowedBufs, nix::Error> {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!stream_impl.recv_pending);
         stream_impl.recv_pending = true;
@@ -662,7 +669,7 @@ impl TcpStream {
         .await
     }
 
-    pub fn shutdown(&self, how: i32) -> impl Future<Output = Result<()>> {
+    pub fn shutdown(&self, how: i32) -> impl Future<Output = Result<(), nix::Error>> {
         assert!(unsafe { !(*self.p.as_ptr()).shutdown_pending });
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
@@ -692,7 +699,7 @@ impl TcpStream {
         }
     }
 
-    pub fn close(&self) -> impl Future<Output = Result<()>> {
+    pub fn close(&self) -> impl Future<Output = Result<(), nix::Error>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
@@ -730,7 +737,7 @@ impl TcpStream {
         }
     }
 
-    pub fn cancel(&self) -> impl Future<Output = Result<()>> {
+    pub fn cancel(&self) -> impl Future<Output = Result<(), nix::Error>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
@@ -867,7 +874,7 @@ impl SendFutureImpl<'_> {
     #[inline]
     fn poll_impl_optype(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
-    ) -> Poll<(Result<usize>, ErasedBuf)> {
+    ) -> Poll<(Result<usize, nix::Error>, ErasedBuf)> {
         assert!(!self.completed);
 
         let stream_impl = unsafe { &mut *self.stream.p.as_ptr() };
@@ -993,7 +1000,7 @@ impl SendFutureImpl<'_> {
 struct SendFuture<'a>(SendFutureImpl<'a>);
 
 impl Future for SendFuture<'_> {
-    type Output = (Result<usize>, Vec<u8>);
+    type Output = (Result<usize, nix::Error>, Vec<u8>);
 
     #[inline]
     fn poll(
@@ -1014,7 +1021,7 @@ impl Future for SendFuture<'_> {
 struct SendFixedFuture<'a>(SendFutureImpl<'a>);
 
 impl Future for SendFixedFuture<'_> {
-    type Output = (Result<usize>, FixedBuf);
+    type Output = (Result<usize, nix::Error>, FixedBuf);
 
     #[inline]
     fn poll(
@@ -1042,7 +1049,7 @@ struct ShutdownFuture<'a> {
 }
 
 impl Future for ShutdownFuture<'_> {
-    type Output = Result<()>;
+    type Output = Result<(), nix::Error>;
 
     #[inline]
     fn poll(
@@ -1157,7 +1164,7 @@ impl Drop for RecvFuture<'_> {
 }
 
 impl Future for RecvFuture<'_> {
-    type Output = Result<BorrowedBufs>;
+    type Output = Result<BorrowedBufs, nix::Error>;
 
     #[inline]
     fn poll(
@@ -1305,7 +1312,7 @@ impl TcpClient {
 
     pub fn connect_ipv4(
         self, addr: Ipv4Addr, port: u16,
-    ) -> impl Future<Output = Result<TcpStream>> {
+    ) -> impl Future<Output = Result<TcpStream, nix::Error>> {
         let addr = SocketAddrV4::new(addr, port);
 
         let op = make_io_uring_op(
@@ -1331,7 +1338,7 @@ impl TcpClient {
 
     pub fn connect_ipv6(
         self, addr: Ipv6Addr, port: u16,
-    ) -> impl Future<Output = Result<TcpStream>> {
+    ) -> impl Future<Output = Result<TcpStream, nix::Error>> {
         let addr = SocketAddrV6::new(addr, port, 0, 0);
 
         let op = make_io_uring_op(
@@ -1363,7 +1370,7 @@ struct ConnectFuture {
 }
 
 impl Future for ConnectFuture {
-    type Output = Result<TcpStream>;
+    type Output = Result<TcpStream, nix::Error>;
 
     #[inline]
     fn poll(
