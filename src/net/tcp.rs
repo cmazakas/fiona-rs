@@ -44,13 +44,34 @@ use std::{
 
 //-----------------------------------------------------------------------------
 
+/// A simple strut of options used for configuring the [`TcpListener`].
+/// `reuse_addr` is equivalent to `setsockopt(SO_REUSEADDR)`. `reuse_port` is
+/// equivalent to `setsockopt(SO_REUSEPORT)`.
+///
+/// Re-using a socket address can be useful to immediately bind a socket to the
+/// wildcard address (`0.0.0.0`) or to a previous address that was a TIME_WAIT
+/// state.
+///
+/// Re-using a port enables load-balancing via the kernel, but note that it can
+/// be trivial to exhaust the amount of ephemeral ports. In these cases,
+/// manually configuring the system may be required.
 #[derive(Debug, Clone, Copy)]
 pub struct TcpListenerOpts {
+    /// If true, sets the socket option for `SO_REUSEADDR`.
     pub reuse_addr: bool,
+
+    /// If true, sets the socket option for `SO_REUSEPORT`.
     pub reuse_port: bool,
 }
 
 impl Default for TcpListenerOpts {
+    /// Returns a default-constructed instance with address reuse enabled and
+    /// port reuse disabled.
+    ///
+    /// Equivalent to:
+    /// ```
+    /// let _opts = fiona::net::TcpListenerOpts { reuse_addr: true, reuse_port: false };
+    /// ```
     fn default() -> Self {
         Self {
             reuse_addr: true,
@@ -61,6 +82,7 @@ impl Default for TcpListenerOpts {
 
 //-----------------------------------------------------------------------------
 
+/// An instance of a listening socket bound to a specific IP address and port.
 #[derive(Debug)]
 pub struct TcpListener {
     p: NonNull<ListenerImpl>,
@@ -69,57 +91,33 @@ pub struct TcpListener {
 impl TcpListener {
     const DEFAULT_BACKLOG: i32 = 2 * 1024;
 
-    fn bind_ip_impl(
-        ex: &Executor, ip_addr: &dyn SockaddrLike, opts: &TcpListenerOpts, af: AddressFamily,
-    ) -> Result<TcpListener, nix::Error> {
-        let ex = ex.clone();
-        let socket = socket(af, SockType::Stream, SockFlag::empty(), SockProtocol::Tcp)?;
-
-        if opts.reuse_addr {
-            setsockopt(&socket, ReuseAddr, &true)?;
-        }
-
-        if opts.reuse_port {
-            setsockopt(&socket, ReusePort, &true)?;
-        }
-
-        bind(socket.as_raw_fd(), ip_addr)?;
-        listen(&socket, Backlog::new(Self::DEFAULT_BACKLOG).unwrap())?;
-
-        let layout = Layout::new::<ListenerImpl>();
-        let p = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
-
-        let ref_count = RefCount {
-            obj_count: 1,
-            op_count: 0,
-            release_impl: release_impl::<ListenerImpl>,
-            obj: p.as_ptr(),
-        };
-
-        // We need to do this for when `port == 0` (the wildcard port).
-        let addr = getsockname::<SockaddrStorage>(socket.as_raw_fd())?;
-
-        let acceptor_impl = ListenerImpl {
-            fd_impl: FdImpl {
-                ref_count,
-                ex,
-                fd: socket.into_raw_fd(),
-                cancel_pending: false,
-                close_pending: false,
-                was_closed: false,
-                is_fixed: false,
-            },
-            addr,
-            accept_pending: false,
-            accept_op: None,
-        };
-
-        let p = p.cast::<ListenerImpl>();
-        unsafe { std::ptr::write(p.as_ptr(), acceptor_impl) };
-
-        Ok(TcpListener { p })
-    }
-
+    /// Create a new `TcpListener` bound to the provided IPv4 address and port
+    /// with the provided options.
+    ///
+    /// Note that the wildcard address is supported, which can be useful in
+    /// tests.
+    ///
+    /// This function is useful for setting up a TCP listening socket with
+    /// either address reuse disabled or with address reuse and port reuse both
+    /// enabled.
+    ///
+    /// # Example
+    /// ```
+    /// let mut ioc = fiona::IoContext::new();
+    /// let ex = ioc.get_executor();
+    ///
+    /// ex.spawn({
+    ///     let ex = ex.clone();
+    ///     async move {
+    ///         let _listener = fiona::net::TcpListener::bind_ipv4_with_params(
+    ///             &ex, std::net::Ipv4Addr::LOCALHOST, 0,
+    ///             &fiona::net::TcpListenerOpts::default()).unwrap();
+    ///     }
+    /// });
+    ///
+    /// let n = ioc.run();
+    /// assert_eq!(n, 1);
+    /// ```
     pub fn bind_ipv4_with_params(
         ex: &Executor, ipv4_addr: Ipv4Addr, port: u16, opts: &TcpListenerOpts,
     ) -> Result<TcpListener, nix::Error> {
@@ -127,6 +125,28 @@ impl TcpListener {
         Self::bind_ip_impl(ex, &addr, opts, AddressFamily::Inet)
     }
 
+    /// Create a new `TcpListener` bound to the provided IPv4 address and port
+    /// with address reuse enabled by default.
+    ///
+    /// Note that the wildcard address is supported, which can be useful in
+    /// tests.
+    ///
+    /// # Example
+    /// ```
+    /// let mut ioc = fiona::IoContext::new();
+    /// let ex = ioc.get_executor();
+    ///
+    /// ex.spawn({
+    ///     let ex = ex.clone();
+    ///     async move {
+    ///         let _listener = fiona::net::TcpListener::bind_ipv4(
+    ///             &ex, std::net::Ipv4Addr::LOCALHOST, 0).unwrap();
+    ///     }
+    /// });
+    ///
+    /// let n = ioc.run();
+    /// assert_eq!(n, 1);
+    /// ```
     pub fn bind_ipv4(
         ex: &Executor, ipv4_addr: Ipv4Addr, port: u16,
     ) -> Result<TcpListener, nix::Error> {
@@ -134,13 +154,33 @@ impl TcpListener {
         Self::bind_ip_impl(ex, &addr, &TcpListenerOpts::default(), AddressFamily::Inet)
     }
 
-    pub fn bind_ipv6(
-        ex: &Executor, ipv6_addr: Ipv6Addr, port: u16,
-    ) -> Result<TcpListener, nix::Error> {
-        let addr = SockaddrIn6::from(SocketAddrV6::new(ipv6_addr, port, 0, 0));
-        Self::bind_ip_impl(ex, &addr, &TcpListenerOpts::default(), AddressFamily::Inet6)
-    }
-
+    /// Create a new `TcpListener` bound to the provided IPv6 address and port
+    /// with the provided options.
+    ///
+    /// Note that the wildcard address is supported, which can be useful in
+    /// tests.
+    ///
+    /// This function is useful for setting up a TCP listening socket with
+    /// either address reuse disabled or with address reuse and port reuse both
+    /// enabled.
+    ///
+    /// # Example
+    /// ```
+    /// let mut ioc = fiona::IoContext::new();
+    /// let ex = ioc.get_executor();
+    ///
+    /// ex.spawn({
+    ///     let ex = ex.clone();
+    ///     async move {
+    ///         let _listener = fiona::net::TcpListener::bind_ipv6_with_params(
+    ///             &ex, std::net::Ipv6Addr::LOCALHOST, 0,
+    ///             &fiona::net::TcpListenerOpts::default()).unwrap();
+    ///     }
+    /// });
+    ///
+    /// let n = ioc.run();
+    /// assert_eq!(n, 1);
+    /// ```
     pub fn bind_ipv6_with_params(
         ex: &Executor, ipv6_addr: Ipv6Addr, port: u16, opts: &TcpListenerOpts,
     ) -> Result<TcpListener, nix::Error> {
@@ -148,6 +188,37 @@ impl TcpListener {
         Self::bind_ip_impl(ex, &addr, opts, AddressFamily::Inet6)
     }
 
+    /// Create a new `TcpListener` bound to the provided IPv6 address and port
+    /// with address reuse enabled by default.
+    ///
+    /// Note that the wildcard address is supported, which can be useful in
+    /// tests.
+    ///
+    /// # Example
+    /// ```
+    /// let mut ioc = fiona::IoContext::new();
+    /// let ex = ioc.get_executor();
+    ///
+    /// ex.spawn({
+    ///     let ex = ex.clone();
+    ///     async move {
+    ///         let _listener = fiona::net::TcpListener::bind_ipv6(
+    ///             &ex, std::net::Ipv6Addr::LOCALHOST, 0).unwrap();
+    ///     }
+    /// });
+    ///
+    /// let n = ioc.run();
+    /// assert_eq!(n, 1);
+    /// ```
+    pub fn bind_ipv6(
+        ex: &Executor, ipv6_addr: Ipv6Addr, port: u16,
+    ) -> Result<TcpListener, nix::Error> {
+        let addr = SockaddrIn6::from(SocketAddrV6::new(ipv6_addr, port, 0, 0));
+        Self::bind_ip_impl(ex, &addr, &TcpListenerOpts::default(), AddressFamily::Inet6)
+    }
+
+    /// Returns the port the listener is bound to. This function is useful when
+    /// creating a listener bound to the wildcard port 0.
     #[must_use]
     pub fn port(&self) -> u16 {
         let acceptor_impl = unsafe { &*self.p.as_ptr() };
@@ -162,6 +233,36 @@ impl TcpListener {
         unreachable!();
     }
 
+    /// Accept an incoming connection.
+    ///
+    /// This function can be cancelled via a call to [`TcpListener::cancel`].
+    ///
+    /// # Example
+    /// ```
+    /// let mut ioc = fiona::IoContext::new();
+    /// let ex = ioc.get_executor();
+    ///
+    /// let listener = fiona::net::TcpListener::bind_ipv6(
+    ///     &ex, std::net::Ipv6Addr::LOCALHOST, 0).unwrap();
+    ///
+    /// ex.spawn({
+    ///     let listener = listener.clone();
+    ///     async move {
+    ///         let stream = listener.accept().await;
+    ///         assert_eq!(stream.unwrap_err(), nix::errno::Errno::ECANCELED);
+    ///     }
+    /// });
+    ///
+    /// ex.spawn({
+    ///     let listener = listener.clone();
+    ///     async move {
+    ///         listener.cancel().await.unwrap();
+    ///     }
+    /// });
+    ///
+    /// let n = ioc.run();
+    /// assert_eq!(n, 2);
+    /// ```
     pub fn accept(&self) -> impl Future<Output = Result<TcpStream, nix::Error>> {
         let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!acceptor_impl.accept_pending);
@@ -253,6 +354,57 @@ impl TcpListener {
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
         }
+    }
+
+    fn bind_ip_impl(
+        ex: &Executor, ip_addr: &dyn SockaddrLike, opts: &TcpListenerOpts, af: AddressFamily,
+    ) -> Result<TcpListener, nix::Error> {
+        let ex = ex.clone();
+        let socket = socket(af, SockType::Stream, SockFlag::empty(), SockProtocol::Tcp)?;
+
+        if opts.reuse_addr {
+            setsockopt(&socket, ReuseAddr, &true)?;
+        }
+
+        if opts.reuse_port {
+            setsockopt(&socket, ReusePort, &true)?;
+        }
+
+        bind(socket.as_raw_fd(), ip_addr)?;
+        listen(&socket, Backlog::new(Self::DEFAULT_BACKLOG).unwrap())?;
+
+        let layout = Layout::new::<ListenerImpl>();
+        let p = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
+
+        let ref_count = RefCount {
+            obj_count: 1,
+            op_count: 0,
+            release_impl: release_impl::<ListenerImpl>,
+            obj: p.as_ptr(),
+        };
+
+        // We need to do this for when `port == 0` (the wildcard port).
+        let addr = getsockname::<SockaddrStorage>(socket.as_raw_fd())?;
+
+        let acceptor_impl = ListenerImpl {
+            fd_impl: FdImpl {
+                ref_count,
+                ex,
+                fd: socket.into_raw_fd(),
+                cancel_pending: false,
+                close_pending: false,
+                was_closed: false,
+                is_fixed: false,
+            },
+            addr,
+            accept_pending: false,
+            accept_op: None,
+        };
+
+        let p = p.cast::<ListenerImpl>();
+        unsafe { std::ptr::write(p.as_ptr(), acceptor_impl) };
+
+        Ok(TcpListener { p })
     }
 }
 

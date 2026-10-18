@@ -1,1 +1,1 @@
-doc-valid-idents = ["io_uring", "timer_wheel", ".."]
+doc-valid-idents = ["io_uring", "timer_wheel", "TIME_WAIT", ".."]

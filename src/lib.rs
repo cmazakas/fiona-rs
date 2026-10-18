@@ -118,7 +118,6 @@ mod common;
 /// read/write them.
 pub mod fs;
 
-/// The networking module. Provides TCP sockets.
 pub mod net;
 
 /// The timer module. Provides a ring-backed fine-grained timer.
@@ -698,16 +697,16 @@ impl FixedBufs {
 ///
 /// # Example
 ///
-/// ```rs
+/// ```
 /// let mut ioc = fiona::IoContext::new();
 /// let ex = ioc.get_executor();
 /// ex.register_fixed_buffers(16, 1024).unwrap();
 ///
-/// let buf = ex.get_fixed_buf();
+/// let mut buf = ex.get_fixed_buf().unwrap();
 /// assert_eq!(buf.buf_idx(), 0);
 ///
 /// // From here, we can update the contents by exposing a mutable slice via `as_mut_slice()`.
-/// let _xs = ex.as_mut_slice();
+/// let _xs = buf.as_mut_slice();
 /// ```
 pub struct FixedBuf {
     ex: Executor,
