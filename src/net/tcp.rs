@@ -274,12 +274,19 @@ impl TcpListener {
         }
     }
 
+    /// Return a copy of the [`Executor`] that was used to construct this IO
+    /// object.
     #[must_use]
     pub fn get_executor(&self) -> Executor {
         let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
         acceptor_impl.fd_impl.ex.clone()
     }
 
+    /// Cancel all pending operations associated with this IO object's file
+    /// descriptor.
+    ///
+    /// Note that cancelation is always a best effort operation. A SQE
+    /// containing a successful result may still be waiting in the SQ.
     pub fn cancel(&self) -> impl Future<Output = Result<(), nix::Error>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
@@ -318,6 +325,9 @@ impl TcpListener {
         }
     }
 
+    /// Close the file descriptor associated with this IO object. Note that this
+    /// does not cancel pending [`TcpListener::accept`] requests, so
+    /// [`TcpListener::cancel`] should be called first.
     pub fn close(&self) -> impl Future<Output = Result<(), nix::Error>> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
 
@@ -409,6 +419,9 @@ impl TcpListener {
 }
 
 impl Clone for TcpListener {
+    /// Clones the `TcpListener`. This is a shallow copy of the IO object and is
+    /// equivalent to cloning an `Rc`. Extends the lifetime of the underlying
+    /// `IoContext`'s data.
     fn clone(&self) -> Self {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
         unsafe { add_obj_ref(rc) };
@@ -610,6 +623,63 @@ impl Drop for StreamImpl {
 
 //-----------------------------------------------------------------------------
 
+/// A `TcpStream` is a bidirectional stream socket, used for TCP/IP
+/// communications.
+///
+/// Like the [`TcpListener`] and [`Timer`](crate::time::Timer), all IO objects
+/// in Fiona are shallowly copyable. Because of this, it's trivial to write
+/// intertask concurrency without the need for a dedicated split between a write
+/// half and a read half.
+///
+/// TCP sockets in Fiona require the usage of provided buffers because they
+/// interally use multishot recv. Read the section on [provided
+/// buffers][liburing_rs::io_uring_provided_buffers] and [multishot
+/// operations](liburing_rs::io_uring_multishot).
+///
+/// # Example
+/// ```
+/// let mut ioc = fiona::IoContext::new();
+///
+/// let ex = ioc.get_executor();
+/// let (bgid, num_bufs, buf_len) = (1234, 1024, 1024);
+/// ex.register_buf_group(bgid, num_bufs, buf_len);
+///
+/// let listener =
+///     fiona::net::TcpListener::bind_ipv6(&ex, std::net::Ipv6Addr::LOCALHOST, 0)
+///         .unwrap();
+///
+/// // Grab the concrete port our listening socket bound to.
+/// let port = listener.port();
+///
+/// ex.spawn({
+///     let ex = ex.clone();
+///     async move {
+///         let stream = listener.accept().await.unwrap();
+///         stream.set_buf_group(bgid);
+///         let bufs = stream.recv().await.unwrap();
+///
+///         let mut msg = Vec::new();
+///         bufs.iter().for_each(|b| msg.extend_from_slice(b));
+///         assert_eq!(&msg[..], "Hello, world!".as_bytes());
+///     }
+/// });
+///
+/// ex.spawn({
+///     let ex = ex.clone();
+///     async move {
+///         let stream = fiona::net::TcpClient::new(&ex)
+///             .connect_ipv6(std::net::Ipv6Addr::LOCALHOST, port)
+///             .await
+///             .unwrap();
+///
+///         stream.set_buf_group(bgid);
+///         let (n, _buf) = stream.send(String::from("Hello, world!").into_bytes()).await;
+///         let _ = n.unwrap();
+///     }
+/// });
+///
+/// let n = ioc.run();
+/// ```
 #[derive(Debug)]
 pub struct TcpStream {
     p: NonNull<StreamImpl>,

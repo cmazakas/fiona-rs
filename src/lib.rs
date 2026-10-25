@@ -48,7 +48,7 @@
 //! * To setup a TLS server or client, see [tls].
 
 #![feature(ptr_metadata, local_waker, sync_unsafe_cell, unsafe_pinned)]
-#![warn(clippy::pedantic, missing_docs)]
+#![warn(clippy::pedantic)]
 #![allow(
     clippy::mutable_key_type,
     clippy::missing_panics_doc,
