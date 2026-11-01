@@ -686,53 +686,16 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    #[must_use]
-    pub(crate) fn new(ex: &Executor, fd: i32) -> TcpStream {
-        let ex = ex.clone();
-        let layout = Layout::new::<StreamImpl>();
-        let p;
-
-        {
-            let ptr = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
-
-            let ref_count = RefCount {
-                obj_count: 1,
-                op_count: 0,
-                release_impl: release_impl::<StreamImpl>,
-                obj: ptr.as_ptr(),
-            };
-
-            let stream_impl = StreamImpl {
-                fd_impl: FdImpl {
-                    ref_count,
-                    ex,
-                    fd,
-                    close_pending: false,
-                    cancel_pending: false,
-                    was_closed: false,
-                    is_fixed: true,
-                },
-                ts: Duration::from_secs(3),
-                buf_group: u16::MAX,
-                send_pending: false,
-                recv_pending: false,
-                shutdown_pending: false,
-                recv_op: None,
-            };
-
-            p = ptr.cast::<StreamImpl>();
-            unsafe { std::ptr::write(p.as_ptr(), stream_impl) };
-        }
-
-        TcpStream { p }
-    }
-
+    /// Return a copy of the `Executor` bound to this IO object.
     #[must_use]
     pub fn get_executor(&self) -> Executor {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.fd_impl.ex.clone()
     }
 
+    /// Set the index of the buffer group that will be used for multishot recv
+    /// operations. This can be changed but only when a pending recv is not
+    /// scheduled, so users should call [cancel](TcpStream::cancel) first.
     pub fn set_buf_group(&self, bgid: u16) {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(stream_impl.recv_op.is_none());
@@ -742,10 +705,32 @@ impl TcpStream {
         // gets called or at least figure out the correct behavior.
     }
 
+    /// Perform a zero-copy send of the passed in buffer. The entire buffer will
+    /// be passed to the underlying send call, though this amount is not
+    /// guaranteed to be transferred. This function returns the amount of
+    /// bytes sent, if there was not an error, and unconditionally returns
+    /// the passed in buffer back to the caller.
+    ///
+    /// While using this function, callers may see an error return of `ENOMEM`.
+    /// This is because the kernel must lock the memory in-place before
+    /// performing the send and many Linux distributions only permit modest
+    /// amount of memory to be locked by a process at once. The `ulimit -l`
+    /// value will need to be manually adjusted.
     pub fn send(&self, buf: Vec<u8>) -> impl Future<Output = (Result<usize, nix::Error>, Vec<u8>)> {
         self.send_subspan(0..buf.len(), buf)
     }
 
+    /// Perform a zero-copy send of the passed in buffer, only transferring the
+    /// specified sub-range. This amount is not guaranteed to be transferred by
+    /// the kernel. This function returns the amount of bytes sent, if there is
+    /// not an error, and unconditionally returns the passed in buffer back to
+    /// the caller.
+    ///
+    /// While using this function, callers may see an error return of `ENOMEM`.
+    /// This is because the kernel must lock the memory in-place before
+    /// performing the send and many Linux distributions only permit modest
+    /// amount of memory to be locked by a process at once. The `ulimit -l`
+    /// value will need to be manually adjusted.
     pub fn send_subspan<R: RangeBounds<usize>>(
         &self, range: R, buf: Vec<u8>,
     ) -> impl Future<Output = (Result<usize, nix::Error>, Vec<u8>)> {
@@ -800,12 +785,29 @@ impl TcpStream {
         })
     }
 
+    /// Perform a zero-copy send of the passed in buffer. This amount is not
+    /// guaranteed to be transferred by the kernel. This function returns
+    /// the amount of bytes sent, if there is not an error, and
+    /// unconditionally returns the passed in buffer back to the caller.
+    ///
+    /// This function requires the user supply a [`FixedBuf`]. This is a
+    /// pre-mapped/pre-locked region of memory which makes it have slightly less
+    /// latency than its [`send`](TcpStream::send) counterpart.
     pub fn send_fixed(
         &self, buf: FixedBuf,
     ) -> impl Future<Output = (Result<usize, nix::Error>, FixedBuf)> {
         self.send_subspan_fixed(0..buf.len(), buf)
     }
 
+    /// Perform a zero-copy send of the passed in buffer, only transferring the
+    /// specified sub-range. This amount is not guaranteed to be transferred by
+    /// the kernel. This function returns the amount of bytes sent, if there is
+    /// not an error, and unconditionally returns the passed in buffer back to
+    /// the caller.
+    ///
+    /// This function requires the user supply a [`FixedBuf`]. This is a
+    /// pre-mapped/pre-locked region of memory which makes it have slightly less
+    /// latency than its [`send_subspan`](TcpStream::send_subspan) counterpart.
     pub fn send_subspan_fixed<R: RangeBounds<usize>>(
         &self, range: R, buf: FixedBuf,
     ) -> impl Future<Output = (Result<usize, nix::Error>, FixedBuf)> {
@@ -862,6 +864,11 @@ impl TcpStream {
         })
     }
 
+    /// Starts a multishot recv operation, if one is not already active. Uses
+    /// buffer group specified by a previous call to
+    /// [`set_buf_group`](TcpStream::set_buf_group). This function has an
+    /// implicit timeout, which will automatically call
+    /// [`cancel`](TcpStream::cancel) on the socket.
     pub async fn recv(&self) -> Result<BorrowedBufs, nix::Error> {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!stream_impl.recv_pending);
@@ -1000,6 +1007,47 @@ impl TcpStream {
     pub fn set_timeout(&self, dur: Duration) {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.ts = dur;
+    }
+
+    #[must_use]
+    pub(crate) fn new(ex: &Executor, fd: i32) -> TcpStream {
+        let ex = ex.clone();
+        let layout = Layout::new::<StreamImpl>();
+        let p;
+
+        {
+            let ptr = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
+
+            let ref_count = RefCount {
+                obj_count: 1,
+                op_count: 0,
+                release_impl: release_impl::<StreamImpl>,
+                obj: ptr.as_ptr(),
+            };
+
+            let stream_impl = StreamImpl {
+                fd_impl: FdImpl {
+                    ref_count,
+                    ex,
+                    fd,
+                    close_pending: false,
+                    cancel_pending: false,
+                    was_closed: false,
+                    is_fixed: true,
+                },
+                ts: Duration::from_secs(3),
+                buf_group: u16::MAX,
+                send_pending: false,
+                recv_pending: false,
+                shutdown_pending: false,
+                recv_op: None,
+            };
+
+            p = ptr.cast::<StreamImpl>();
+            unsafe { std::ptr::write(p.as_ptr(), stream_impl) };
+        }
+
+        TcpStream { p }
     }
 }
 
