@@ -227,12 +227,12 @@ fn timer_wheel_panic() {
 
 #[test]
 fn timer_wheel_externally_polled() {
-    // Test what happens when we externally create a timer_wheel::TimerFuture, poll
-    // it manually and then drop the backing I/O context and all other external
-    // Executor instances. The TimerFuture should keep the runtime data alive and
-    // because it was not dropped, its entry in the timer wheel should be active. If
-    // we wait long enough inside our run of the event loop, it should be marked
-    // complete.
+    // Test what happens when we externally create a timer_wheel::TimerFuture,
+    // poll it manually and then drop the backing I/O context and all other
+    // external Executor instances. The TimerFuture should keep the runtime data
+    // alive and because it was not dropped, its entry in the timer wheel should
+    // be active. If we wait long enough inside our run of the event loop, it
+    // should be marked complete.
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();

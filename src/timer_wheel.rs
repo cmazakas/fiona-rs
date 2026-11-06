@@ -32,8 +32,8 @@ const MAX_DURATION: u64 = (1 << (6 * NUM_LEVELS)) - 1;
 fn level_for(elapsed: u64, when: u64) -> usize {
     // Obtain the most significant bit where `when` and `elapsed` diverge. This
     // difference is what determines which level/slot we place this timer into.
-    // Mix in in the SLOT_MASK for the case when the xor produces 0, as that breaks
-    // our ability to reason about the position of the signifcand.
+    // Mix in in the SLOT_MASK for the case when the xor produces 0, as that
+    // breaks our ability to reason about the position of the signifcand.
     const MASK: u64 = (1 << 6) - 1;
     let mut masked = elapsed ^ when | MASK;
 
@@ -49,8 +49,9 @@ fn level_for(elapsed: u64, when: u64) -> usize {
 }
 
 fn slot_for(when: u64, level: usize) -> usize {
-    // Because we choose the level for our timer based on which 6-bit word it falls
-    // into, we remove all lower-order bits and base the slot on that 6-bit word.
+    // Because we choose the level for our timer based on which 6-bit word it
+    // falls into, we remove all lower-order bits and base the slot on that
+    // 6-bit word.
     ((when >> (level * 6)) % NUM_SLOTS as u64) as usize
 }
 
@@ -672,9 +673,10 @@ mod test {
 
         assert!(timer_wheel.elapsed() > max_deadline as u64);
 
-        // Sort our indices by the deadlines we've ascribed them and if required, sort
-        // them by the indices themselves. Testing against this property ensures we
-        // follow a proper FIFO structure, which requires pop_front() and pop_back().
+        // Sort our indices by the deadlines we've ascribed them and if
+        // required, sort them by the indices themselves. Testing against this
+        // property ensures we follow a proper FIFO structure, which requires
+        // pop_front() and pop_back().
         expected.sort_by(|lhs, rhs| {
             if lhs.1 == rhs.1 {
                 return lhs.0.cmp(&rhs.0);

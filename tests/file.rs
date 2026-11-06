@@ -101,11 +101,11 @@ fn file_open_close_on_future_drop() {
             let mut tasks = Vec::new();
 
             for i in 0..NUM_FILES {
-                let mut task = fiona::fs::File::open(
+                let mut task = Box::pin(fiona::fs::File::open(
                     &ex,
-                    &format!("tests/data/fiona_test_file_open_close_on_future_drop_{i}"),
-                );
-                let r = poll!(&mut task);
+                    format!("tests/data/fiona_test_file_open_close_on_future_drop_{i}"),
+                ));
+                let r = poll!(task.as_mut());
                 assert!(r.is_pending());
 
                 tasks.push(task);
@@ -156,11 +156,11 @@ fn file_open_eager_drop_cancel() {
             let mut files = Vec::new();
 
             for i in 0..NUM_FILES {
-                let mut task = fiona::fs::File::open(
+                let mut task = Box::pin(fiona::fs::File::open(
                     &ex,
-                    &format!("tests/data/fiona_test_file_open_eager_drop_cancel_{i}"),
-                );
-                let r = poll!(&mut task);
+                    format!("tests/data/fiona_test_file_open_eager_drop_cancel_{i}"),
+                ));
+                let r = poll!(task.as_mut());
                 assert!(r.is_pending());
 
                 fiona::time::sleep(&ex, Duration::from_micros(1)).await;
@@ -364,12 +364,12 @@ fn file_eager_drop_write() {
             let mut tasks = Vec::new();
 
             for (i, buf) in bufs.into_iter().enumerate() {
-                let task = files[i].write_subspan_at_fixed(..n, buf, -1 as _);
+                let task = Box::pin(files[i].write_subspan_at_fixed(..n, buf, -1 as _));
                 tasks.push(task);
             }
 
-            for mut task in &mut tasks {
-                assert!(Pin::new(&mut task).poll(&mut cx).is_pending());
+            for task in &mut tasks {
+                assert!(task.as_mut().poll(&mut cx).is_pending());
             }
 
             drop(tasks);
@@ -705,7 +705,7 @@ fn file_read_write_non_fixed() {
                     let (to_write, remaining) = msg.split_at(1024);
                     msg = remaining;
 
-                    buf.as_mut_slice().copy_from_slice(to_write);
+                    buf.copy_from_slice(to_write);
                     bufs.push(buf);
                 }
             }

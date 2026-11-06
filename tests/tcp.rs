@@ -101,11 +101,11 @@ fn tcp_acceptor_eager_drop() {
 
     ex.spawn(async move {
         for _ in 0..3 {
-            let mut f = acceptor.accept();
+            let mut f = Box::pin(acceptor.accept());
 
             let w = WakerFuture.await;
             assert!(
-                Pin::new(&mut f)
+                f.as_mut()
                     .poll(&mut std::task::Context::from_waker(&w))
                     .is_pending()
             );
@@ -362,19 +362,19 @@ fn tcp_send_hello_world_throwing_reuse_future() {
 
     let mut cx = Context::from_waker(Waker::noop());
 
-    let mut fut = acceptor.accept();
-    assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+    let mut fut = pin!(acceptor.accept());
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
 
     ex.spawn({
         let ex = ex.clone();
         async move {
             let mut connect_future =
-                fiona::net::TcpClient::new(&ex).connect_ipv4(Ipv4Addr::LOCALHOST, port);
+                pin!(fiona::net::TcpClient::new(&ex).connect_ipv4(Ipv4Addr::LOCALHOST, port));
 
             let waker = WakerFuture.await;
             let mut cx = Context::from_waker(&waker);
 
-            assert!(Pin::new(&mut connect_future).poll(&mut cx).is_pending());
+            assert!(connect_future.as_mut().poll(&mut cx).is_pending());
             panic!();
         }
     });
@@ -399,10 +399,10 @@ fn tcp_send_hello_world_throwing_reuse_future() {
 #[test]
 fn tcp_accept_select_ready_always() {
     // Test what happens when an accept would complete immediately succesfully
-    // but the future isn't explicitly handled. This test is useful for handling the
-    // oddities of Future manipulation that crates like futures facilitate. We went
-    // to fundamentally test that we don't introduce fd leaks here and starve the
-    // runtime of descriptors.
+    // but the future isn't explicitly handled. This test is useful for handling
+    // the oddities of Future manipulation that crates like futures facilitate.
+    // We went to fundamentally test that we don't introduce fd leaks here and
+    // starve the runtime of descriptors.
 
     static mut NUM_RUNS: u64 = 0;
 
@@ -442,11 +442,11 @@ fn tcp_accept_select_ready_always() {
         let (num_sent, buf) = stream.send(String::from("rawr!").into_bytes()).await;
         assert_eq!(num_sent.unwrap(), buf.len());
 
-        // Test the case where an accept() op completes, we see the CQE and the Future +
-        // task are still in scope so we still schedule resumption, but we never
-        // actually poll() the AcceptFuture to completion. Because we're using multishot
-        // accept, our op is running in the background so we have no need to explicitly
-        // poll().
+        // Test the case where an accept() op completes, we see the CQE and the
+        // Future + task are still in scope so we still schedule resumption, but
+        // we never actually poll() the AcceptFuture to completion. Because
+        // we're using multishot accept, our op is running in the background so
+        // we have no need to explicitly poll().
         let _client3 = fiona::net::TcpClient::new(&ex)
             .connect_ipv4(Ipv4Addr::LOCALHOST, port)
             .await
@@ -1068,10 +1068,10 @@ fn tcp_double_connect() {
         let ex = ex.clone();
         ex.clone().spawn(async move {
             let client = fiona::net::TcpClient::new(&ex);
-            let mut f1 = client.connect_ipv4(Ipv4Addr::LOCALHOST, port);
+            let mut f1 = pin!(client.connect_ipv4(Ipv4Addr::LOCALHOST, port));
 
-            assert!(futures::poll!(&mut f1).is_pending());
-            assert!(futures::poll!(&mut f1).is_pending());
+            assert!(futures::poll!(f1.as_mut()).is_pending());
+            assert!(futures::poll!(f1.as_mut()).is_pending());
         });
     }
 
@@ -1081,8 +1081,8 @@ fn tcp_double_connect() {
 
 #[test]
 fn tcp_concurrent_send_recv() {
-    // Test that our TCP I/O objects support concurrent send() and recv() calls on
-    // the same underlying socket.
+    // Test that our TCP I/O objects support concurrent send() and recv() calls
+    // on the same underlying socket.
 
     const NUM_CLIENTS: u64 = 500;
     const MESSAGE_LEN: usize = 64 * 1024;
@@ -1286,10 +1286,10 @@ fn tcp_close() {
             let (r, _) = stream.send(vec![0, 1, 2, 3, 4]).await;
             assert_eq!(r.unwrap_err(), Errno::EBADF);
         }
-        // Time-slice at the end here so we do a full CQE processing loop for the
-        // scheduled DropClose. Our RunGuard implementation will cleanup the CQEs fine,
-        // but it doesn't do any CQE processing so we lose coverage in our test without
-        // this.
+        // Time-slice at the end here so we do a full CQE processing loop for
+        // the scheduled DropClose. Our RunGuard implementation will cleanup the
+        // CQEs fine, but it doesn't do any CQE processing so we lose coverage
+        // in our test without this.
         timer.wait(Duration::from_millis(10)).await.unwrap();
     }
 
@@ -1313,8 +1313,8 @@ fn tcp_close_eager_drop() {
 
     async fn server(acceptor: fiona::net::TcpListener) {
         let stream = acceptor.accept().await.unwrap();
-        let mut f = stream.close();
-        assert!(futures::poll!(&mut f).is_pending());
+        let mut f = Box::pin(stream.close());
+        assert!(futures::poll!(f.as_mut()).is_pending());
 
         drop(f);
 
@@ -1422,8 +1422,8 @@ fn tcp_shutdown_eager_drop() {
     async fn server(acceptor: fiona::net::TcpListener) {
         let stream = acceptor.accept().await.unwrap();
 
-        let mut f = stream.shutdown(SHUT_RDWR);
-        assert!(futures::poll!(&mut f).is_pending());
+        let mut f = Box::pin(stream.shutdown(SHUT_RDWR));
+        assert!(futures::poll!(f.as_mut()).is_pending());
 
         drop(f);
 
@@ -1552,7 +1552,7 @@ fn tcp_eager_drop_send_ready() {
         let timer = fiona::time::Timer::new(&ex);
         timer.wait(Duration::from_millis(10)).await.unwrap();
 
-        let mut f = stream.send(vec![0, 1, 2, 3, 4]);
+        let mut f = Box::pin(stream.send(vec![0, 1, 2, 3, 4]));
         assert!(futures::poll!(&mut f).is_pending());
         drop(f);
 
@@ -1606,12 +1606,12 @@ fn tcp_eager_drop_connect_ready() {
 
     async fn client(ex: fiona::Executor, port: u16) {
         let mut connect_future =
-            fiona::net::TcpClient::new(&ex).connect_ipv4(Ipv4Addr::LOCALHOST, port);
+            Box::pin(fiona::net::TcpClient::new(&ex).connect_ipv4(Ipv4Addr::LOCALHOST, port));
 
         let w = WakerFuture.await;
         let mut cx = std::task::Context::from_waker(&w);
 
-        assert!(Pin::new(&mut connect_future).poll(&mut cx).is_pending());
+        assert!(connect_future.as_mut().poll(&mut cx).is_pending());
 
         let timer = fiona::time::Timer::new(&ex.clone());
         timer.wait(Duration::from_millis(250)).await.unwrap();
@@ -2014,20 +2014,21 @@ fn tcp_acceptor_outlives_io_context() {
 
     ex.register_buf_group(1234, 256, 1024).unwrap();
 
-    // Creating this Future itself shouldn't leak but invoking the Future via poll()
-    // should. This is because we create an actual I/O operation and emplace an SQE
-    // in the submission queue. Because we no longer create an internal RunGuard,
-    // there's nothing to clean up the queues so we're left with a leak because we
-    // never release the operation via release_op().
-    let mut fut = acceptor.accept();
+    // Creating this Future itself shouldn't leak but invoking the Future via
+    // poll() should. This is because we create an actual I/O operation and
+    // emplace an SQE in the submission queue. Because we no longer create an
+    // internal RunGuard, there's nothing to clean up the queues so we're left
+    // with a leak because we never release the operation via release_op().
+    let mut fut = pin!(acceptor.accept());
     let noop_waker = std::task::Waker::noop();
     let mut ctx = std::task::Context::from_waker(noop_waker);
-    assert!(Pin::new(&mut fut).poll(&mut ctx).is_pending());
-    assert!(Pin::new(&mut fut).poll(&mut ctx).is_pending());
+    assert!(fut.as_mut().poll(&mut ctx).is_pending());
+    assert!(fut.as_mut().poll(&mut ctx).is_pending());
 
-    // This should panic because when our IoContext goes out of scope, we deallocate
-    // all of the task queues so in this case, calling spawn() needs to panic to
-    // ensure soundness as the dangling task head/tail have been freed.
+    // This should panic because when our IoContext goes out of scope, we
+    // deallocate all of the task queues so in this case, calling spawn() needs
+    // to panic to ensure soundness as the dangling task head/tail have been
+    // freed.
     let r = catch_unwind(AssertUnwindSafe(|| {
         let string = String::from("hello, world!");
         ex.spawn(async move {
@@ -2040,8 +2041,8 @@ fn tcp_acceptor_outlives_io_context() {
 
 #[test]
 fn tcp_sockets_outlive_io_context() {
-    // Test that it's sound for a connected pair of sockets to outlive the backing
-    // I/O context.
+    // Test that it's sound for a connected pair of sockets to outlive the
+    // backing I/O context.
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
@@ -2095,26 +2096,26 @@ fn tcp_sockets_outlive_io_context() {
     let server = server_stream.borrow_mut().take().unwrap();
     let client = client_stream.borrow_mut().take().unwrap();
 
-    let mut send1 = server.send(vec![0, 1, 2, 3]);
-    let mut send2 = client.send(vec![3, 2, 1, 0]);
+    let mut send1 = pin!(server.send(vec![0, 1, 2, 3]));
+    let mut send2 = pin!(client.send(vec![3, 2, 1, 0]));
 
     let mut recv1 = pin!(server.recv());
     let mut recv2 = pin!(client.recv());
 
-    let mut close1 = server.close();
-    let mut close2 = client.close();
+    let mut close1 = pin!(server.close());
+    let mut close2 = pin!(client.close());
 
     let noop_waker = std::task::Waker::noop();
     let mut ctx = std::task::Context::from_waker(noop_waker);
 
-    assert!(Pin::new(&mut send1).poll(&mut ctx).is_pending());
-    assert!(Pin::new(&mut send2).poll(&mut ctx).is_pending());
+    assert!(send1.as_mut().poll(&mut ctx).is_pending());
+    assert!(send2.as_mut().poll(&mut ctx).is_pending());
 
-    assert!(Pin::new(&mut recv1).poll(&mut ctx).is_pending());
-    assert!(Pin::new(&mut recv2).poll(&mut ctx).is_pending());
+    assert!(recv1.as_mut().poll(&mut ctx).is_pending());
+    assert!(recv2.as_mut().poll(&mut ctx).is_pending());
 
-    assert!(Pin::new(&mut close1).poll(&mut ctx).is_pending());
-    assert!(Pin::new(&mut close2).poll(&mut ctx).is_pending());
+    assert!(close1.as_mut().poll(&mut ctx).is_pending());
+    assert!(close2.as_mut().poll(&mut ctx).is_pending());
 }
 
 #[test]
@@ -2260,8 +2261,9 @@ fn tcp_socket_reuse() {
 #[test]
 fn tcp_graceful_shutdown() {
     // Want to demonstrate that our TCP layer is capable of doing a graceful TCP
-    // close which involves shutting down the write side of the connection followed
-    // by receiving an EOF from the peer before finally closing the socket itself.
+    // close which involves shutting down the write side of the connection
+    // followed by receiving an EOF from the peer before finally closing the
+    // socket itself.
 
     let mut ioc = fiona::IoContext::new();
 

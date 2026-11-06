@@ -128,9 +128,9 @@ impl File {
         }
     }
 
-    pub fn write_subspan_at_fixed<R: RangeBounds<usize>>(
+    pub async fn write_subspan_at_fixed<R: RangeBounds<usize>>(
         &self, range: R, buf: FixedBuf, offset: u64,
-    ) -> impl Future<Output = (Result<usize, nix::Error>, FixedBuf)> {
+    ) -> (Result<usize, nix::Error>, FixedBuf) {
         let file_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!file_impl.write_pending, "A write is already pending.");
         assert_eq!(
@@ -166,17 +166,18 @@ impl File {
             completed: false,
             op: Some(key.data().as_ffi()),
         })
+        .await
     }
 
-    pub fn write_at_fixed(
+    pub async fn write_at_fixed(
         &self, buf: FixedBuf, offset: u64,
-    ) -> impl Future<Output = (Result<usize, nix::Error>, FixedBuf)> {
-        self.write_subspan_at_fixed(.., buf, offset)
+    ) -> (Result<usize, nix::Error>, FixedBuf) {
+        self.write_subspan_at_fixed(.., buf, offset).await
     }
 
-    pub fn write_subspan_at<R: RangeBounds<usize>>(
+    pub async fn write_subspan_at<R: RangeBounds<usize>>(
         &self, range: R, buf: Vec<u8>, offset: u64,
-    ) -> impl Future<Output = (Result<usize, nix::Error>, Vec<u8>)> {
+    ) -> (Result<usize, nix::Error>, Vec<u8>) {
         let file_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!file_impl.write_pending, "A write is already pending.");
         assert_eq!(
@@ -212,17 +213,18 @@ impl File {
             completed: false,
             op: Some(key.data().as_ffi()),
         })
+        .await
     }
 
-    pub fn write_at(
+    pub async fn write_at(
         &self, buf: Vec<u8>, offset: u64,
-    ) -> impl Future<Output = (Result<usize, nix::Error>, Vec<u8>)> {
-        self.write_subspan_at(.., buf, offset)
+    ) -> (Result<usize, nix::Error>, Vec<u8>) {
+        self.write_subspan_at(.., buf, offset).await
     }
 
-    pub fn read_subspan_at_fixed<R: RangeBounds<usize>>(
+    pub async fn read_subspan_at_fixed<R: RangeBounds<usize>>(
         &self, range: R, buf: FixedBuf, offset: u64,
-    ) -> impl Future<Output = (Result<usize, nix::Error>, FixedBuf)> {
+    ) -> (Result<usize, nix::Error>, FixedBuf) {
         let file_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(
             !file_impl.write_pending,
@@ -257,17 +259,18 @@ impl File {
             completed: false,
             op: Some(key.data().as_ffi()),
         })
+        .await
     }
 
-    pub fn read_at_fixed(
+    pub async fn read_at_fixed(
         &self, buf: FixedBuf, offset: u64,
-    ) -> impl Future<Output = (Result<usize, nix::Error>, FixedBuf)> {
-        self.read_subspan_at_fixed(.., buf, offset)
+    ) -> (Result<usize, nix::Error>, FixedBuf) {
+        self.read_subspan_at_fixed(.., buf, offset).await
     }
 
-    pub fn read_subspan_at<R: RangeBounds<usize>>(
+    pub async fn read_subspan_at<R: RangeBounds<usize>>(
         &self, range: R, buf: Vec<u8>, offset: u64,
-    ) -> impl Future<Output = (Result<usize, nix::Error>, Vec<u8>)> {
+    ) -> (Result<usize, nix::Error>, Vec<u8>) {
         let file_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(
             !file_impl.write_pending,
@@ -302,15 +305,14 @@ impl File {
             completed: false,
             op: Some(key.data().as_ffi()),
         })
+        .await
     }
 
-    pub fn read_at(
-        &self, buf: Vec<u8>, offset: u64,
-    ) -> impl Future<Output = (Result<usize, nix::Error>, Vec<u8>)> {
-        self.read_subspan_at(.., buf, offset)
+    pub async fn read_at(&self, buf: Vec<u8>, offset: u64) -> (Result<usize, nix::Error>, Vec<u8>) {
+        self.read_subspan_at(.., buf, offset).await
     }
 
-    pub fn cancel(&self) -> impl Future<Output = Result<(), nix::Error>> {
+    pub async fn cancel(&self) -> Result<(), nix::Error> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
         let file_impl = unsafe { &mut *self.p.as_ptr() };
@@ -346,9 +348,10 @@ impl File {
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
         }
+        .await
     }
 
-    pub fn close(&self) -> impl Future<Output = Result<(), nix::Error>> {
+    pub async fn close(&self) -> Result<(), nix::Error> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
 
         let file_impl = unsafe { &mut *self.p.as_ptr() };
@@ -384,6 +387,7 @@ impl File {
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
         }
+        .await
     }
 
     #[must_use]

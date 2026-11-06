@@ -44,7 +44,7 @@ use std::{
 
 //-----------------------------------------------------------------------------
 
-/// A simple strut of options used for configuring the [`TcpListener`].
+/// A simple struct of options used for configuring the [`TcpListener`].
 /// `reuse_addr` is equivalent to `setsockopt(SO_REUSEADDR)`. `reuse_port` is
 /// equivalent to `setsockopt(SO_REUSEPORT)`.
 ///
@@ -263,7 +263,7 @@ impl TcpListener {
     /// let n = ioc.run();
     /// assert_eq!(n, 2);
     /// ```
-    pub fn accept(&self) -> impl Future<Output = Result<TcpStream, nix::Error>> {
+    pub async fn accept(&self) -> Result<TcpStream, nix::Error> {
         let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!acceptor_impl.accept_pending);
         acceptor_impl.accept_pending = true;
@@ -272,6 +272,7 @@ impl TcpListener {
             acceptor: self,
             completed: false,
         }
+        .await
     }
 
     /// Return a copy of the [`Executor`] that was used to construct this IO
@@ -287,7 +288,7 @@ impl TcpListener {
     ///
     /// Note that cancelation is always a best effort operation. A SQE
     /// containing a successful result may still be waiting in the SQ.
-    pub fn cancel(&self) -> impl Future<Output = Result<(), nix::Error>> {
+    pub async fn cancel(&self) -> Result<(), nix::Error> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
         let listener = unsafe { &mut *self.p.as_ptr() };
@@ -323,12 +324,13 @@ impl TcpListener {
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
         }
+        .await
     }
 
     /// Close the file descriptor associated with this IO object. Note that this
     /// does not cancel pending [`TcpListener::accept`] requests, so
     /// [`TcpListener::cancel`] should be called first.
-    pub fn close(&self) -> impl Future<Output = Result<(), nix::Error>> {
+    pub async fn close(&self) -> Result<(), nix::Error> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
 
         let acceptor_impl = unsafe { &mut *self.p.as_ptr() };
@@ -364,6 +366,7 @@ impl TcpListener {
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
         }
+        .await
     }
 
     fn bind_ip_impl(
@@ -716,8 +719,8 @@ impl TcpStream {
     /// performing the send and many Linux distributions only permit modest
     /// amount of memory to be locked by a process at once. The `ulimit -l`
     /// value will need to be manually adjusted.
-    pub fn send(&self, buf: Vec<u8>) -> impl Future<Output = (Result<usize, nix::Error>, Vec<u8>)> {
-        self.send_subspan(0..buf.len(), buf)
+    pub async fn send(&self, buf: Vec<u8>) -> (Result<usize, nix::Error>, Vec<u8>) {
+        self.send_subspan(0..buf.len(), buf).await
     }
 
     /// Perform a zero-copy send of the passed in buffer, only transferring the
@@ -731,9 +734,9 @@ impl TcpStream {
     /// performing the send and many Linux distributions only permit modest
     /// amount of memory to be locked by a process at once. The `ulimit -l`
     /// value will need to be manually adjusted.
-    pub fn send_subspan<R: RangeBounds<usize>>(
+    pub async fn send_subspan<R: RangeBounds<usize>>(
         &self, range: R, buf: Vec<u8>,
-    ) -> impl Future<Output = (Result<usize, nix::Error>, Vec<u8>)> {
+    ) -> (Result<usize, nix::Error>, Vec<u8>) {
         assert!(
             unsafe { !(*self.p.as_ptr()).send_pending },
             "Send is already pending for this TCP socket."
@@ -783,6 +786,7 @@ impl TcpStream {
             completed: false,
             op: Some(key.data().as_ffi()),
         })
+        .await
     }
 
     /// Perform a zero-copy send of the passed in buffer. This amount is not
@@ -793,10 +797,8 @@ impl TcpStream {
     /// This function requires the user supply a [`FixedBuf`]. This is a
     /// pre-mapped/pre-locked region of memory which makes it have slightly less
     /// latency than its [`send`](TcpStream::send) counterpart.
-    pub fn send_fixed(
-        &self, buf: FixedBuf,
-    ) -> impl Future<Output = (Result<usize, nix::Error>, FixedBuf)> {
-        self.send_subspan_fixed(0..buf.len(), buf)
+    pub async fn send_fixed(&self, buf: FixedBuf) -> (Result<usize, nix::Error>, FixedBuf) {
+        self.send_subspan_fixed(0..buf.len(), buf).await
     }
 
     /// Perform a zero-copy send of the passed in buffer, only transferring the
@@ -808,9 +810,9 @@ impl TcpStream {
     /// This function requires the user supply a [`FixedBuf`]. This is a
     /// pre-mapped/pre-locked region of memory which makes it have slightly less
     /// latency than its [`send_subspan`](TcpStream::send_subspan) counterpart.
-    pub fn send_subspan_fixed<R: RangeBounds<usize>>(
+    pub async fn send_subspan_fixed<R: RangeBounds<usize>>(
         &self, range: R, buf: FixedBuf,
-    ) -> impl Future<Output = (Result<usize, nix::Error>, FixedBuf)> {
+    ) -> (Result<usize, nix::Error>, FixedBuf) {
         assert!(
             unsafe { !(*self.p.as_ptr()).send_pending },
             "Send is already pending for this TCP socket."
@@ -862,6 +864,7 @@ impl TcpStream {
             completed: false,
             op: Some(key.data().as_ffi()),
         })
+        .await
     }
 
     /// Starts a multishot recv operation, if one is not already active. Uses
@@ -898,7 +901,7 @@ impl TcpStream {
         .await
     }
 
-    pub fn shutdown(&self, how: i32) -> impl Future<Output = Result<(), nix::Error>> {
+    pub async fn shutdown(&self, how: i32) -> Result<(), nix::Error> {
         assert!(unsafe { !(*self.p.as_ptr()).shutdown_pending });
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
@@ -926,9 +929,10 @@ impl TcpStream {
             op: Some(key.data().as_ffi()),
             how,
         }
+        .await
     }
 
-    pub fn close(&self) -> impl Future<Output = Result<(), nix::Error>> {
+    pub async fn close(&self) -> Result<(), nix::Error> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
@@ -964,9 +968,10 @@ impl TcpStream {
             op: Some(key.data().as_ffi()),
             _m: PhantomData,
         }
+        .await
     }
 
-    pub fn cancel(&self) -> impl Future<Output = Result<(), nix::Error>> {
+    pub async fn cancel(&self) -> Result<(), nix::Error> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
@@ -1002,6 +1007,7 @@ impl TcpStream {
             fd_impl,
             _m: PhantomData,
         }
+        .await
     }
 
     pub fn set_timeout(&self, dur: Duration) {
@@ -1580,9 +1586,7 @@ impl TcpClient {
         self
     }
 
-    pub fn connect_ipv4(
-        self, addr: Ipv4Addr, port: u16,
-    ) -> impl Future<Output = Result<TcpStream, nix::Error>> {
+    pub async fn connect_ipv4(self, addr: Ipv4Addr, port: u16) -> Result<TcpStream, nix::Error> {
         let addr = SocketAddrV4::new(addr, port);
 
         let op = make_io_uring_op(
@@ -1604,11 +1608,10 @@ impl TcpClient {
             ex: self.ex,
             op: Some(key.data().as_ffi()),
         }
+        .await
     }
 
-    pub fn connect_ipv6(
-        self, addr: Ipv6Addr, port: u16,
-    ) -> impl Future<Output = Result<TcpStream, nix::Error>> {
+    pub async fn connect_ipv6(self, addr: Ipv6Addr, port: u16) -> Result<TcpStream, nix::Error> {
         let addr = SocketAddrV6::new(addr, port, 0, 0);
 
         let op = make_io_uring_op(
@@ -1630,6 +1633,7 @@ impl TcpClient {
             ex: self.ex,
             op: Some(key.data().as_ffi()),
         }
+        .await
     }
 }
 

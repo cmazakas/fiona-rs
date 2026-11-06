@@ -8,7 +8,7 @@ use std::{
     cell::{Cell, RefCell},
     future::{Future, poll_fn},
     hash::{DefaultHasher, Hasher},
-    pin::Pin,
+    pin::{Pin, pin},
     rc::Rc,
     sync::{Arc, Mutex},
     task::{LocalWaker, Poll, Waker},
@@ -277,10 +277,10 @@ fn await_forgotten_recursive() {
         let w = WakerFuture.await;
         let mut cx = std::task::Context::from_waker(&w);
 
-        // In theory, turning this into a .await point should either infinitely loop or
-        // just hang indefinitely. A simple, single poll() call should hopefully
-        // be enough to help us detect soundness issues with a future poll()'ing
-        // its own associated SpawnFuture.
+        // In theory, turning this into a .await point should either infinitely
+        // loop or just hang indefinitely. A simple, single poll() call should
+        // hopefully be enough to help us detect soundness issues with a future
+        // poll()'ing its own associated SpawnFuture.
         assert!(f.poll(&mut cx).is_pending());
         vec![1, 2, 3, 4]
     }
@@ -464,11 +464,12 @@ fn await_from_main() {
     }
 
     let mut ioc = fiona::IoContext::new();
-    let mut future = Box::pin(ioc.get_executor().spawn(async { 1234 }));
-    let mut future2 = Box::pin(ioc.get_executor().spawn(async { vec![1234] }));
+    let mut future = pin!(ioc.get_executor().spawn(async { 1234 }));
+    let mut future2 = pin!(ioc.get_executor().spawn(async { vec![1234] }));
     ioc.run();
 
-    // Make sure this remains to test SpawnFuture outliving its backing IoContext.
+    // Make sure this remains to test SpawnFuture outliving its backing
+    // IoContext.
     drop(ioc);
 
     let w = Waker::from(Arc::new(PanicWaker));
@@ -579,8 +580,8 @@ fn await_manually_polled() {
     async fn f1(ex: fiona::Executor) {
         let w = WakerFuture.await;
 
-        // Test the case where we manually poll a sibling task, attaching ourselves as
-        // the continuation our task then immediately finishes.
+        // Test the case where we manually poll a sibling task, attaching
+        // ourselves as the continuation our task then immediately finishes.
         //
         let f = std::pin::pin!(ex.spawn(f2(w.clone())));
 
@@ -613,8 +614,9 @@ fn await_manually_polled() {
 
 #[test]
 fn await_manually_polled_early_drop() {
-    // Want to attempt to test the property that the main task we're waiting on goes
-    // out of scope when an external thread completes and tries to use the Waker.
+    // Want to attempt to test the property that the main task we're waiting on
+    // goes out of scope when an external thread completes and tries to use the
+    // Waker.
 
     static mut NUM_RUNS: u64 = 0;
 
@@ -843,8 +845,8 @@ fn await_futures_mpsc() {
 
 #[test]
 fn await_rayon_tasks() {
-    // Want to test that our IoContext can toss work onto a Rayon threadpool which
-    // we then await on in bulk.
+    // Want to test that our IoContext can toss work onto a Rayon threadpool
+    // which we then await on in bulk.
 
     async fn fiona_task(thread_pool: Rc<rayon::ThreadPool>) {
         let mut tasks = FuturesUnordered::new();
@@ -925,13 +927,13 @@ fn await_rayon_stress_test() {
 
 #[test]
 fn await_double_wake() {
-    // Because our runtime now uses an amortized wakeup mechanism (i.e eventfd write
-    // or ring message), we need to test the case where the main thread running the
-    // ring is preempted before it can set the atomic flag to true, which means that
-    // threads running the Waker won't trigger the necessary wake-up mechanism
-    // causing a deadlock. It's the event loop's responsibility to check the task
-    // queue one more time before blocking on io_uring_submit_and_wait(), after it's
-    // set the atomic flag to true.
+    // Because our runtime now uses an amortized wakeup mechanism (i.e eventfd
+    // write or ring message), we need to test the case where the main thread
+    // running the ring is preempted before it can set the atomic flag to true,
+    // which means that threads running the Waker won't trigger the necessary
+    // wake-up mechanism causing a deadlock. It's the event loop's
+    // responsibility to check the task queue one more time before blocking on
+    // io_uring_submit_and_wait(), after it's set the atomic flag to true.
 
     async fn timer_task() {
         wait_for(Duration::from_micros(10), ()).await;
