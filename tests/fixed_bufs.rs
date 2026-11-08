@@ -80,3 +80,14 @@ fn fixed_bufs_outlives_ioc() {
 
     assert!(fixed_buf.iter().all(|x| *x == 123));
 }
+
+#[test]
+#[should_panic = "Buffer length overflow."]
+fn fixed_bufs_size_overflow() {
+    let ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let buf_len = usize::MAX / 2 + 1;
+    ex.register_fixed_buffers(2, buf_len).unwrap();
+    unreachable!();
+}

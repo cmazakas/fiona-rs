@@ -4,7 +4,7 @@
 
 use crate::{
     Executor, FdImpl, FixedBuf, OpType, RefCount, add_obj_ref, add_op_ref,
-    common::{CancelFuture, CloseFuture, ErasedBuf},
+    common::{CancelFuture, CloseFuture, ErasedBuf, make_range},
     get_sqe, make_io_uring_op, release_impl, release_obj,
 };
 use liburing_rs::{
@@ -28,31 +28,9 @@ use std::{
     path::Path,
     pin::Pin,
     ptr::{self, NonNull},
-    range::Range,
     result::Result,
     task::Poll,
 };
-
-//-----------------------------------------------------------------------------
-
-fn make_range<R: RangeBounds<usize>>(range: R, buf_len: usize) -> Range<usize> {
-    let start = match range.start_bound() {
-        std::ops::Bound::Included(&s) => s,
-        std::ops::Bound::Excluded(&s) => s + 1,
-        std::ops::Bound::Unbounded => 0,
-    };
-
-    let end = match range.end_bound() {
-        std::ops::Bound::Included(&e) => e + 1,
-        std::ops::Bound::Excluded(&e) => e,
-        std::ops::Bound::Unbounded => buf_len,
-    };
-
-    let subspan = Range { start, end };
-    assert!(subspan.end <= buf_len);
-
-    subspan
-}
 
 //-----------------------------------------------------------------------------
 

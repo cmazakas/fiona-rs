@@ -2264,7 +2264,12 @@ impl Executor {
             return Err(Errno::from_raw(-ret));
         }
 
-        let mut bufs = vec![0; buf_len * num_bufs as usize];
+        let mut bufs = vec![
+            0;
+            buf_len
+                .checked_mul(num_bufs as usize)
+                .expect("Buffer length overflow.")
+        ];
         let mut bid_map = Vec::with_capacity(num_bufs as usize);
         let buf_headers = vec![
             BufHeader {
@@ -2342,7 +2347,12 @@ impl Executor {
         let ring = self.ring();
         let nr_iovecs = num_bufs;
 
-        let mut buf = vec![0_u8; num_bufs as usize * buf_len];
+        let mut buf = vec![
+            0_u8;
+            (num_bufs as usize)
+                .checked_mul(buf_len)
+                .expect("Buffer length overflow.")
+        ];
 
         let mut iovecs = Vec::with_capacity(num_bufs as _);
         for i in 0..num_bufs {

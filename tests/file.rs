@@ -290,6 +290,100 @@ fn file_subspan_write() {
     assert_eq!(n, 1);
 }
 
+#[allow(clippy::reversed_empty_ranges)]
+#[test]
+#[should_panic = "!subspan.is_empty()"]
+fn file_reversed_file_read_subspan() {
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let file = fiona::fs::File::open(&ex, "tests/data/fiona_test_file_open")
+                .await
+                .unwrap();
+
+            let _ = file.read_subspan_at(1..0, Vec::new(), 0).await;
+        }
+    });
+
+    ioc.run();
+    unreachable!();
+}
+
+#[test]
+#[should_panic = "subspan.end <= buf_len"]
+fn file_subspan_exceeeds_buf() {
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let file = fiona::fs::File::open(&ex, "tests/data/fiona_test_file_open")
+                .await
+                .unwrap();
+
+            let _ = file.read_subspan_at(0..1024, vec![0_u8; 512], 0).await;
+        }
+    });
+
+    ioc.run();
+    unreachable!();
+}
+
+#[allow(clippy::reversed_empty_ranges)]
+#[test]
+#[should_panic = "!subspan.is_empty()"]
+fn file_fixed_reversed_file_read_subspan() {
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.register_fixed_buffers(1024, 1024).unwrap();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let file = fiona::fs::File::open(&ex, "tests/data/fiona_test_file_open")
+                .await
+                .unwrap();
+
+            let _ = file
+                .read_subspan_at_fixed(1..0, ex.get_fixed_buf().unwrap(), 0)
+                .await;
+        }
+    });
+
+    ioc.run();
+    unreachable!();
+}
+
+#[test]
+#[should_panic = "subspan.end <= buf_len"]
+fn file_fixed_subspan_exceeeds_buf() {
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    ex.register_fixed_buffers(1024, 512).unwrap();
+
+    ex.spawn({
+        let ex = ex.clone();
+        async move {
+            let file = fiona::fs::File::open(&ex, "tests/data/fiona_test_file_open")
+                .await
+                .unwrap();
+
+            let _ = file
+                .read_subspan_at_fixed(0..1024, ex.get_fixed_buf().unwrap(), 0)
+                .await;
+        }
+    });
+
+    ioc.run();
+    unreachable!();
+}
+
 #[test]
 fn file_offset_out_of_bounds() {
     // Test that our code can handle sparse writes.

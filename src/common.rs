@@ -2,7 +2,7 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
-use std::{marker::PhantomData, mem::offset_of, task::Poll};
+use std::{marker::PhantomData, mem::offset_of, ops::RangeBounds, range::Range, task::Poll};
 
 use crate::{FdImpl, FixedBuf, OpType, add_op_ref, get_sqe, make_io_uring_op};
 use liburing_rs::{
@@ -12,6 +12,28 @@ use liburing_rs::{
 };
 use nix::errno::Errno;
 use slotmap::{DefaultKey, Key, KeyData};
+
+//-----------------------------------------------------------------------------
+
+pub(crate) fn make_range<R: RangeBounds<usize>>(range: R, buf_len: usize) -> Range<usize> {
+    let start = match range.start_bound() {
+        std::ops::Bound::Included(&s) => s,
+        std::ops::Bound::Excluded(&s) => s + 1,
+        std::ops::Bound::Unbounded => 0,
+    };
+
+    let end = match range.end_bound() {
+        std::ops::Bound::Included(&e) => e + 1,
+        std::ops::Bound::Excluded(&e) => e,
+        std::ops::Bound::Unbounded => buf_len,
+    };
+
+    let subspan = Range { start, end };
+    assert!(subspan.end <= buf_len);
+    assert!(!subspan.is_empty());
+
+    subspan
+}
 
 //-----------------------------------------------------------------------------
 

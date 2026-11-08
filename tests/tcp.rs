@@ -1914,6 +1914,33 @@ fn tcp_send_subspan() {
     assert!(n > 0);
 }
 
+#[allow(clippy::reversed_empty_ranges)]
+#[test]
+#[should_panic = "!subspan.is_empty()"]
+fn tcp_reversed_send_subspan() {
+    let mut ioc = fiona::IoContext::new();
+    let (_server, client) = make_socket_pair(&mut ioc);
+    let ex = ioc.get_executor();
+
+    ex.spawn(async move {
+        let _ = client.send_subspan(1..0, Vec::new()).await;
+    });
+
+    ioc.run();
+    unreachable!();
+}
+
+#[test]
+#[should_panic = "Buffer length overflow."]
+fn tcp_buf_group_size_overflow() {
+    let ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+
+    let buf_len = usize::MAX / 2 + 1;
+    let _ = ex.register_buf_group(1234, 2, buf_len);
+    unreachable!();
+}
+
 #[test]
 fn tcp_ephemeral_port_exhaustion_panic() {
     let mut ioc = fiona::IoContext::builder()
