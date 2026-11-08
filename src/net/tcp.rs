@@ -218,6 +218,17 @@ impl TcpListener {
 
     /// Returns the port the listener is bound to. This function is useful when
     /// creating a listener bound to the wildcard port 0.
+    ///
+    /// # Example
+    /// ```
+    /// let mut ioc = fiona::IoContext::new();
+    /// let ex = ioc.get_executor();
+    ///
+    /// let listener = fiona::net::TcpListener::bind_ipv6(
+    ///     &ex, std::net::Ipv6Addr::LOCALHOST, 0).unwrap();
+    ///
+    /// assert_ne!(listener.port(), 0);
+    /// ```
     #[must_use]
     pub fn port(&self) -> u16 {
         let acceptor_impl = unsafe { &*self.p.as_ptr() };
@@ -841,7 +852,7 @@ impl TcpStream {
     }
 
     /// Starts a multishot recv operation, if one is not already active. Uses
-    /// buffer group specified by a previous call to
+    /// the buffer group specified by a previous call to
     /// [`set_buf_group`](TcpStream::set_buf_group). This function has an
     /// implicit timeout, which will automatically call
     /// [`cancel`](TcpStream::cancel) on the socket.
@@ -874,6 +885,32 @@ impl TcpStream {
         .await
     }
 
+    /// Performs a [shutdown](https://man7.org/linux/man-pages/man2/shutdown.2.html)
+    /// operation on the backing stream socket, returning with an error if one
+    /// occurred.
+    ///
+    /// To obtain values of `how`, one should use the nix or libc crate. Invalid
+    /// values of `how` will cause `EINVAL` to be returned.
+    ///
+    /// This function should be used as part of  a semantic TCP connectiong
+    /// close.
+    ///
+    /// # Example
+    /// ```
+    /// use nix::libc::SHUT_WR;
+    ///
+    /// async fn fiona_close(stream: fiona::net::TcpStream) {
+    ///     // Close the write half of the stream
+    ///     stream.shutdown(SHUT_WR).await.unwrap();
+    ///
+    ///     // Wait until we see the EOF.
+    ///     let bufs = stream.recv().await.unwrap();
+    ///     assert!(bufs.is_empty());
+    ///
+    ///     // Now we can safely close the socket.
+    ///     stream.close().await.unwrap();
+    /// }
+    /// ```
     pub async fn shutdown(&self, how: i32) -> Result<(), nix::Error> {
         assert!(unsafe { !(*self.p.as_ptr()).shutdown_pending });
 
@@ -905,6 +942,26 @@ impl TcpStream {
         .await
     }
 
+    /// Closes the backing TCP socket. This function does not consume the socket
+    /// object because multiple `TcpStream`s can still be alive and refer to the
+    /// same stream socket. Multiple cals simply result in `EBADF`.
+    ///
+    /// # Example
+    /// ```
+    /// use nix::libc::SHUT_WR;
+    ///
+    /// async fn fiona_close(stream: fiona::net::TcpStream) {
+    ///     // Close the write half of the stream
+    ///     stream.shutdown(SHUT_WR).await.unwrap();
+    ///
+    ///     // Wait until we see the EOF.
+    ///     let bufs = stream.recv().await.unwrap();
+    ///     assert!(bufs.is_empty());
+    ///
+    ///     // Now we can safely close the socket.
+    ///     stream.close().await.unwrap();
+    /// }
+    /// ```
     pub async fn close(&self) -> Result<(), nix::Error> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.close_pending });
 
@@ -944,6 +1001,8 @@ impl TcpStream {
         .await
     }
 
+    /// Cancels all pending I/O operations on the backing stream socket.
+    /// Canceled operations will see `ECANCELED`.
     pub async fn cancel(&self) -> Result<(), nix::Error> {
         assert!(unsafe { !(*self.p.as_ptr()).fd_impl.cancel_pending });
 
@@ -983,6 +1042,8 @@ impl TcpStream {
         .await
     }
 
+    /// Set the timeout value that will be used during the next call to
+    /// [`recv`](`TcpStream::recv`).
     pub fn set_timeout(&self, dur: Duration) {
         let stream_impl = unsafe { &mut *self.p.as_ptr() };
         stream_impl.ts = dur;
@@ -1031,6 +1092,10 @@ impl TcpStream {
 }
 
 impl Drop for TcpStream {
+    /// Releases this stream's shared ownership of the underlying stream socket,
+    /// canceling any pending multishot recv operations if this is the last
+    /// `TcpStream` still alive. The data is finally released and deallocated
+    /// when all pending operations are completed and seen by the kernel.
     fn drop(&mut self) {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
         if unsafe { (*rc).obj_count } == 1 {
@@ -1065,6 +1130,9 @@ impl Drop for TcpStream {
 }
 
 impl Clone for TcpStream {
+    /// Return a new `TcpStream` instance that shares partial ownership of the
+    /// backing stream socket and its associated data. Equivalent to a call to
+    /// `Rc::clone`.
     fn clone(&self) -> Self {
         let rc = unsafe { &raw mut (*self.p.as_ptr()).fd_impl.ref_count };
         unsafe { add_obj_ref(rc) };
@@ -1539,12 +1607,18 @@ impl Future for RecvFuture<'_> {
 
 //-----------------------------------------------------------------------------
 
+/// A `TcpClient` is a builder-like structure that is used to start a [connect](https://www.man7.org/linux/man-pages/man2/connect.2.html)
+/// operation. The timeout can be specified with `with_timeout` and then the
+/// consuming operation to begin the `connect()` call is `connect_ipv4` or
+/// `connect_ipv6`.
 pub struct TcpClient {
     timeout: Duration,
     ex: Executor,
 }
 
 impl TcpClient {
+    /// Create a new instace of a `TcpClient` builder using the given
+    /// `Executor`.
     #[must_use]
     pub fn new(ex: &Executor) -> TcpClient {
         TcpClient {
@@ -1553,12 +1627,15 @@ impl TcpClient {
         }
     }
 
+    /// Sets the timeout that will be used during the TCP connect call.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> TcpClient {
         self.timeout = timeout;
         self
     }
 
+    /// Consumes the builder and attempts a connection with the address
+    /// specified by `addr`.
     pub async fn connect_ipv4(self, addr: Ipv4Addr, port: u16) -> Result<TcpStream, nix::Error> {
         let addr = SocketAddrV4::new(addr, port);
 
@@ -1584,6 +1661,8 @@ impl TcpClient {
         .await
     }
 
+    /// Consumes the builder and attempts a connection with the address
+    /// specified by `addr`.
     pub async fn connect_ipv6(self, addr: Ipv6Addr, port: u16) -> Result<TcpStream, nix::Error> {
         let addr = SocketAddrV6::new(addr, port, 0, 0);
 
