@@ -1191,7 +1191,7 @@ fn tcp_select_drop_ready_recv_future() {
         timer.wait(Duration::from_millis(100)).await.unwrap();
 
         let mut timers = Vec::<fiona::time::Timer>::new();
-        let mut timeouts = Vec::<fiona::time::TimerFuture>::new();
+        let mut timeouts = Vec::new();
         {
             let recv_future = stream.recv();
             let mut recv_future = pin!(recv_future);
@@ -1208,11 +1208,11 @@ fn tcp_select_drop_ready_recv_future() {
 
             for i in 0..num_ops {
                 let i = i as usize;
-                timeouts.push(timers[i].wait(Duration::from_millis(10)));
+                timeouts.push(Box::pin(timers[i].wait(Duration::from_millis(10))));
             }
 
             for timeout in &mut timeouts {
-                let r = Pin::new(timeout).poll(&mut cx);
+                let r = timeout.as_mut().poll(&mut cx);
                 assert!(r.is_pending());
             }
         }

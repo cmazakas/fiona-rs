@@ -2,6 +2,18 @@
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
+//! The timer module. Provides a ring-backed fine-grained timer.
+//!
+//! The timers in this module are ring-backed, which means the timeout
+//! operations go through the ring. Unlike wheel-based timer implementations,
+//! Fiona's [`Timer`] has full resolution into the sub-millisecond range.
+//!
+//! For most cases, `Timer` should be eschewed in favor of
+//! [`sleep_for`](crate::timer_wheel::sleep_for), which does not incur the cost
+//! of going through the ring. Instead, `Timer` is useful for scenarios where
+//! you want to trigger a full trip through the ring for testing or truly
+//! finer-grained resolution is required.
+
 extern crate liburing_rs;
 
 use crate::{
@@ -24,11 +36,12 @@ struct TimerImpl {
     timeout_pending: bool,
 }
 
+/// The `Timer` struct which holds a handle to the runtime and its backing data.
 pub struct Timer {
     p: NonNull<TimerImpl>,
 }
 
-pub struct TimerFuture<'a> {
+struct TimerFuture<'a> {
     timer: &'a Timer,
     op: Option<u64>,
     completed: bool,
@@ -36,6 +49,9 @@ pub struct TimerFuture<'a> {
 
 //-----------------------------------------------------------------------------
 
+/// A convenience function which creates a `Timer` that is immediately waited
+/// on.
+#[inline]
 pub async fn sleep(ex: &Executor, dur: Duration) {
     let timer = Timer::new(ex);
     timer.wait(dur).await.unwrap();
@@ -44,6 +60,8 @@ pub async fn sleep(ex: &Executor, dur: Duration) {
 //-----------------------------------------------------------------------------
 
 impl Timer {
+    /// Create a new `Timer` object using the provided `Executor`. All I/O will
+    /// run through the ring associated with `ex`.
     #[must_use]
     pub fn new(ex: &Executor) -> Self {
         let ex = ex.clone();
@@ -71,6 +89,7 @@ impl Timer {
         }
     }
 
+    /// Return a copy of the `Executor` associated with this I/O object.
     #[inline]
     #[must_use]
     pub fn get_executor(&self) -> Executor {
@@ -78,9 +97,10 @@ impl Timer {
         timer_impl.ex.clone()
     }
 
+    /// Schedule a wait for `Duration` using the ring. Unlike wheel-based
+    /// implementations, the resolution of the timer matches the kernel exactly.
     #[inline]
-    #[must_use]
-    pub fn wait(&self, dur: Duration) -> TimerFuture<'_> {
+    pub async fn wait(&self, dur: Duration) -> Result<(), Errno> {
         let timer_impl = unsafe { &mut *self.p.as_ptr() };
         assert!(!timer_impl.timeout_pending);
 
@@ -94,19 +114,21 @@ impl Timer {
                 .cast()
         };
 
-        let mut guard = timer_impl.ex.p.io_ops.borrow_mut();
-        let io_ops = &mut *guard;
-
-        let key = io_ops.insert(
-            make_io_uring_op(ref_count, OpType::Timeout { dur: dur.into() }),
-            &timer_impl.ex,
-        );
+        let key = {
+            let mut guard = timer_impl.ex.p.io_ops.borrow_mut();
+            let io_ops = &mut *guard;
+            io_ops.insert(
+                make_io_uring_op(ref_count, OpType::Timeout { dur: dur.into() }),
+                &timer_impl.ex,
+            )
+        };
 
         TimerFuture {
             timer: self,
             completed: false,
             op: Some(key.data().as_ffi()),
         }
+        .await
     }
 }
 

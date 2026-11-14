@@ -120,7 +120,6 @@ pub mod fs;
 
 pub mod net;
 
-/// The timer module. Provides a ring-backed fine-grained timer.
 pub mod time;
 
 pub mod timer_wheel;

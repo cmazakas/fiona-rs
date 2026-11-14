@@ -10,7 +10,7 @@ use std::{
     cell::RefCell,
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
-    pin::Pin,
+    pin::pin,
     rc::Rc,
     task::Poll,
     time::{Duration, Instant},
@@ -126,11 +126,11 @@ fn time_early_drop() {
 
         let _guard = DurationGuard::new(dur);
         for _ in 0..5 {
-            let mut f = timer.wait(dur);
+            let mut f = Box::pin(timer.wait(dur));
             {
                 let w = WakerFuture.await;
                 assert!(
-                    Pin::new(&mut f)
+                    f.as_mut()
                         .poll(&mut std::task::Context::from_waker(&w))
                         .is_pending()
                 );
@@ -178,10 +178,10 @@ fn time_shared_panic() {
 #[inline(never)]
 #[should_panic = "assertion failed: !timer_impl.timeout_pending"]
 fn time_forget_expired() {
-    // This function must be marked inline(never) because if its name disappears,
-    // it's cumbersome to ignore it in an lsan suppression file preventing it from
-    // being inlined ensures that its name is always visible for the purposes of
-    // suppression and matching.
+    // This function must be marked inline(never) because if its name
+    // disappears, it's cumbersome to ignore it in an lsan suppression file
+    // preventing it from being inlined ensures that its name is always visible
+    // for the purposes of suppression and matching.
 
     // Because we allocate operation state per Future, if we forget() a timer
     // future, we should only get a spurious poll() (which is sound) and then a
@@ -191,11 +191,11 @@ fn time_forget_expired() {
 
     async fn f1(ex: fiona::Executor) {
         let timer = fiona::time::Timer::new(&ex);
-        let mut f = timer.wait(Duration::from_millis(100));
+        let mut f = Box::pin(timer.wait(Duration::from_millis(100)));
         {
             let w = WakerFuture.await;
             assert!(
-                Pin::new(&mut f)
+                f.as_mut()
                     .poll(&mut std::task::Context::from_waker(&w))
                     .is_pending()
             );
@@ -244,20 +244,20 @@ fn time_multiple_eager_drops() {
         let _guard = DurationGuard::new(dur);
 
         {
-            let mut f = timer.wait(dur);
-            assert!(Pin::new(&mut f).poll(&mut cx).is_pending());
+            let mut f = Box::pin(timer.wait(dur));
+            assert!(f.as_mut().poll(&mut cx).is_pending());
             drop(f);
         }
 
         {
-            let mut f = timer.wait(dur);
-            assert!(Pin::new(&mut f).poll(&mut cx).is_pending());
+            let mut f = Box::pin(timer.wait(dur));
+            assert!(f.as_mut().poll(&mut cx).is_pending());
             drop(f);
         }
 
         {
-            let mut f = timer.wait(dur);
-            assert!(Pin::new(&mut f).poll(&mut cx).is_pending());
+            let mut f = Box::pin(timer.wait(dur));
+            assert!(f.as_mut().poll(&mut cx).is_pending());
             drop(f);
         }
 
@@ -285,8 +285,8 @@ async fn wait_for<T>(ex: fiona::Executor, dur: Duration, t: T) -> T {
 
 #[test]
 fn time_futures_unordered() {
-    // We should be able to use a wrapper library like the futures crate and have
-    // things complete in the proper unordered order.
+    // We should be able to use a wrapper library like the futures crate and
+    // have things complete in the proper unordered order.
 
     {
         async fn launch_timers(ex: fiona::Executor) {
@@ -352,8 +352,8 @@ fn time_futures_unordered() {
 
 #[test]
 fn time_futures_select() {
-    // Test that our io object works with select!, which relies on cancel-on-drop
-    // quite heavily.
+    // Test that our io object works with select!, which relies on
+    // cancel-on-drop quite heavily.
     // Also test that our waker is correctly implemented as well.
 
     async fn f1(ex: fiona::Executor) {
@@ -481,40 +481,6 @@ fn time_double_run_panic_reuse() {
 }
 
 #[test]
-fn time_relocate_future() {
-    // Test that our Futures are safe to relocate before we eventually .await them.
-
-    let mut ioc = fiona::IoContext::new();
-    let ex = ioc.get_executor();
-
-    let ex2 = ex.clone();
-    ex.clone().spawn(async move {
-        let timer = fiona::time::Timer::new(&ex2);
-        let f = timer.wait(Duration::from_millis(100));
-        let original_address = &raw const f;
-
-        let f2 = f;
-        assert_ne!(&raw const f2, original_address);
-
-        f2.await.unwrap();
-    });
-
-    ex.clone().spawn(async move {
-        let timer = fiona::time::Timer::new(&ex);
-        let mut f = timer.wait(Duration::from_millis(100));
-        let original_address = &raw const f;
-        assert!(futures::poll!(&mut f).is_pending());
-
-        let f2 = f;
-        assert_ne!(&raw const f2, original_address);
-
-        f2.await.unwrap();
-    });
-
-    assert_eq!(ioc.run(), 2);
-}
-
-#[test]
 fn time_foreign_executor() {
     // Test what happens when we start migrating I/O objects across different
     // execution contexts.
@@ -530,34 +496,38 @@ fn time_foreign_executor() {
 
         let timer1 = fiona::time::Timer::new(&ex1);
 
-        ex2.spawn((async |timer1: fiona::time::Timer,
-                          ioc1: Rc<RefCell<fiona::IoContext>>,
-                          ex2: fiona::Executor| {
-            let mut f1 = timer1.wait(Duration::from_millis(100));
-            let waker = WakerFuture.await;
-            let mut cx = std::task::Context::from_waker(&waker);
-            assert!(Pin::new(&mut f1).poll(&mut cx).is_pending());
+        ex2.spawn({
+            let timer1 = timer1.clone();
+            let ioc1 = ioc1.clone();
+            let ex2 = ex2.clone();
 
-            timer1.get_executor().spawn(async move {});
-            ioc1.borrow_mut().run();
+            async move {
+                let mut f1 = pin!(timer1.wait(Duration::from_millis(100)));
+                let waker = WakerFuture.await;
+                let mut cx = std::task::Context::from_waker(&waker);
+                assert!(f1.as_mut().poll(&mut cx).is_pending());
 
-            assert!(Pin::new(&mut f1).poll(&mut cx).is_pending());
+                timer1.get_executor().spawn(async move {});
+                ioc1.borrow_mut().run();
 
-            let timer2 = fiona::time::Timer::new(&ex2);
-            timer2.wait(Duration::from_millis(100)).await.unwrap();
+                assert!(f1.as_mut().poll(&mut cx).is_pending());
 
-            timer1.get_executor().spawn(async move {});
-            ioc1.borrow_mut().run();
+                let timer2 = fiona::time::Timer::new(&ex2);
+                timer2.wait(Duration::from_millis(100)).await.unwrap();
 
-            assert!(Pin::new(&mut f1).poll(&mut cx).is_ready());
-        })(timer1.clone(), ioc1.clone(), ex2.clone()));
+                timer1.get_executor().spawn(async move {});
+                ioc1.borrow_mut().run();
+
+                assert!(f1.as_mut().poll(&mut cx).is_ready());
+            }
+        });
 
         ioc2.borrow_mut().run();
     }
 
     {
-        // Post the SQE and make sure there was enough intermittent work such that we
-        // process the CQE and mark the operation as done.
+        // Post the SQE and make sure there was enough intermittent work such
+        // that we process the CQE and mark the operation as done.
 
         let ioc1 = Rc::new(RefCell::new(fiona::IoContext::new()));
         let ioc2 = Rc::new(RefCell::new(fiona::IoContext::new()));
@@ -567,26 +537,32 @@ fn time_foreign_executor() {
 
         let timer1 = fiona::time::Timer::new(&ex1);
 
-        ex2.spawn((async |timer1: fiona::time::Timer,
-                          ioc1: Rc<RefCell<fiona::IoContext>>,
-                          ex2: fiona::Executor| {
-            let mut f1 = timer1.wait(Duration::from_millis(100));
-            let waker = WakerFuture.await;
-            let mut cx = std::task::Context::from_waker(&waker);
-            assert!(Pin::new(&mut f1).poll(&mut cx).is_pending());
+        ex2.spawn({
+            let timer1 = timer1.clone();
+            let ioc1 = ioc1.clone();
+            let ex2 = ex2.clone();
 
-            let ex1_copy = timer1.get_executor();
-            timer1.get_executor().spawn(async move {
-                let timer1_2 = fiona::time::Timer::new(&ex1_copy);
-                timer1_2.wait(Duration::from_millis(125)).await.unwrap();
-            });
-            ioc1.borrow_mut().run();
+            async move {
+                let mut f1 = pin!(timer1.wait(Duration::from_millis(100)));
+                let waker = WakerFuture.await;
+                let mut cx = std::task::Context::from_waker(&waker);
+                assert!(f1.as_mut().poll(&mut cx).is_pending());
 
-            let timer2 = fiona::time::Timer::new(&ex2);
-            timer2.wait(Duration::from_millis(100)).await.unwrap();
+                timer1.get_executor().spawn({
+                    let ex = timer1.get_executor();
+                    async move {
+                        let timer1_2 = fiona::time::Timer::new(&ex);
+                        timer1_2.wait(Duration::from_millis(125)).await.unwrap();
+                    }
+                });
+                ioc1.borrow_mut().run();
 
-            assert!(Pin::new(&mut f1).poll(&mut cx).is_ready());
-        })(timer1.clone(), ioc1.clone(), ex2.clone()));
+                let timer2 = fiona::time::Timer::new(&ex2);
+                timer2.wait(Duration::from_millis(100)).await.unwrap();
+
+                assert!(f1.as_mut().poll(&mut cx).is_ready());
+            }
+        });
 
         ioc2.borrow_mut().run();
     }
