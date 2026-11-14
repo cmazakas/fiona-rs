@@ -92,7 +92,7 @@ dependencies = [
 [[package]]
 name = "axboe-liburing"
 version = "2.16.0"
-source = "git+https://github.com/cmazakas/liburing.git?rev=2cbbd89edff6b916820a2d288fdca91d1c19ca0f#2cbbd89edff6b916820a2d288fdca91d1c19ca0f"
+source = "git+https://github.com/cmazakas/liburing.git?rev=1c776d6129f77c7f2db61421bb1842ae72897214#1c776d6129f77c7f2db61421bb1842ae72897214"
 dependencies = [
  "bindgen",
 ]
