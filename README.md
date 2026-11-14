@@ -1,5 +1,7 @@
 An io_uring runtime that aims to leverage all of its unique features to experiment and see what kinds of new APIs are possible.
 
+**[User Guide](https://cmazakas.github.io/fiona-rs/)** - tutorials, API walkthroughs, and configuration reference.
+
 - [Build Requirements](#build-requirements)
 - [Preliminary Benchmarks](#preliminary-benchmarks)
 - [Working Around RLIMIT\_MEMLOCK Limits](#working-around-rlimit_memlock-limits)
