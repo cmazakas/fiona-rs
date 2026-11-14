@@ -123,8 +123,6 @@ pub mod net;
 /// The timer module. Provides a ring-backed fine-grained timer.
 pub mod time;
 
-/// The timer_wheel module. Provides coarse-grained userspace timers,
-/// implemented as a timer wheel.
 pub mod timer_wheel;
 
 /// The TLS module. Provides a TLS wrapper around TCP streams.

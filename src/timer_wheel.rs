@@ -6,6 +6,17 @@
 // reference implementation. The Tokio authors deserve all credit for their
 // genius in this implementation.
 
+//! The timer_wheel module. Provides coarse-grained userspace timers,
+//! implemented as a timer wheel.
+//!
+//! This implementation is based heavily on Tokio's `TimerWheel` implementation
+//! but comes with some internal optimizations such as being allowed to use
+//! `LocalWaker`s internally instead of having to handle the cost of
+//! synchronizaiton.
+//!
+//! Unlike Fiona's [`Timer`](crate::time::Timer) structure, this is a pure
+//! userspace construct that doesn't touch the kernel and performs no I/O.
+
 #![allow(clippy::struct_field_names)]
 #![allow(unused)]
 
@@ -381,6 +392,7 @@ impl Drop for TimerFuture {
 
 //-----------------------------------------------------------------------------
 
+/// Register a timer with the wheel and wait for its completion.
 pub fn sleep_for(ex: &Executor, duration: Duration) -> impl Future<Output = ()> + 'static {
     let duration = Cell::new(round_up_ms(duration));
     TimerFuture {
