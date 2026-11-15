@@ -5,6 +5,7 @@
 use std::{
     cell::{Cell, RefCell},
     io::{ErrorKind, Read, Write},
+    mem::DropGuard,
     ops::DerefMut,
     rc::Rc,
     sync::Arc,
@@ -31,6 +32,7 @@ struct StreamImpl<TlsConnection> {
     tls_conn: RefCell<TlsConnection>,
     buf: RefCell<Vec<u8>>,
     wrote_close_notify: Cell<bool>,
+    flush_pending: Cell<bool>,
 }
 
 fn write_impl<Data>(
@@ -51,11 +53,16 @@ fn write_impl<Data>(
 
 async fn flush_impl<Data, TlsConnection>(
     tcp_stream: &TcpStream, buf: &RefCell<Vec<u8>>, max_send_size: usize,
-    tls_stream: &RefCell<TlsConnection>,
+    tls_stream: &RefCell<TlsConnection>, flush_pending: &Cell<bool>,
 ) -> Result<usize, Error>
 where
     TlsConnection: DerefMut<Target = rustls::ConnectionCommon<Data>>,
 {
+    assert!(!flush_pending.get(), "Flush is already in progress.");
+    let _guard = DropGuard::new(flush_pending, |f| {
+        f.set(false);
+    });
+
     let (send_buf, max_send) = {
         let mut borrow_guard = buf.borrow_mut();
         let buf = &mut *borrow_guard;
@@ -210,6 +217,7 @@ impl TlsStream {
             &self.stream_impl.buf,
             max_send_size,
             &self.stream_impl.tls_conn,
+            &self.stream_impl.flush_pending,
         )
         .await
     }
@@ -243,6 +251,7 @@ impl TlsClient {
             &self.stream_impl.buf,
             max_send_size,
             &self.stream_impl.tls_conn,
+            &self.stream_impl.flush_pending,
         )
         .await
     }
@@ -274,6 +283,7 @@ pub async fn server_handshake(
             tls_conn: RefCell::new(config),
             buf: RefCell::new(Vec::new()),
             wrote_close_notify: Cell::new(false),
+            flush_pending: Cell::new(false),
         }),
     };
 
@@ -349,6 +359,7 @@ pub async fn client_handshake(
             ),
             buf: RefCell::new(Vec::new()),
             wrote_close_notify: Cell::new(false),
+            flush_pending: Cell::new(false),
         }),
     };
 

@@ -6,10 +6,13 @@ use rand::{Rng, SeedableRng};
 use rustls_pki_types::pem::PemObject;
 use std::{
     cell::RefCell,
+    future::poll_fn,
     io::{Read, Write},
     net::Ipv6Addr,
+    pin::pin,
     rc::Rc,
     sync::Arc,
+    task::Poll,
     time::Duration,
 };
 
@@ -153,8 +156,8 @@ fn tls_hello_world() {
     // Post-handshake and we still have TLS data to write.
     assert!(server_session.wants_write());
 
-    // Leave this code commented out to test a unified write of pending handshake
-    // data along with encrypted application data, set down below.
+    // Leave this code commented out to test a unified write of pending
+    // handshake data along with encrypted application data, set down below.
 
     // while server_session.wants_write() {
     //     assert!(server_session.write_tls(&mut buf).unwrap() > 0);
@@ -710,7 +713,8 @@ fn tls_shutdown() {
 
 #[test]
 fn tls_concurrent_read_write() {
-    // Test that a concurrent read() and write() + flush() call are sound together.
+    // Test that a concurrent read() and write() + flush() call are sound
+    // together.
 
     let mut ioc = fiona::IoContext::new();
     let ex = ioc.get_executor();
@@ -753,8 +757,8 @@ fn tls_concurrent_read_write() {
 
 #[test]
 fn tls_concurrent_read_write_large() {
-    // Test that a concurrent read() and write() + flush() call are sound together,
-    // but for a large message.
+    // Test that a concurrent read() and write() + flush() call are sound
+    // together, but for a large message.
 
     const MAX_SEND: usize = 4 * 1024;
 
@@ -1035,4 +1039,141 @@ fn tls_handshake_errors() {
 
     let n = ioc.run();
     assert_eq!(n, 2);
+}
+
+#[test]
+fn tls_write_flush_in_progress() {
+    // Test what happens when we continue to write() while a flush() operation
+    // is active.
+
+    const MAX_SEND: usize = 4 * 1024;
+    const MSG_LEN: usize = 1024 * 1024;
+
+    let mut rng = rand::rngs::StdRng::from_os_rng();
+
+    let client_message = {
+        let mut message = vec![0; MSG_LEN];
+        rand::RngCore::fill_bytes(&mut rng, &mut message);
+        Rc::new(message)
+    };
+
+    let server_message = {
+        let mut message = vec![0; MSG_LEN];
+        rand::RngCore::fill_bytes(&mut rng, &mut message);
+        Rc::new(message)
+    };
+
+    let mut ioc = fiona::IoContext::new();
+    let ex = ioc.get_executor();
+    let (tls_stream, tls_client) = make_tls_socket_pair(&mut ioc, 1234, 1024, 16 * 1024);
+
+    ex.spawn({
+        let (tls_stream, client_message) = (tls_stream.clone(), client_message.clone());
+        async move {
+            let mut n = 0;
+            let mut buf = Vec::new();
+
+            while buf.len() < client_message.len() {
+                n += tls_stream.read(&mut buf).await.unwrap();
+            }
+
+            assert_eq!(n, client_message.len());
+            assert_eq!(buf, &client_message[..]);
+        }
+    });
+
+    ex.spawn({
+        let (tls_stream, server_message) = (tls_stream.clone(), server_message.clone());
+        async move {
+            let mut num_written = 0;
+            loop {
+                if num_written < server_message.len() {
+                    let n = tls_stream
+                        .write(&server_message[num_written..][..1024])
+                        .unwrap();
+                    num_written += n;
+                }
+
+                let mut f = pin!(tls_stream.flush(MAX_SEND));
+                let mut r = Poll::Pending;
+                poll_fn(|cx| {
+                    r = f.as_mut().poll(cx);
+                    Poll::Ready(())
+                })
+                .await;
+
+                if num_written < server_message.len() {
+                    let n = tls_stream
+                        .write(&server_message[num_written..][..1024])
+                        .unwrap();
+                    num_written += n;
+                }
+
+                let n = match r {
+                    Poll::Ready(n) => n.unwrap(),
+                    Poll::Pending => f.await.unwrap(),
+                };
+
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    });
+
+    ex.spawn({
+        let (tls_client, server_message) = (tls_client.clone(), server_message.clone());
+        async move {
+            let mut n = 0;
+            let mut buf = Vec::new();
+
+            while buf.len() < server_message.len() {
+                n += tls_client.read(&mut buf).await.unwrap();
+            }
+
+            assert_eq!(n, server_message.len());
+            assert_eq!(buf, &server_message[..]);
+        }
+    });
+
+    ex.spawn({
+        let (tls_client, client_message) = (tls_client.clone(), client_message.clone());
+        async move {
+            let mut num_written = 0;
+            loop {
+                if num_written < client_message.len() {
+                    let n = tls_client
+                        .write(&client_message[num_written..][..1024])
+                        .unwrap();
+                    num_written += n;
+                }
+
+                let mut f = pin!(tls_client.flush(MAX_SEND));
+                let mut r = Poll::Pending;
+                poll_fn(|cx| {
+                    r = f.as_mut().poll(cx);
+                    Poll::Ready(())
+                })
+                .await;
+
+                if num_written < client_message.len() {
+                    let n = tls_client
+                        .write(&client_message[num_written..][..1024])
+                        .unwrap();
+                    num_written += n;
+                }
+
+                let n = match r {
+                    Poll::Ready(n) => n.unwrap(),
+                    Poll::Pending => f.await.unwrap(),
+                };
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    });
+
+    let n = ioc.run();
+    assert_eq!(n, 4);
 }
