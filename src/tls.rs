@@ -174,6 +174,20 @@ fn write_shutdown_impl<Data, TlsConnection>(
     wrote_close_notify.set(true);
 }
 
+/// A `TlsStream` is a simple wrapper around a [`TcpStream`] along with the
+/// required data for properly implementing a TLS server-side connection. Like
+/// the `TcpStream`, `TlsStream` is a cheap-to-`Clone` type. The `TlsStream`
+/// works by buffering encrypted data when
+/// [`write`](crate::tls::TlsStream::write) is called and then sending
+/// it over the wire when [`flush`](crate::tls::TlsStream::flush) is called.
+///
+/// Fiona puts rustls in its primary interface for ease-of-integration with
+/// existing code.
+///
+/// # Example
+/// ```
+#[doc = include_str!("../examples/tls.rs")]
+/// ```
 #[derive(Clone, Debug)]
 pub struct TlsStream {
     tcp_stream: TcpStream,
